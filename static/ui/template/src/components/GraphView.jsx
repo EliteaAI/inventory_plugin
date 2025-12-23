@@ -2,9 +2,13 @@ import { useEffect, useRef, useCallback, useState, useImperativeHandle, forwardR
 import { Box, Typography, Paper } from '@mui/material';
 import cytoscape from 'cytoscape';
 import coseBilkent from 'cytoscape-cose-bilkent';
+import NodeContextMenu from './NodeContextMenu';
 
-// Register the layout extension
-cytoscape.use(coseBilkent);
+// Register the layout extension (only once)
+if (!cytoscape.prototype._coseBilkentRegistered) {
+  cytoscape.use(coseBilkent);
+  cytoscape.prototype._coseBilkentRegistered = true;
+}
 
 // Entity type colors - exported for use in filters
 export const typeColors = {
@@ -30,10 +34,11 @@ const layerColors = {
   domain: '#9C27B0',
 };
 
-const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNode, theme = 'light', filters = {} }, ref) {
+const GraphView = forwardRef(function GraphView({ data, onNodeSelect, onExpandNode, selectedNode, highlightedNodes = [], theme = 'light', filters = {} }, ref) {
   const containerRef = useRef(null);
   const cyRef = useRef(null);
   const [layoutRunning, setLayoutRunning] = useState(false);
+  const [contextMenu, setContextMenu] = useState({ open: false, position: null, node: null });
 
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
@@ -52,10 +57,13 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
   const runLayout = useCallback(() => {
     if (!cyRef.current) return;
     const cy = cyRef.current;
-    if (cy.nodes().length === 0) return;
+    if (cy.nodes().length === 0) {
+      setLayoutRunning(false);
+      return;
+    }
 
     setLayoutRunning(true);
-    
+
     // Use grid layout for isolated nodes (no edges), otherwise use force-directed
     const hasEdges = cy.edges().length > 0;
     const layoutConfig = hasEdges ? {
@@ -76,11 +84,23 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
     };
 
     const layout = cy.layout(layoutConfig);
-    layout.run();
-    layout.promiseOn('layoutstop').then(() => {
+
+    // Set up a timeout fallback in case layoutstop doesn't fire
+    const timeoutId = setTimeout(() => {
       setLayoutRunning(false);
       cy.fit(undefined, 50);
+    }, 5000);
+
+    layout.promiseOn('layoutstop').then(() => {
+      clearTimeout(timeoutId);
+      setLayoutRunning(false);
+      cy.fit(undefined, 50);
+    }).catch(() => {
+      clearTimeout(timeoutId);
+      setLayoutRunning(false);
     });
+
+    layout.run();
   }, []);
 
   // Convert data to Cytoscape format
@@ -174,8 +194,8 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
             'text-valign': 'bottom',
             'text-halign': 'center',
             'font-size': '10px',
-            color: isDark ? '#fff' : '#333',
-            'text-background-color': isDark ? '#333' : '#fff',
+            color: isDark ? '#FFFFFF' : '#333',
+            'text-background-color': isDark ? '#181F2A' : '#fff',
             'text-background-opacity': 0.7,
             'text-background-padding': '2px',
             width: 30,
@@ -194,15 +214,15 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
           selector: 'edge',
           style: {
             width: 1.5,
-            'line-color': isDark ? '#666' : '#ccc',
-            'target-arrow-color': isDark ? '#666' : '#ccc',
+            'line-color': isDark ? '#3B3E46' : '#ccc',
+            'target-arrow-color': isDark ? '#3B3E46' : '#ccc',
             'target-arrow-shape': 'triangle',
             'curve-style': 'bezier',
             label: 'data(label)',
             'font-size': '8px',
-            color: isDark ? '#aaa' : '#666',
+            color: isDark ? '#A9B7C1' : '#666',
             'text-rotation': 'autorotate',
-            'text-background-color': isDark ? '#333' : '#fff',
+            'text-background-color': isDark ? '#181F2A' : '#fff',
             'text-background-opacity': 0.7,
           },
         },
@@ -212,6 +232,31 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
             width: 2.5,
             'line-color': '#ff5722',
             'target-arrow-color': '#ff5722',
+          },
+        },
+        // Highlighted nodes (from chat)
+        {
+          selector: 'node.highlighted',
+          style: {
+            'border-width': 5,
+            'border-color': '#6ae8fa', // AlitaUI primary for highlighting
+            'box-shadow': '0 0 10px #6ae8fa',
+            width: 40,
+            height: 40,
+            'z-index': 999,
+          },
+        },
+        // Dimmed nodes (not highlighted when others are)
+        {
+          selector: 'node.dimmed',
+          style: {
+            opacity: 0.3,
+          },
+        },
+        {
+          selector: 'edge.dimmed',
+          style: {
+            opacity: 0.15,
           },
         },
       ],
@@ -226,6 +271,8 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
       if (onNodeSelect) {
         onNodeSelect(node.data());
       }
+      // Close context menu on left click
+      setContextMenu({ open: false, position: null, node: null });
     });
 
     // Handle background tap to deselect
@@ -234,13 +281,55 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
         if (onNodeSelect) {
           onNodeSelect(null);
         }
+        // Close context menu when clicking background
+        setContextMenu({ open: false, position: null, node: null });
+      }
+    });
+
+    // Handle right-click on node (context menu)
+    cy.on('cxttap', 'node', (evt) => {
+      const node = evt.target;
+      const nodeData = node.data();
+
+      // Get the position in screen coordinates
+      const renderedPosition = node.renderedPosition();
+      const containerRect = containerRef.current?.getBoundingClientRect();
+
+      if (containerRect) {
+        // Calculate absolute position on screen
+        const x = containerRect.left + renderedPosition.x;
+        const y = containerRect.top + renderedPosition.y;
+
+        // Adjust to prevent menu going off screen
+        const menuWidth = 200;
+        const menuHeight = 180;
+        const adjustedX = Math.min(x, window.innerWidth - menuWidth - 10);
+        const adjustedY = Math.min(y, window.innerHeight - menuHeight - 10);
+
+        setContextMenu({
+          open: true,
+          position: { x: adjustedX, y: adjustedY },
+          node: nodeData,
+        });
+      }
+    });
+
+    // Close context menu on background right-click
+    cy.on('cxttap', (evt) => {
+      if (evt.target === cy) {
+        setContextMenu({ open: false, position: null, node: null });
       }
     });
 
     cyRef.current = cy;
 
     return () => {
-      cy.destroy();
+      try {
+        cy.destroy();
+      } catch (e) {
+        // Ignore destroy errors (can occur during React StrictMode double-renders)
+        console.warn('[GraphView] Error destroying cytoscape instance:', e.message);
+      }
     };
   }, [theme, onNodeSelect]);
 
@@ -277,50 +366,125 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, selectedNo
     }
   }, [selectedNode]);
 
+  // Handle highlighted nodes from chat
+  useEffect(() => {
+    if (!cyRef.current) return;
+
+    const cy = cyRef.current;
+
+    // Clear previous highlighting
+    cy.nodes().removeClass('highlighted dimmed');
+    cy.edges().removeClass('dimmed');
+
+    if (highlightedNodes && highlightedNodes.length > 0) {
+      // Apply highlighting to specified nodes
+      const highlightedSet = new Set(highlightedNodes);
+
+      cy.nodes().forEach((node) => {
+        if (highlightedSet.has(node.id())) {
+          node.addClass('highlighted');
+        } else {
+          node.addClass('dimmed');
+        }
+      });
+
+      // Dim edges that don't connect to highlighted nodes
+      cy.edges().forEach((edge) => {
+        const sourceHighlighted = highlightedSet.has(edge.source().id());
+        const targetHighlighted = highlightedSet.has(edge.target().id());
+        if (!sourceHighlighted && !targetHighlighted) {
+          edge.addClass('dimmed');
+        }
+      });
+
+      // Center view on highlighted nodes
+      const highlightedElements = cy.nodes('.highlighted');
+      if (highlightedElements.length > 0) {
+        cy.animate({
+          fit: {
+            eles: highlightedElements,
+            padding: 100,
+          },
+          duration: 500,
+        });
+      }
+    }
+  }, [highlightedNodes]);
+
   const nodeCount = data?.results?.length || data?.entities?.length || 0;
+
+  // Handle context menu close
+  const handleContextMenuClose = useCallback(() => {
+    setContextMenu({ open: false, position: null, node: null });
+  }, []);
+
+  // Handle expand from context menu
+  const handleContextMenuExpand = useCallback((node, depth) => {
+    if (onExpandNode && node?.id) {
+      onExpandNode(node.id, depth);
+    }
+    handleContextMenuClose();
+  }, [onExpandNode, handleContextMenuClose]);
 
   return (
     <Box sx={{ height: '100%', position: 'relative' }}>
-      {/* Graph container */}
-      <Paper
+      {/* Graph container - Cytoscape attaches here, NO React children allowed */}
+      <Box
         ref={containerRef}
         sx={{
           height: '100%',
           width: '100%',
-          position: 'relative',
-          backgroundColor: theme === 'dark' ? '#1e1e1e' : '#fafafa',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          backgroundColor: theme === 'dark' ? '#181F2A' : '#fafafa',
         }}
-      >
-        {layoutRunning && (
-          <Box
-            sx={{
-              position: 'absolute',
-              top: '50%',
-              left: '50%',
-              transform: 'translate(-50%, -50%)',
-              zIndex: 10,
-            }}
-          >
+      />
+      {/* Overlay elements - positioned over the graph but NOT inside Cytoscape container */}
+      {layoutRunning && (
+        <Box
+          sx={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            zIndex: 10,
+            pointerEvents: 'none',
+          }}
+        >
+          <Paper sx={{ px: 2, py: 1 }}>
             <Typography variant="body2" color="text.secondary">
               Calculating layout...
             </Typography>
-          </Box>
-        )}
-        {nodeCount === 0 && !layoutRunning && (
-          <Box
-            sx={{
-              position: 'absolute',
-              top: '50%',
-              left: '50%',
-              transform: 'translate(-50%, -50%)',
-            }}
-          >
-            <Typography variant="body2" color="text.secondary">
-              No data to display. Search for entities to visualize.
-            </Typography>
-          </Box>
-        )}
-      </Paper>
+          </Paper>
+        </Box>
+      )}
+      {nodeCount === 0 && !layoutRunning && (
+        <Box
+          sx={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            zIndex: 10,
+            pointerEvents: 'none',
+          }}
+        >
+          <Typography variant="body2" color="text.secondary">
+            No data to display. Search for entities to visualize.
+          </Typography>
+        </Box>
+      )}
+      {/* Context menu for node actions */}
+      {contextMenu.open && (
+        <NodeContextMenu
+          position={contextMenu.position}
+          node={contextMenu.node}
+          onExpand={handleContextMenuExpand}
+          onClose={handleContextMenuClose}
+          theme={theme}
+        />
+      )}
     </Box>
   );
 });

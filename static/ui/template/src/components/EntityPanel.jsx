@@ -117,7 +117,7 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                     fontSize: '11px',
                     mt: 0.5,
                     p: 1,
-                    backgroundColor: theme === 'dark' ? '#1a1a1a' : '#f5f5f5',
+                    backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                     borderRadius: 1,
                     wordBreak: 'break-all',
                   }}
@@ -169,7 +169,7 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                       fontSize: '11px',
                       mt: 0.5,
                       p: 1,
-                      backgroundColor: theme === 'dark' ? '#1a1a1a' : '#f5f5f5',
+                      backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                       borderRadius: 1,
                       wordBreak: 'break-word',
                     }}
@@ -188,7 +188,7 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                       fontSize: '11px',
                       mt: 0.5,
                       p: 1,
-                      backgroundColor: theme === 'dark' ? '#1a1a1a' : '#f5f5f5',
+                      backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                       borderRadius: 1,
                       wordBreak: 'break-word',
                     }}
@@ -221,13 +221,13 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                   sx={{
                     p: 0,
                     mt: 1,
-                    backgroundColor: theme === 'dark' ? '#1e1e1e' : '#f5f5f5',
+                    backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                     overflow: 'hidden',
                   }}
                 >
                   {entityData.subject && (
-                    <Box sx={{ p: 1.5, borderBottom: `1px solid ${theme === 'dark' ? '#333' : '#e0e0e0'}` }}>
-                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#4fc3f7' : '#0277bd', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
+                    <Box sx={{ p: 1.5, borderBottom: `1px solid ${theme === 'dark' ? '#3B3E46' : '#e0e0e0'}` }}>
+                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#6ae8fa' : '#29B8F5', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
                         subject
                       </Typography>
                       <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: theme === 'dark' ? '#e0e0e0' : '#424242' }}>
@@ -236,8 +236,8 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                     </Box>
                   )}
                   {entityData.predicate && (
-                    <Box sx={{ p: 1.5, borderBottom: entityData.object ? `1px solid ${theme === 'dark' ? '#333' : '#e0e0e0'}` : 'none' }}>
-                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#4fc3f7' : '#0277bd', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
+                    <Box sx={{ p: 1.5, borderBottom: entityData.object ? `1px solid ${theme === 'dark' ? '#3B3E46' : '#e0e0e0'}` : 'none' }}>
+                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#6ae8fa' : '#29B8F5', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
                         predicate
                       </Typography>
                       <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: theme === 'dark' ? '#e0e0e0' : '#424242' }}>
@@ -247,7 +247,7 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                   )}
                   {entityData.object && (
                     <Box sx={{ p: 1.5 }}>
-                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#4fc3f7' : '#0277bd', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
+                      <Typography variant="caption" sx={{ fontWeight: 600, color: theme === 'dark' ? '#6ae8fa' : '#29B8F5', display: 'block', mb: 0.5, fontFamily: 'monospace' }}>
                         object
                       </Typography>
                       <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: theme === 'dark' ? '#e0e0e0' : '#424242' }}>
@@ -300,7 +300,7 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                   sx={{
                     p: 0,
                     mt: 1,
-                    backgroundColor: theme === 'dark' ? '#1e1e1e' : '#f5f5f5',
+                    backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                     overflow: 'hidden',
                   }}
                 >
@@ -309,14 +309,14 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                       key={key} 
                       sx={{ 
                         p: 1.5,
-                        borderBottom: idx < arr.length - 1 ? `1px solid ${theme === 'dark' ? '#333' : '#e0e0e0'}` : 'none',
+                        borderBottom: idx < arr.length - 1 ? `1px solid ${theme === 'dark' ? '#3B3E46' : '#e0e0e0'}` : 'none',
                       }}
                     >
                       <Typography 
                         variant="caption" 
                         sx={{ 
                           fontWeight: 600,
-                          color: theme === 'dark' ? '#4fc3f7' : '#0277bd',
+                          color: theme === 'dark' ? '#6ae8fa' : '#29B8F5',
                           display: 'block',
                           mb: 0.5,
                           fontFamily: 'monospace',
@@ -362,9 +362,9 @@ function EntityPanel({ entity, projectId, toolkitId, onClose, theme = 'light' })
                 sx={{
                   p: 2,
                   mt: 1,
-                  backgroundColor: theme === 'dark' ? '#1e1e1e' : '#f5f5f5',
+                  backgroundColor: theme === 'dark' ? '#181F2A' : '#f5f5f5',
                   overflow: 'auto',
-                  border: theme === 'dark' ? '1px solid #444' : '1px solid #ddd',
+                  border: theme === 'dark' ? '1px solid #3B3E46' : '1px solid #ddd',
                   maxHeight: '300px',
                 }}
               >

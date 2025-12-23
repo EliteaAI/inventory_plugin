@@ -1411,7 +1411,130 @@ class KnowledgeGraph:
         undirected = self._graph.to_undirected()
         component = nx.node_connected_component(undirected, node_id)
         return list(component)
-    
+
+    def find_bridging_nodes(
+        self,
+        entity_ids: List[str],
+        max_bridge_length: int = 3,
+        max_bridges: int = 20
+    ) -> Dict[str, Any]:
+        """
+        Find minimal bridging nodes to connect disjoint entity clusters.
+
+        Uses a Steiner tree-like approach: for each pair of disconnected clusters,
+        find the shortest path and add intermediate nodes to create a more
+        connected visualization.
+
+        Args:
+            entity_ids: List of entity IDs to connect
+            max_bridge_length: Maximum path length between nodes (default 3 = 2 intermediate nodes max)
+            max_bridges: Maximum number of bridging paths to add
+
+        Returns:
+            Dict with:
+                - bridging_nodes: List of intermediate node IDs to add
+                - bridging_edges: List of edges in the bridging paths
+                - clusters: Number of original disconnected clusters
+        """
+        # Filter to entities that exist
+        valid_ids = [eid for eid in entity_ids if self._graph.has_node(eid)]
+        if len(valid_ids) < 2:
+            return {'bridging_nodes': [], 'bridging_edges': [], 'clusters': len(valid_ids)}
+
+        # Build undirected view for path finding
+        undirected = self._graph.to_undirected()
+
+        # Find connected components among our target nodes
+        target_set = set(valid_ids)
+        components = []
+        visited = set()
+
+        for node_id in valid_ids:
+            if node_id in visited:
+                continue
+            # Find all target nodes reachable from this one
+            component = set()
+            queue = [node_id]
+            while queue:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                if current in target_set:
+                    component.add(current)
+                    # Explore neighbors in full graph
+                    for neighbor in undirected.neighbors(current):
+                        if neighbor not in visited:
+                            queue.append(neighbor)
+            if component:
+                components.append(component)
+
+        if len(components) <= 1:
+            # Already connected
+            return {'bridging_nodes': [], 'bridging_edges': [], 'clusters': 1}
+
+        # Find shortest bridges between component pairs
+        bridging_nodes = set()
+        bridging_edges = []
+        bridges_found = 0
+
+        # Sort components by size (connect smaller ones first)
+        components.sort(key=len)
+
+        # Try to connect each component to another
+        for i, comp1 in enumerate(components):
+            if bridges_found >= max_bridges:
+                break
+
+            best_path = None
+            best_length = float('inf')
+
+            for comp2 in components[i+1:]:
+                # Find shortest path between any node in comp1 and any node in comp2
+                for n1 in comp1:
+                    if bridges_found >= max_bridges:
+                        break
+                    for n2 in comp2:
+                        try:
+                            path = nx.shortest_path(undirected, n1, n2)
+                            if len(path) <= max_bridge_length and len(path) < best_length:
+                                best_path = path
+                                best_length = len(path)
+                        except nx.NetworkXNoPath:
+                            continue
+
+            # Add the best bridge found
+            if best_path and len(best_path) > 2:
+                bridges_found += 1
+                # Add intermediate nodes (exclude endpoints which are already in our set)
+                for node in best_path[1:-1]:
+                    bridging_nodes.add(node)
+
+                # Add all edges along the path
+                for j in range(len(best_path) - 1):
+                    source, target = best_path[j], best_path[j+1]
+                    # Get edge data from the actual directed graph
+                    if self._graph.has_edge(source, target):
+                        edge_data = dict(self._graph.edges[source, target])
+                        bridging_edges.append({
+                            'source': source,
+                            'target': target,
+                            'type': edge_data.get('relation_type', 'RELATED'),
+                        })
+                    elif self._graph.has_edge(target, source):
+                        edge_data = dict(self._graph.edges[target, source])
+                        bridging_edges.append({
+                            'source': target,
+                            'target': source,
+                            'type': edge_data.get('relation_type', 'RELATED'),
+                        })
+
+        return {
+            'bridging_nodes': list(bridging_nodes),
+            'bridging_edges': bridging_edges,
+            'clusters': len(components)
+        }
+
     # ========== Citation Helpers ==========
     
     def get_citation(self, entity_id: str) -> Optional[Citation]:

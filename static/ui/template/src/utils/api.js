@@ -423,6 +423,40 @@ export async function getSourcesStatus(projectId, toolkitId) {
 }
 
 /**
+ * Get entities by their IDs with connecting edges
+ * Used to fetch and display entities that were touched during chat responses
+ * @param {string} projectId - Project ID
+ * @param {string} toolkitId - Toolkit ID
+ * @param {string[]} entityIds - Array of entity IDs to fetch
+ * @param {boolean} includeEdges - Whether to include edges connecting these entities (default: true)
+ * @returns {Promise<Object>} { results: [...], edges: [...], total_entities, total_edges }
+ */
+export async function getEntitiesByIds(projectId, toolkitId, entityIds, includeEdges = true) {
+  return invokeProviderTool('get_entities_by_ids', {
+    entity_ids: entityIds,
+    include_edges: includeEdges,
+    output_format: 'json',
+  });
+}
+
+/**
+ * Get neighbors of an entity up to a specified depth level
+ * Used by graph UI context menu to expand connections 1-3 levels deep
+ * @param {string} projectId - Project ID
+ * @param {string} toolkitId - Toolkit ID
+ * @param {string} entityId - ID of the entity to expand from
+ * @param {number} depth - Number of hops to expand (1, 2, or 3)
+ * @returns {Promise<Object>} { results: [...], edges: [...], total_entities, total_edges, origin_entity_id, depth }
+ */
+export async function getEntityNeighbors(projectId, toolkitId, entityId, depth = 1) {
+  return invokeProviderTool('get_entity_neighbors', {
+    entity_id: entityId,
+    depth: depth,
+    output_format: 'json',
+  });
+}
+
+/**
  * Get impact analysis
  */
 export async function getImpactAnalysis(projectId, toolkitId, entityName, direction = 'downstream', maxDepth = 3) {
@@ -598,6 +632,163 @@ export function getToolkitSources(toolkit) {
 export async function saveIngestionStatus(projectId, bucket, graphName, status) {
   // No-op for now - status is tracked in component state
   return Promise.resolve();
+}
+
+// ============================================================================
+// CONVERSATION API - Chat functionality using platform conversation endpoints
+// ============================================================================
+
+/**
+ * Create a new conversation for the inventory toolkit
+ * @param {string} projectId - Project ID
+ * @param {string} toolkitId - Toolkit ID to associate with conversation
+ * @param {string} name - Conversation name (optional, defaults to "New Conversation")
+ * @returns {Promise<Object>} Created conversation object
+ */
+export async function createConversation(projectId, toolkitId, name = 'New Conversation') {
+  const conversation = await apiRequest(`/api/v2/elitea_core/conversations/prompt_lib/${projectId}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name,
+      is_private: true,
+      meta: {
+        toolkit_id: toolkitId,
+        toolkit_type: 'inventory',
+      },
+      participants: [],
+    }),
+  });
+
+  // Add the inventory toolkit as a participant
+  if (conversation?.id) {
+    await addParticipant(projectId, conversation.id, {
+      type: 'toolkit',
+      entity_id: parseInt(toolkitId, 10),
+      entity_version_id: null,
+      is_active: true,
+      entity_meta: {
+        project_id: parseInt(projectId, 10),
+      },
+    });
+
+    // Fetch the updated conversation with participant
+    return getConversation(projectId, conversation.id);
+  }
+
+  return conversation;
+}
+
+/**
+ * List all conversations for a project, filtered by toolkit
+ * @param {string} projectId - Project ID
+ * @param {string} toolkitId - Toolkit ID to filter by
+ * @param {number} limit - Max results (default 100)
+ * @param {number} offset - Pagination offset (default 0)
+ * @returns {Promise<Object>} { rows: [...], total: number }
+ */
+export async function listConversations(projectId, toolkitId, limit = 100, offset = 0) {
+  const response = await apiRequest(
+    `/api/v2/elitea_core/conversations/prompt_lib/${projectId}?limit=${limit}&offset=${offset}&sort_by=updated_at&sort_order=desc`
+  );
+
+  // Filter conversations by toolkit_id in meta
+  const rows = Array.isArray(response) ? response : (response?.rows || []);
+  const filteredRows = rows.filter(
+    conv => conv.meta?.toolkit_id === toolkitId || conv.meta?.toolkit_id === parseInt(toolkitId, 10)
+  );
+
+  return {
+    rows: filteredRows,
+    total: filteredRows.length,
+  };
+}
+
+/**
+ * Get conversation details by ID
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @returns {Promise<Object>} Conversation object with participants
+ */
+export async function getConversation(projectId, conversationId) {
+  return apiRequest(`/api/v2/elitea_core/conversation/prompt_lib/${projectId}/${conversationId}`);
+}
+
+/**
+ * Delete a conversation
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @returns {Promise<void>}
+ */
+export async function deleteConversation(projectId, conversationId) {
+  return apiRequest(`/api/v2/elitea_core/conversations/prompt_lib/${projectId}/${conversationId}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * Update conversation name
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @param {string} name - New conversation name
+ * @returns {Promise<Object>} Updated conversation
+ */
+export async function updateConversation(projectId, conversationId, { name }) {
+  return apiRequest(`/api/v2/elitea_core/conversation/prompt_lib/${projectId}/${conversationId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name }),
+  });
+}
+
+/**
+ * Add a participant to a conversation
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @param {Object} participant - Participant object { type, entity_id, entity_version_id, is_active }
+ * @returns {Promise<Object>} Updated participants list
+ */
+export async function addParticipant(projectId, conversationId, participant) {
+  return apiRequest(`/api/v2/elitea_core/participants/prompt_lib/${projectId}/${conversationId}`, {
+    method: 'POST',
+    body: JSON.stringify([participant]),
+  });
+}
+
+/**
+ * Get messages for a conversation
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @param {number} page - Page number (0-indexed)
+ * @param {number} pageSize - Messages per page (default 50)
+ * @returns {Promise<Object>} { rows: [...], total: number }
+ */
+export async function getMessages(projectId, conversationId, page = 0, pageSize = 50) {
+  return apiRequest(
+    `/api/v2/elitea_core/messages/prompt_lib/${projectId}/${conversationId}?limit=${pageSize}&offset=${page * pageSize}`
+  );
+}
+
+/**
+ * Select a conversation (marks it as active for the user session)
+ * @param {string} projectId - Project ID
+ * @param {number} conversationId - Conversation ID
+ * @returns {Promise<void>}
+ */
+export async function selectConversation(projectId, conversationId) {
+  return apiRequest(`/api/v2/elitea_core/select_conversation/prompt_lib/${projectId}/${conversationId}`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * Unselect current conversation
+ * @param {string} projectId - Project ID
+ * @returns {Promise<void>}
+ */
+export async function unselectConversation(projectId) {
+  return apiRequest(`/api/v2/elitea_core/select_conversation/prompt_lib/${projectId}`, {
+    method: 'DELETE',
+  });
 }
 
 /**

@@ -45,35 +45,53 @@ export default function useSources() {
 
   // Fetch toolkit details for a list of IDs
   const fetchToolkitDetails = useCallback(async (ids, currentMap = {}) => {
-    if (!project_id || ids.length === 0) return {};
+    console.log('[useSources] fetchToolkitDetails called with ids:', ids);
+    if (!project_id || ids.length === 0) {
+      console.log('[useSources] fetchToolkitDetails - skipping, no project_id or empty ids');
+      return {};
+    }
 
     const newMap = { ...currentMap };
 
     // Fetch details for IDs we don't have yet
     const idsToFetch = ids.filter(id => !currentMap[id]?.toolkit_name);
+    console.log('[useSources] idsToFetch:', idsToFetch);
 
     if (idsToFetch.length > 0) {
-      // Build URL with toolkit_type filters - include all source-compatible types
-      const toolkitTypes = ['github', 'ado', 'gitlab', 'bitbucket', 'websearch', 'confluence', 'jira'];
-      const params = new URLSearchParams();
-      params.append('limit', '100');
-      toolkitTypes.forEach(type => params.append('toolkit_type', type));
+      // Fetch each toolkit individually by ID to ensure we get the correct name
+      // regardless of toolkit type
+      const fetchPromises = idsToFetch.map(async (id) => {
+        try {
+          console.log(`[useSources] Fetching toolkit ${id}...`);
+          const toolkit = await getToolkit(project_id, id);
+          console.log(`[useSources] Got toolkit ${id}:`, toolkit?.name, toolkit?.type);
+          if (toolkit) {
+            return {
+              id,
+              toolkit_name: toolkit.name || toolkit.toolkit_name || toolkit.type,
+              toolkit_type: toolkit.type,
+            };
+          }
+        } catch (err) {
+          console.warn(`[useSources] Could not fetch toolkit ${id}:`, err.message);
+        }
+        return null;
+      });
 
-      // Use apiRequest which handles session auth correctly
-      const data = await apiRequest(`/api/v2/elitea_core/tools/prompt_lib/${project_id}?${params.toString()}`);
-
-      const rows = Array.isArray(data) ? data : data?.rows || [];
-      rows.forEach(toolkit => {
-        if (idsToFetch.includes(toolkit.id)) {
-          newMap[toolkit.id] = {
-            ...newMap[toolkit.id],
-            toolkit_name: toolkit.name || toolkit.toolkit_name,
-            toolkit_type: toolkit.type,
+      const results = await Promise.all(fetchPromises);
+      console.log('[useSources] fetchToolkitDetails results:', results);
+      results.forEach(result => {
+        if (result) {
+          newMap[result.id] = {
+            ...newMap[result.id],
+            toolkit_name: result.toolkit_name,
+            toolkit_type: result.toolkit_type,
           };
         }
       });
     }
 
+    console.log('[useSources] fetchToolkitDetails returning map:', newMap);
     return newMap;
   }, [project_id]);
 
@@ -87,6 +105,8 @@ export default function useSources() {
         const newMap = { ...currentMap };
 
         // Merge status info into sources map
+        // IMPORTANT: Prefer already-fetched toolkit_name from fetchToolkitDetails
+        // over sources_status.json which may have fallback "toolkit_{id}" values
         statusData.sources.forEach(source => {
           const id = source.toolkit_id;
           newMap[id] = {
@@ -95,8 +115,9 @@ export default function useSources() {
             last_ingested: source.last_updated,
             entities_count: source.entities_count,
             relations_count: source.relations_count,
-            toolkit_name: source.toolkit_name || newMap[id]?.toolkit_name,
-            toolkit_type: source.toolkit_type || newMap[id]?.toolkit_type,
+            // Prefer already-fetched name, fall back to status name only if not available
+            toolkit_name: newMap[id]?.toolkit_name || source.toolkit_name,
+            toolkit_type: newMap[id]?.toolkit_type || source.toolkit_type,
           };
         });
 
