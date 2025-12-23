@@ -1,0 +1,4 @@
+# Inventory Plugin Dependencies
+alita-sdk[runtime,tools]>=0.3.556
+networkx>=3.0
+
