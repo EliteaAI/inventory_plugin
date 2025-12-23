@@ -32,6 +32,7 @@ export default function SourcesList({
     addSource,
     removeSource,
     updateSource,
+    updateSourceConfig,
     refreshSources,
     clearError,
   } = useSources();
@@ -48,6 +49,10 @@ export default function SourcesList({
   const handleRemoveSource = useCallback(async (toolkitId) => {
     await removeSource(toolkitId);
   }, [removeSource]);
+
+  const handleConfigChange = useCallback(async (toolkitId, configUpdates) => {
+    await updateSourceConfig(toolkitId, configUpdates);
+  }, [updateSourceConfig]);
 
   const handleIngest = useCallback(async (toolkitId) => {
     // Update status to ingesting (optimistic update)
@@ -185,6 +190,7 @@ export default function SourcesList({
                 source={source}
                 onIngest={handleIngest}
                 onRemove={handleRemoveSource}
+                onConfigChange={handleConfigChange}
               />
             ))}
           </Box>

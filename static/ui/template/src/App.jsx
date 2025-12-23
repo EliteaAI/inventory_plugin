@@ -35,12 +35,14 @@ import CenterFocusStrongIcon from '@mui/icons-material/CenterFocusStrong';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import MenuIcon from '@mui/icons-material/Menu';
+import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
+import CloseIcon from '@mui/icons-material/Close';
 
 import GraphView, { typeColors } from './components/GraphView';
 import EntityPanel from './components/EntityPanel';
 import StatsPanel from './components/StatsPanel';
 import ToolkitDrawer from './components/ToolkitDrawer';
-import ChatInput from './components/ChatInput';
+import ChatPanel from './components/ChatPanel';
 import {
   getConfig,
   getToolkit,
@@ -48,10 +50,15 @@ import {
   searchGraph,
   getGraphStats,
   getCacheStats,
+  getEntitiesByIds,
+  getEntityNeighbors,
 } from './utils/api';
 
 const RIGHT_PANEL_WIDTH = 300;
 const DRAWER_WIDTH = 300;
+const CHAT_PANEL_MIN_WIDTH = 350;
+const CHAT_PANEL_DEFAULT_WIDTH = 450;
+const CHAT_PANEL_MAX_WIDTH = 900;
 
 function App() {
   const graphRef = useRef(null);
@@ -63,6 +70,10 @@ function App() {
   const [rightTab, setRightTab] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatWidth, setChatWidth] = useState(CHAT_PANEL_DEFAULT_WIDTH);
+  const [isResizing, setIsResizing] = useState(false);
+  const resizeRef = useRef(null);
 
   // Scope controls state
   const [viewMode, setViewMode] = useState('explore');
@@ -94,7 +105,48 @@ function App() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [error, setError] = useState(null);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'info' });
+
+  // Chat-related state
+  const [highlightedNodes, setHighlightedNodes] = useState([]);
+
+  // Accumulated graph from chat exploration - persists and grows with each search
+  const [exploredGraph, setExploredGraph] = useState(() => {
+    // Try to restore from sessionStorage
+    try {
+      const saved = sessionStorage.getItem('inventory_explored_graph');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        console.log('[App] Restored explored graph from session:', parsed.results?.length || 0, 'entities');
+        return parsed;
+      }
+    } catch (e) {
+      console.warn('[App] Failed to restore explored graph from session:', e);
+    }
+    return { results: [], edges: [] };
+  });
   
+  // Persist explored graph to sessionStorage
+  useEffect(() => {
+    if (exploredGraph.results?.length > 0) {
+      try {
+        sessionStorage.setItem('inventory_explored_graph', JSON.stringify(exploredGraph));
+        console.log('[App] Saved explored graph to session:', exploredGraph.results.length, 'entities');
+      } catch (e) {
+        console.warn('[App] Failed to save explored graph to session:', e);
+      }
+    }
+  }, [exploredGraph]);
+
+  // Display restored explored graph on initial load (after loading is done)
+  useEffect(() => {
+    if (!loading && exploredGraph.results?.length > 0 && !graphData) {
+      console.log('[App] Displaying restored explored graph:', exploredGraph.results.length, 'entities');
+      setGraphData(exploredGraph);
+      setNodeCount(exploredGraph.results.length);
+      setEdgeCount(exploredGraph.edges?.length || 0);
+    }
+  }, [loading, exploredGraph, graphData]);
+
   // Extract unique node types from graph data (like visualize.py does)
   useEffect(() => {
     if (graphData?.results) {
@@ -314,6 +366,300 @@ function App() {
     }
   }, []);
 
+  // Chat panel resize handlers
+  const handleResizeMouseDown = useCallback((e) => {
+    e.preventDefault();
+    setIsResizing(true);
+  }, []);
+
+  useEffect(() => {
+    const handleResizeMouseMove = (e) => {
+      if (!isResizing) return;
+
+      // Calculate new width based on mouse position from right edge
+      const containerRect = document.body.getBoundingClientRect();
+      const newWidth = containerRect.right - e.clientX - RIGHT_PANEL_WIDTH - 28; // 28 is chat tab width
+
+      // Clamp to min/max bounds
+      const clampedWidth = Math.max(CHAT_PANEL_MIN_WIDTH, Math.min(CHAT_PANEL_MAX_WIDTH, newWidth));
+      setChatWidth(clampedWidth);
+    };
+
+    const handleResizeMouseUp = () => {
+      setIsResizing(false);
+    };
+
+    if (isResizing) {
+      document.addEventListener('mousemove', handleResizeMouseMove);
+      document.addEventListener('mouseup', handleResizeMouseUp);
+      document.body.style.cursor = 'ew-resize';
+      document.body.style.userSelect = 'none';
+    }
+
+    return () => {
+      document.removeEventListener('mousemove', handleResizeMouseMove);
+      document.removeEventListener('mouseup', handleResizeMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isResizing]);
+
+  // Clear explored graph (also clears sessionStorage)
+  const handleClearExploredGraph = useCallback(() => {
+    graphRef.current?.reset();
+    setExploredGraph({ results: [], edges: [] });
+    setGraphData(null);
+    setNodeCount(0);
+    setEdgeCount(0);
+    setHighlightedNodes([]);
+    try {
+      sessionStorage.removeItem('inventory_explored_graph');
+    } catch (e) {
+      console.warn('[App] Failed to clear explored graph from session:', e);
+    }
+    setSnackbar({
+      open: true,
+      message: 'Explored graph cleared',
+      severity: 'info',
+    });
+  }, []);
+
+  /**
+   * Handle touched entities from chat - fetch graph data and MERGE with existing explored graph
+   * This creates a growing visualization as the user continues chatting
+   */
+  const handleTouchedEntities = useCallback(async (entities) => {
+    console.log('[App] Touched entities from chat:', entities);
+    if (!entities || entities.length === 0) return;
+
+    // Separate file access entities (direct add) from graph entities (need to fetch)
+    const fileAccessEntities = entities.filter(e => e.is_file_access);
+    const graphEntities = entities.filter(e => !e.is_file_access);
+
+    // Extract entity IDs for graph entities only
+    const graphEntityIds = graphEntities.map(e => e.id).filter(Boolean);
+    const allEntityIds = entities.map(e => e.id).filter(Boolean);
+
+    // Convert file access entities to graph result format
+    const fileAccessResults = fileAccessEntities.map(e => ({
+      entity: {
+        id: e.id,
+        name: e.name,
+        type: e.type || 'file',
+        layer: e.layer || 'source',
+        file_path: e.file_path,
+        source_toolkit: e.source_toolkit,
+        description: `File: ${e.file_path}`,
+      },
+      score: 1.0,
+    }));
+
+    console.log(`[App] File access entities: ${fileAccessResults.length}, Graph entities to fetch: ${graphEntityIds.length}`);
+
+    try {
+      let graphResult = { results: [], edges: [] };
+
+      // Only fetch from backend if there are graph entities
+      if (graphEntityIds.length > 0) {
+        graphResult = await getEntitiesByIds(
+          config?.project_id,
+          config?.toolkit_id,
+          graphEntityIds,
+          true // include edges
+        );
+        console.log('[App] Fetched touched entities graph data:', graphResult);
+      }
+
+      // Combine file access results with fetched graph results
+      const newResults = [
+        ...fileAccessResults,
+        ...(graphResult.results || graphResult.entities || []),
+      ];
+      const newEdges = graphResult.edges || [];
+
+      if (newResults.length > 0) {
+        // Use functional update pattern that also updates graphData synchronously
+        setExploredGraph(prev => {
+          const existingIds = new Set(prev.results?.map(r => r.entity?.id || r.id) || []);
+          const existingEdgeKeys = new Set(
+            (prev.edges || []).map(e => `${e.source}--${e.type}-->${e.target}`)
+          );
+
+          // Add new entities that don't already exist
+          const mergedResults = [...(prev.results || [])];
+          let addedCount = 0;
+          for (const result of newResults) {
+            const entityId = result.entity?.id || result.id;
+            if (entityId && !existingIds.has(entityId)) {
+              mergedResults.push(result);
+              existingIds.add(entityId);
+              addedCount++;
+            }
+          }
+
+          // Add new edges that don't already exist
+          const mergedEdges = [...(prev.edges || [])];
+          let addedEdges = 0;
+          for (const edge of newEdges) {
+            const edgeKey = `${edge.source}--${edge.type}-->${edge.target}`;
+            if (!existingEdgeKeys.has(edgeKey)) {
+              mergedEdges.push(edge);
+              existingEdgeKeys.add(edgeKey);
+              addedEdges++;
+            }
+          }
+
+          console.log(`[App] Merged graph: +${addedCount} entities, +${addedEdges} edges (total: ${mergedResults.length} entities, ${mergedEdges.length} edges)`);
+
+          const mergedGraph = {
+            results: mergedResults,
+            edges: mergedEdges,
+            total_entities: mergedResults.length,
+            total_edges: mergedEdges.length,
+          };
+
+          // Update graphData and counts in the same render cycle
+          // React 18 batches these updates together
+          setGraphData(mergedGraph);
+          setNodeCount(mergedResults.length);
+          setEdgeCount(mergedEdges.length);
+
+          return mergedGraph;
+        });
+
+        // Highlight only the newly touched entities
+        setHighlightedNodes(allEntityIds);
+
+        // Show notification
+        setSnackbar({
+          open: true,
+          message: `Added ${allEntityIds.length} entities to exploration`,
+          severity: 'info',
+        });
+      } else {
+        // Entities not found in graph - just highlight what we have
+        setHighlightedNodes(allEntityIds);
+        setSnackbar({
+          open: true,
+          message: `Referenced ${allEntityIds.length} entities (some may not exist in graph)`,
+          severity: 'warning',
+        });
+      }
+    } catch (err) {
+      console.error('[App] Failed to fetch touched entities:', err);
+      // Still try to highlight them in case they're already in the graph
+      setHighlightedNodes(allEntityIds);
+      setSnackbar({
+        open: true,
+        message: `Error loading entity graph: ${err.message}`,
+        severity: 'error',
+      });
+    }
+  }, [config]);
+
+  /**
+   * Handle node expansion from context menu - fetch neighbors at specified depth and MERGE with graph
+   */
+  const handleExpandNode = useCallback(async (entityId, depth) => {
+    console.log(`[App] Expanding node ${entityId} to depth ${depth}`);
+    if (!entityId || !config?.project_id || !config?.toolkit_id) return;
+
+    try {
+      setSearchLoading(true);
+      const startTime = performance.now();
+
+      const result = await getEntityNeighbors(
+        config.project_id,
+        config.toolkit_id,
+        entityId,
+        depth
+      );
+
+      const endTime = performance.now();
+      setQueryTime(Math.round(endTime - startTime));
+
+      console.log('[App] Expand result:', result);
+
+      if (result && (result.results?.length > 0 || result.entities?.length > 0)) {
+        const newResults = result.results || result.entities || [];
+        const newEdges = result.edges || [];
+
+        // Merge with existing graph (same pattern as handleTouchedEntities)
+        setExploredGraph(prev => {
+          const existingIds = new Set(prev.results?.map(r => r.entity?.id || r.id) || []);
+          const existingEdgeKeys = new Set(
+            (prev.edges || []).map(e => `${e.source}--${e.type}-->${e.target}`)
+          );
+
+          // Add new entities that don't already exist
+          const mergedResults = [...(prev.results || [])];
+          let addedCount = 0;
+          for (const result of newResults) {
+            const entityId = result.entity?.id || result.id;
+            if (entityId && !existingIds.has(entityId)) {
+              mergedResults.push(result);
+              existingIds.add(entityId);
+              addedCount++;
+            }
+          }
+
+          // Add new edges that don't already exist
+          const mergedEdges = [...(prev.edges || [])];
+          let addedEdges = 0;
+          for (const edge of newEdges) {
+            const edgeKey = `${edge.source}--${edge.type}-->${edge.target}`;
+            if (!existingEdgeKeys.has(edgeKey)) {
+              mergedEdges.push(edge);
+              existingEdgeKeys.add(edgeKey);
+              addedEdges++;
+            }
+          }
+
+          console.log(`[App] Expand merged: +${addedCount} entities, +${addedEdges} edges (total: ${mergedResults.length} entities, ${mergedEdges.length} edges)`);
+
+          const mergedGraph = {
+            results: mergedResults,
+            edges: mergedEdges,
+            total_entities: mergedResults.length,
+            total_edges: mergedEdges.length,
+          };
+
+          // Update graphData and counts in the same render cycle
+          setGraphData(mergedGraph);
+          setNodeCount(mergedResults.length);
+          setEdgeCount(mergedEdges.length);
+
+          return mergedGraph;
+        });
+
+        // Highlight the expanded nodes
+        const newEntityIds = newResults.map(r => r.entity?.id || r.id).filter(Boolean);
+        setHighlightedNodes(newEntityIds);
+
+        setSnackbar({
+          open: true,
+          message: `Expanded to ${result.total_entities} entities at depth ${depth}`,
+          severity: 'success',
+        });
+      } else {
+        setSnackbar({
+          open: true,
+          message: 'No additional connections found',
+          severity: 'info',
+        });
+      }
+    } catch (err) {
+      console.error('[App] Node expansion failed:', err);
+      setSnackbar({
+        open: true,
+        message: `Expansion failed: ${err.message}`,
+        severity: 'error',
+      });
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [config]);
+
   // Graph context for chat
   const graphContext = useMemo(() => ({
     selectedEntity: selectedEntity,
@@ -329,16 +675,16 @@ function App() {
         palette: {
           mode,
           primary: {
-            main: mode === 'dark' ? '#F47CFF' : '#C428DD',
-            contrastText: '#FFFFFF',
+            main: mode === 'dark' ? '#6ae8fa' : '#C428DD',
+            contrastText: mode === 'dark' ? '#0E131D' : '#FFFFFF',
           },
           secondary: {
             main: mode === 'dark' ? '#777A83' : '#777A83',
           },
           background: {
             default: mode === 'dark' ? '#0E131D' : '#F8FCFF',
-            paper: mode === 'dark' ? '#1A1F2E' : '#FFFFFF',
-            secondary: mode === 'dark' ? '#1A1F2E' : '#FAFAFA',
+            paper: mode === 'dark' ? '#181F2A' : '#FFFFFF',
+            secondary: mode === 'dark' ? '#181F2A' : '#FAFAFA',
           },
           text: {
             primary: mode === 'dark' ? '#FFFFFF' : '#0E131D',
@@ -346,10 +692,10 @@ function App() {
             disabled: mode === 'dark' ? '#5B5E69' : '#CBCED6',
           },
           divider: mode === 'dark' ? 'rgba(255,255,255,0.1)' : '#CBCED6',
-          success: { main: '#2AB37A' },
+          success: { main: '#2BD48D' },
           error: { main: '#D71616' },
           warning: { main: '#E97912' },
-          info: { main: '#6390FE' },
+          info: { main: '#006DD1' },
         },
         typography: {
           fontFamily: '"Montserrat", "Roboto", "Arial", sans-serif',
@@ -455,7 +801,8 @@ function App() {
           MuiTooltip: {
             styleOverrides: {
               tooltip: {
-                backgroundColor: '#3B3E46',
+                backgroundColor: mode === 'dark' ? '#CAD0D8' : '#3B3E46',
+                color: mode === 'dark' ? '#0E131D' : '#FFFFFF',
                 fontSize: '12px',
                 fontWeight: 500,
               },
@@ -555,13 +902,21 @@ function App() {
         </AppBar>
 
           {/* Main Content Area */}
-          <Box sx={{ display: 'flex', flexGrow: 1, overflow: 'hidden' }}>
+          <Box sx={{
+            display: 'flex',
+            flexGrow: 1,
+            minHeight: 0, // Required for flexGrow to work in column layout
+            overflow: 'hidden',
+            // Consistent background across graph and chat tab area
+            backgroundColor: mode === 'dark' ? '#181F2A' : '#fafafa',
+          }}>
 
             {/* Graph Canvas with Tools */}
             <Box sx={{
               flexGrow: 1,
               position: 'relative',
               overflow: 'hidden',
+              minWidth: 0,
             }}>
 
             {/* Loading Overlay */}
@@ -572,7 +927,7 @@ function App() {
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                backgroundColor: 'rgba(255,255,255,0.8)',
+                backgroundColor: mode === 'dark' ? 'rgba(24, 31, 42, 0.9)' : 'rgba(250, 250, 250, 0.9)',
                 zIndex: 10,
               }}>
                 <CircularProgress />
@@ -593,19 +948,11 @@ function App() {
                   ref={graphRef}
                   data={graphData}
                   onNodeSelect={handleNodeSelect}
+                  onExpandNode={handleExpandNode}
                   selectedNode={selectedEntity}
+                  highlightedNodes={highlightedNodes}
                   theme={mode}
                   filters={filters}
-                />
-
-                {/* Floating Chat Input */}
-                <ChatInput
-                  projectId={config?.project_id}
-                  toolkitId={config?.toolkit_id}
-                  toolkit={toolkit}
-                  onQueryResult={handleChatQueryResult}
-                  theme={mode}
-                  graphContext={graphContext}
                 />
 
                 {/* Floating Tools Panel */}
@@ -644,7 +991,7 @@ function App() {
                     </IconButton>
                   </Tooltip>
                   <Tooltip title="Clear" placement="right">
-                    <IconButton size="small" onClick={() => graphRef.current?.reset()}>
+                    <IconButton size="small" onClick={handleClearExploredGraph}>
                       <RestartAltIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
@@ -673,6 +1020,138 @@ function App() {
                 </Paper>
               </>
             )}
+          </Box>
+
+          {/* Chat Side Panel - Expandable & Resizable */}
+          <Box
+            sx={{
+              display: 'flex',
+              flexShrink: 0,
+              height: '100%',
+              position: 'relative',
+              zIndex: chatOpen ? 10 : 1, // Higher z-index when open to overlay graph
+              // Match the graph background color for seamless look
+              backgroundColor: mode === 'dark' ? '#181F2A' : '#fafafa',
+            }}
+          >
+            {/* Vertical Chat Tab Button */}
+            <Box
+              onClick={() => setChatOpen(!chatOpen)}
+              sx={{
+                width: 28,
+                minHeight: 120,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                backgroundColor: mode === 'dark'
+                  ? (chatOpen ? '#6ae8fa' : 'rgba(106, 232, 250, 0.15)')
+                  : (chatOpen ? '#C428DD' : 'rgba(196, 40, 221, 0.1)'),
+                borderTopLeftRadius: 8,
+                borderBottomLeftRadius: 8,
+                marginTop: 'auto',
+                marginBottom: 'auto',
+                transition: 'all 0.2s ease',
+                '&:hover': {
+                  backgroundColor: mode === 'dark'
+                    ? (chatOpen ? '#83EFFF' : 'rgba(106, 232, 250, 0.25)')
+                    : (chatOpen ? '#9B1FB0' : 'rgba(196, 40, 221, 0.2)'),
+                },
+              }}
+            >
+              <Typography
+                sx={{
+                  writingMode: 'vertical-rl',
+                  textOrientation: 'mixed',
+                  transform: 'rotate(180deg)',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  letterSpacing: '1px',
+                  color: mode === 'dark'
+                    ? (chatOpen ? '#0E131D' : '#6ae8fa')
+                    : (chatOpen ? '#FFFFFF' : '#C428DD'),
+                  userSelect: 'none',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <ChatBubbleOutlineIcon sx={{ fontSize: 14, transform: 'rotate(90deg)' }} />
+                Chat
+              </Typography>
+            </Box>
+
+            {/* Expandable Chat Panel with Resize Handle */}
+            <Box
+              sx={{
+                position: 'relative',
+                width: chatOpen ? chatWidth : 0,
+                height: '100%',
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+                borderLeft: chatOpen ? 1 : 0,
+                borderColor: 'divider',
+                backgroundColor: 'background.paper',
+                transition: isResizing ? 'none' : 'width 0.2s ease',
+              }}
+            >
+              {/* Resize Handle - on the left edge of chat content */}
+              {chatOpen && (
+                <Box
+                  ref={resizeRef}
+                  onMouseDown={handleResizeMouseDown}
+                  sx={{
+                    position: 'absolute',
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 6,
+                    cursor: 'ew-resize',
+                    zIndex: 20,
+                    backgroundColor: isResizing
+                      ? (mode === 'dark' ? 'rgba(106, 232, 250, 0.5)' : 'rgba(196, 40, 221, 0.5)')
+                      : 'transparent',
+                    transition: isResizing ? 'none' : 'background-color 0.2s',
+                    '&:hover': {
+                      backgroundColor: mode === 'dark'
+                        ? 'rgba(106, 232, 250, 0.3)'
+                        : 'rgba(196, 40, 221, 0.3)',
+                    },
+                    '&::after': {
+                      content: '""',
+                      position: 'absolute',
+                      left: 2,
+                      top: '50%',
+                      transform: 'translateY(-50%)',
+                      width: 2,
+                      height: 40,
+                      borderRadius: 1,
+                      backgroundColor: mode === 'dark'
+                        ? 'rgba(106, 232, 250, 0.4)'
+                        : 'rgba(196, 40, 221, 0.4)',
+                    },
+                  }}
+                />
+              )}
+              {chatOpen && (
+                <ChatPanel
+                  projectId={config?.project_id}
+                  toolkitId={config?.toolkit_id}
+                  toolkit={toolkit}
+                  filters={{
+                    entity_types: selectedNodeTypes,
+                    sources: selectedSources,
+                    depth: depth,
+                    max_nodes: maxNodes,
+                  }}
+                  onClose={() => setChatOpen(false)}
+                  onTouchedEntities={handleTouchedEntities}
+                  onClearGraph={handleClearExploredGraph}
+                  theme={mode}
+                />
+              )}
+            </Box>
           </Box>
 
           {/* Right Panel */}

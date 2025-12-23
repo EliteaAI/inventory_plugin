@@ -139,12 +139,12 @@ export default function EditSourceDialog({
 
       <DialogContent dividers>
         {/* Language Preset Selector */}
-        <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-          <InputLabel>Language Preset</InputLabel>
+        <FormControl fullWidth variant="standard" sx={{ mb: 3 }}>
+          <InputLabel shrink>Language Preset</InputLabel>
           <Select
             value={preset}
-            label="Language Preset"
             onChange={handlePresetChange}
+            displayEmpty
           >
             {Object.entries(LANGUAGE_PRESETS).map(([key, config]) => (
               <MenuItem key={key} value={key}>
@@ -157,41 +157,44 @@ export default function EditSourceDialog({
         {/* File Patterns (Whitelist) */}
         <TextField
           fullWidth
+          variant="standard"
           label="Include Patterns (Whitelist)"
           placeholder="**/*.py, **/*.js, src/**"
           value={filePatterns}
           onChange={(e) => setFilePatterns(e.target.value)}
-          size="small"
           multiline
           rows={2}
-          sx={{ mb: 2 }}
+          sx={{ mb: 3 }}
           helperText="Comma-separated glob patterns of files to include"
+          InputLabelProps={{ shrink: true }}
         />
 
         {/* Exclude Patterns (Blacklist) */}
         <TextField
           fullWidth
+          variant="standard"
           label="Exclude Patterns (Blacklist)"
           placeholder="**/test/**, **/node_modules/**, **/vendor/**"
           value={excludePatterns}
           onChange={(e) => setExcludePatterns(e.target.value)}
-          size="small"
           multiline
           rows={2}
-          sx={{ mb: 2 }}
+          sx={{ mb: 3 }}
           helperText="Comma-separated glob patterns of files to exclude"
+          InputLabelProps={{ shrink: true }}
         />
 
         {/* Branch Override */}
         <TextField
           fullWidth
+          variant="standard"
           label="Branch (Optional)"
           placeholder="main, develop, feature/..."
           value={branch}
           onChange={(e) => setBranch(e.target.value)}
-          size="small"
           sx={{ mb: 2 }}
           helperText="Override default branch for this source"
+          InputLabelProps={{ shrink: true }}
         />
 
         {/* Help Section */}

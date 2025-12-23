@@ -221,6 +221,10 @@ class Method:
             "get_ingestion_status": self._tool_get_ingestion_status,
             # Source status tools (for UI)
             "get_sources_status": self._tool_get_sources_status,
+            # Entity batch retrieval (for chat highlighting)
+            "get_entities_by_ids": self._tool_get_entities_by_ids,
+            # Entity neighbor expansion (for graph UI context menu)
+            "get_entity_neighbors": self._tool_get_entity_neighbors,
         }
 
         if tool_name not in tools:
@@ -443,10 +447,12 @@ class Method:
             return f"Error: {error_message}"
 
         self.invocation_thinking(f"Starting ingestion from toolkit {toolkit_id}...")
+        log.info(f"[run_ingestion] ===== Starting ingestion for toolkit {toolkit_id} =====")
 
         try:
             # Get project_id and application_id from request context
             config = request_data.get("configuration", {})
+            log.info(f"[run_ingestion] config keys: {list(config.keys())}")
             project_id = config.get("project_id") or params.get("project_id")
             application_id = config.get("application_id") or params.get("application_id")
 
@@ -462,13 +468,39 @@ class Method:
 
             self.invocation_thinking(f"Connecting to platform at {alita_client.base_url}...")
 
-            # Instantiate source toolkit using AlitaClient.toolkit()
+            # Instantiate source toolkit
             # Note: toolkit_id parameter refers to the SOURCE toolkit (GitHub/ADO/GitLab),
             # not the inventory toolkit itself
+            # We fetch directly using the correct API path (/api/v2/elitea_core) because
+            # AlitaClient.toolkit() uses the old /api/v1 path
             self.invocation_thinking(f"Loading source toolkit {toolkit_id}...")
+            log.info(f"[run_ingestion] Loading source toolkit {toolkit_id}")
             try:
-                source_toolkit_instance = alita_client.toolkit(int(toolkit_id))
-            except ValueError as e:
+                import requests as http_requests
+                from alita_sdk.tools import instantiate_toolkit
+
+                # Fetch toolkit data using correct API path
+                toolkit_api_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
+                log.info(f"[run_ingestion] Fetching toolkit from: {toolkit_api_url}")
+
+                resp = http_requests.get(toolkit_api_url, headers=alita_client.headers, verify=False)
+                if not resp.ok:
+                    log.error(f"[run_ingestion] Failed to fetch toolkit: {resp.status_code} - {resp.text}")
+                    return f"Error: Failed to fetch source toolkit {toolkit_id}: {resp.status_code}"
+
+                toolkit_data = resp.json()
+                log.info(f"[run_ingestion] Got toolkit data: {toolkit_data.get('name', 'unknown')}, type: {toolkit_data.get('type', 'unknown')}")
+
+                # Add alita client to settings (same as AlitaClient.toolkit() does)
+                if 'settings' not in toolkit_data:
+                    toolkit_data['settings'] = {}
+                toolkit_data['settings']['alita'] = alita_client
+
+                # Instantiate toolkit using instantiate_toolkit from SDK
+                source_toolkit_instance = instantiate_toolkit(toolkit_data)
+                log.info(f"[run_ingestion] Source toolkit loaded: {type(source_toolkit_instance)}")
+            except Exception as e:
+                log.exception(f"[run_ingestion] Failed to load source toolkit {toolkit_id}")
                 return f"Error: Failed to load source toolkit {toolkit_id}: {e}"
 
             # Extract api_wrapper from the toolkit's tools
@@ -487,7 +519,27 @@ class Method:
             self.invocation_thinking(f"Loaded {toolkit_type} toolkit: {toolkit_name}")
 
             # Get inventory toolkit settings from request_data (passed when tool is invoked)
-            inventory_settings = config.get("settings", {}) or params
+            inventory_settings = config.get("settings", {})
+
+            # If settings not passed, fetch them from the platform API
+            if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
+                log.info(f"Settings not in request, fetching inventory toolkit {application_id} settings from platform...")
+                try:
+                    # Fetch raw toolkit data from platform API using correct path
+                    inventory_toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
+                    log.info(f"[run_ingestion] Fetching inventory toolkit from: {inventory_toolkit_url}")
+                    resp = http_requests.get(inventory_toolkit_url, headers=alita_client.headers, verify=False)
+                    if resp.ok:
+                        inventory_toolkit_data = resp.json()
+                        inventory_settings = inventory_toolkit_data.get("settings", {})
+                        log.info(f"Fetched inventory toolkit settings keys: {list(inventory_settings.keys())}")
+                    else:
+                        log.warning(f"Failed to fetch inventory toolkit: {resp.status_code}")
+                        inventory_settings = params
+                except Exception as fetch_err:
+                    log.warning(f"Could not fetch inventory toolkit settings: {fetch_err}")
+                    inventory_settings = params  # Fall back to params
+
             log.info(f"Inventory toolkit settings keys: {list(inventory_settings.keys())}")
 
             # Get LLM configuration from inventory toolkit settings
@@ -528,7 +580,10 @@ class Method:
                 inventory_settings.get("source_configs") or
                 {}
             )
+            log.info(f"All source_configs: {source_configs}")
+            log.info(f"Looking for toolkit_id key: '{toolkit_id}' (str: '{str(toolkit_id)}')")
             source_config = source_configs.get(str(toolkit_id), {})
+            log.info(f"Source config for toolkit {toolkit_id}: {source_config}")
 
             # Use source-specific patterns if available, otherwise fall back to params
             effective_file_patterns = source_config.get("file_patterns") or file_patterns
@@ -538,8 +593,7 @@ class Method:
             if source_config.get("branch") and not branch:
                 branch = source_config.get("branch")
 
-            log.info(f"Source config for toolkit {toolkit_id}: {source_config}")
-            log.info(f"Effective patterns - whitelist: {effective_file_patterns}, blacklist: {effective_exclude_patterns}")
+            log.info(f"Effective patterns - whitelist: '{effective_file_patterns}', blacklist: '{effective_exclude_patterns}'")
 
             # Build whitelist/blacklist from patterns
             whitelist = [p.strip() for p in effective_file_patterns.split(",") if p.strip()] if effective_file_patterns else None
@@ -1739,6 +1793,146 @@ class Method:
 
         return output
 
+    # ========== Entity Batch Retrieval (for Chat Highlighting) ==========
+
+    @web.method()
+    def _tool_get_entities_by_ids(self, params, graph_path, request_data):
+        """
+        Fetch entities by their IDs along with the edges connecting them.
+
+        Used by the chat UI to display and highlight entities that were
+        accessed during a chat response.
+
+        Parameters:
+            entity_ids: List of entity IDs to fetch
+            include_edges: Whether to include edges between entities (default: True)
+            include_bridging: Whether to include bridging nodes that connect disjoint clusters (default: True)
+            max_bridge_length: Max path length for bridging (default: 4, meaning up to 3 intermediate nodes)
+            output_format: "json" or "text" (default: "json")
+
+        Returns:
+            Graph data with results (entities) and edges between them
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+        entity_ids = params.get("entity_ids", [])
+        include_edges = params.get("include_edges", True)
+        include_bridging = params.get("include_bridging", True)
+        max_bridge_length = params.get("max_bridge_length", 4)
+
+        if not entity_ids:
+            if output_format == "json":
+                return json_module.dumps({
+                    "results": [],
+                    "edges": [],
+                    "error": "No entity_ids provided"
+                })
+            return "No entity_ids provided"
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({
+                    "results": [],
+                    "edges": [],
+                    "error": "No graph configured"
+                })
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        # Fetch entities by ID
+        results = []
+        entity_id_set = set(entity_ids)
+
+        for entity_id in entity_ids:
+            entity = kg.get_entity(entity_id)
+            if entity:
+                # Add the id to the entity (not included by get_entity since it's the graph key)
+                entity['id'] = entity_id
+                results.append({
+                    "entity": entity,
+                    "score": 1.0,
+                })
+
+        # Find and add bridging nodes to connect disjoint clusters
+        bridging_info = {'bridging_nodes': [], 'bridging_edges': [], 'clusters': 1}
+        if include_bridging and len(results) > 1:
+            bridging_info = kg.find_bridging_nodes(
+                entity_ids,
+                max_bridge_length=max_bridge_length,
+                max_bridges=20
+            )
+
+            # Add bridging nodes to results (marked as bridging)
+            for bridge_id in bridging_info.get('bridging_nodes', []):
+                if bridge_id not in entity_id_set:
+                    entity = kg.get_entity(bridge_id)
+                    if entity:
+                        entity['id'] = bridge_id
+                        entity['is_bridging'] = True  # Mark as bridging node
+                        results.append({
+                            "entity": entity,
+                            "score": 0.5,  # Lower score for bridging nodes
+                        })
+                        entity_id_set.add(bridge_id)
+
+        # Collect edges that connect our entities (including bridging nodes)
+        edges = []
+        if include_edges and len(results) > 0:
+            # Get edges from the networkx graph between our entities
+            for source_id in entity_id_set:
+                if kg._graph.has_node(source_id):
+                    for _, target_id, data in kg._graph.out_edges(source_id, data=True):
+                        if target_id in entity_id_set:
+                            edges.append({
+                                'source': source_id,
+                                'target': target_id,
+                                'type': data.get('relation_type', 'RELATED'),
+                            })
+
+        # Add bridging edges if not already included
+        if include_bridging:
+            existing_edges = set(f"{e['source']}--{e['type']}-->{e['target']}" for e in edges)
+            for edge in bridging_info.get('bridging_edges', []):
+                edge_key = f"{edge['source']}--{edge['type']}-->{edge['target']}"
+                if edge_key not in existing_edges:
+                    edges.append(edge)
+                    existing_edges.add(edge_key)
+
+        if output_format == "json":
+            return json_module.dumps({
+                "results": results,
+                "edges": edges,
+                "total_entities": len(results),
+                "total_edges": len(edges),
+                "clusters_found": bridging_info.get('clusters', 1),
+                "bridging_nodes_added": len(bridging_info.get('bridging_nodes', [])),
+            })
+
+        # Format as text
+        if not results:
+            return f"No entities found for the provided IDs."
+
+        output = f"Found {len(results)} entities and {len(edges)} connecting edges:\n\n"
+        for r in results:
+            entity = r['entity']
+            output += f"- **{entity.get('name')}** ({entity.get('type', 'unknown')})\n"
+            output += f"  ID: {entity.get('id')}\n"
+            if entity.get('description'):
+                output += f"  Description: {entity.get('description')[:100]}...\n"
+            output += "\n"
+
+        if edges:
+            output += "\n## Edges:\n"
+            for edge in edges[:20]:  # Limit to first 20 edges
+                output += f"- {edge.get('source')} --[{edge.get('type', 'RELATED')}]--> {edge.get('target')}\n"
+            if len(edges) > 20:
+                output += f"  ...and {len(edges) - 20} more edges\n"
+
+        return output
+
     # ========== Ingestion Status Tools ==========
 
     @web.method()
@@ -1786,5 +1980,131 @@ class Method:
         else:
             output = "No active ingestion for this toolkit.\n\n"
             output += f"Slots: {tracker_status['active_count']}/{tracker_status['max_parallel']} in use\n"
+
+        return output
+
+    # ========== Entity Neighbor Expansion (for Graph UI Context Menu) ==========
+
+    @web.method()
+    def _tool_get_entity_neighbors(self, params, graph_path, request_data):
+        """
+        Get neighbors of an entity up to a specified depth level.
+
+        Used by the graph UI context menu to expand connections 1-3 levels deep.
+
+        Parameters:
+            entity_id: ID of the entity to expand from
+            depth: Number of hops to expand (1, 2, or 3)
+            output_format: "json" or "text" (default: "json")
+
+        Returns:
+            Graph data with results (entities) and edges connecting them
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+        entity_id = params.get("entity_id")
+        depth = params.get("depth", 1)
+
+        # Validate depth
+        depth = max(1, min(3, int(depth)))
+
+        if not entity_id:
+            if output_format == "json":
+                return json_module.dumps({
+                    "results": [],
+                    "edges": [],
+                    "error": "No entity_id provided"
+                })
+            return "No entity_id provided"
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({
+                    "results": [],
+                    "edges": [],
+                    "error": "No graph configured"
+                })
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+        graph = kg._graph
+
+        # Check if entity exists
+        if entity_id not in graph:
+            if output_format == "json":
+                return json_module.dumps({
+                    "results": [],
+                    "edges": [],
+                    "error": f"Entity '{entity_id}' not found in graph"
+                })
+            return f"Entity '{entity_id}' not found in graph"
+
+        # Perform BFS expansion to find all neighbors up to depth
+        current_layer = {entity_id}
+        all_entity_ids = {entity_id}
+
+        for _ in range(depth):
+            next_layer = set()
+            for eid in current_layer:
+                if eid in graph:
+                    # Get both incoming and outgoing neighbors
+                    neighbors = set(graph.predecessors(eid)) | set(graph.successors(eid))
+                    # Add only new neighbors
+                    new_neighbors = neighbors - all_entity_ids
+                    next_layer.update(new_neighbors)
+
+            if not next_layer:
+                break  # No more neighbors to expand
+
+            all_entity_ids.update(next_layer)
+            current_layer = next_layer
+
+        # Build results list
+        results = []
+        for eid in all_entity_ids:
+            entity_data = graph.nodes.get(eid)
+            if entity_data:
+                entity = dict(entity_data)
+                entity['id'] = eid
+                # Mark the original entity
+                entity['is_origin'] = (eid == entity_id)
+                results.append({
+                    'entity': entity,
+                    'score': 1.0 if eid == entity_id else 0.5,
+                })
+
+        # Collect edges that connect our entities
+        edges = []
+        for source_id in all_entity_ids:
+            if graph.has_node(source_id):
+                for _, target_id, data in graph.out_edges(source_id, data=True):
+                    if target_id in all_entity_ids:
+                        edges.append({
+                            'source': source_id,
+                            'target': target_id,
+                            'type': data.get('relation_type', 'RELATED'),
+                        })
+
+        if output_format == "json":
+            return json_module.dumps({
+                "results": results,
+                "edges": edges,
+                "total_entities": len(results),
+                "total_edges": len(edges),
+                "origin_entity_id": entity_id,
+                "depth": depth,
+            })
+
+        # Format as text
+        output = f"Found {len(results)} entities within {depth} hop(s) of '{entity_id}':\n\n"
+        for r in results:
+            entity = r['entity']
+            marker = " (origin)" if entity.get('is_origin') else ""
+            output += f"- **{entity.get('name')}** ({entity.get('type', 'unknown')}){marker}\n"
+
+        if edges:
+            output += f"\n{len(edges)} edges connecting these entities.\n"
 
         return output
