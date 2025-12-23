@@ -46,6 +46,7 @@ class InventoryChatCallback:
         emit_fn: Callable[[str, Dict[str, Any]], None],
         session_id: str,
         conversation_id: Optional[str] = None,
+        file_tracking_fn: Optional[Callable[[str, str], None]] = None,
     ):
         """
         Initialize callback handler.
@@ -54,10 +55,12 @@ class InventoryChatCallback:
             emit_fn: Function to emit events (receives event_type, data)
             session_id: Unique session ID for this chat
             conversation_id: Optional conversation ID for history
+            file_tracking_fn: Optional function to track file accesses (tool_name, input_str)
         """
         self.emit_fn = emit_fn
         self.session_id = session_id
         self.conversation_id = conversation_id
+        self.file_tracking_fn = file_tracking_fn
         self.tool_runs = {}  # Track active tool runs
         self.start_time = time.time()
 
@@ -211,6 +214,16 @@ class InventoryChatCallback:
             "start_time": time.time(),
         }
 
+        # Track file accesses for file-reading tools
+        if self.file_tracking_fn:
+            file_reading_patterns = ('read_file', 'get_file', 'fetch_file', 'get_content', 'read_content')
+            tool_name_lower = tool_name.lower()
+            if any(pattern in tool_name_lower for pattern in file_reading_patterns):
+                try:
+                    self.file_tracking_fn(tool_name, input_str)
+                except Exception as e:
+                    log.warning(f"File tracking failed for {tool_name}: {e}")
+
         self.emit("tool_start", {
             "run_id": run_id,
             "tool_name": tool_name,
@@ -326,11 +339,59 @@ class Method:
         log.info(f"[inventory_chat] prompt: {prompt[:100]}...")
         log.info(f"[inventory_chat] filters: {filters}")
 
-        # Create callback handler
+        # Track entities accessed during execution (shared across all tracking)
+        touched_entities = []
+
+        # Create file tracking function for callback
+        def track_file_from_tool(tool_name: str, tool_input: str):
+            """Extract file path from tool input and add to touched_entities."""
+            import re
+
+            FILE_PATH_PATTERNS = [
+                r'"(?:file_?path|path|file)"\s*:\s*"([^"]+)"',
+                r"'(?:file_?path|path|file)'\s*:\s*'([^']+)'",
+                r'(?:file_?path|path|file)\s*=\s*["\']?([^\s"\',}]+)',
+            ]
+
+            file_path = None
+            input_str = str(tool_input) if tool_input else ""
+
+            for pattern in FILE_PATH_PATTERNS:
+                match = re.search(pattern, input_str, re.IGNORECASE)
+                if match:
+                    file_path = match.group(1)
+                    break
+
+            # If input looks like a plain file path
+            if not file_path and '/' in input_str and not input_str.strip().startswith('{'):
+                path = input_str.strip().strip('"\'')
+                if path and ' ' not in path[:20]:
+                    file_path = path
+
+            if file_path:
+                # Extract toolkit name from tool_name (e.g., "github_read_file" -> "github")
+                toolkit_name = tool_name.split('_')[0] if '_' in tool_name else "source"
+                file_id = f"file:{toolkit_name}:{file_path}"
+
+                if not any(e.get('id') == file_id for e in touched_entities):
+                    file_name = file_path.split('/')[-1] if '/' in file_path else file_path
+                    touched_entities.append({
+                        'id': file_id,
+                        'name': file_name,
+                        'type': 'file',
+                        'layer': 'source',
+                        'file_path': file_path,
+                        'source_toolkit': toolkit_name,
+                        'is_file_access': True,
+                    })
+                    log.info(f"[inventory_chat] Tracked file access: {file_path} from {toolkit_name}")
+
+        # Create callback handler with file tracking
         callback = InventoryChatCallback(
             emit_fn=emit_fn or (lambda t, d: None),  # No-op if no emit function
             session_id=session_id,
             conversation_id=conversation_id,
+            file_tracking_fn=track_file_from_tool,
         )
 
         try:
@@ -371,10 +432,7 @@ class Method:
             # 4. Get graph path
             graph_path = f"/data/graphs/{project_id}/{toolkit_id}/graph.json"
 
-            # 5. Track entities accessed during execution
-            touched_entities = []
-
-            # 6. Build tools for the agent
+            # 5. Build tools for the agent (touched_entities was declared earlier)
             tools = self._build_chat_tools(
                 project_id=project_id,
                 toolkit_id=toolkit_id,
@@ -1366,106 +1424,18 @@ class Method:
         touched_entities: List[Dict[str, Any]],
     ) -> List:
         """
-        Wrap tools to track file accesses for graph visualization.
+        Pass-through for tools - file tracking now happens via LangChain callbacks.
 
-        When a tool reads a file (read_file, get_file_content, etc.),
-        the file path is extracted and added to touched_entities.
+        Previously this method wrapped tools to intercept file accesses, but that
+        approach broke toolkit initialization (especially GitHub toolkit). Now
+        tracking happens in InventoryChatCallback.on_tool_start instead.
 
         Args:
-            tools: List of LangChain tools to wrap
-            toolkit_name: Name of the source toolkit
-            touched_entities: Shared list to track accessed files
+            tools: List of LangChain tools
+            toolkit_name: Name of the source toolkit (unused, kept for compatibility)
+            touched_entities: Shared list (unused, tracking via callback now)
 
         Returns:
-            List of wrapped tools
+            Original tools list unchanged
         """
-        from langchain.tools import Tool
-        import re
-
-        # Patterns to extract file paths from tool inputs
-        FILE_PATH_PATTERNS = [
-            r'"(?:file_?path|path|file)"\s*:\s*"([^"]+)"',  # JSON: "file_path": "..."
-            r"'(?:file_?path|path|file)'\s*:\s*'([^']+)'",  # JSON with single quotes
-            r'(?:file_?path|path|file)\s*=\s*["\']?([^\s"\',}]+)',  # key=value
-        ]
-
-        def extract_file_path(tool_input: str) -> str:
-            """Extract file path from tool input string."""
-            if not tool_input:
-                return None
-
-            for pattern in FILE_PATH_PATTERNS:
-                match = re.search(pattern, tool_input, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-
-            # If input looks like a plain file path
-            if '/' in tool_input and not tool_input.startswith('{'):
-                # Clean up the path
-                path = tool_input.strip().strip('"\'')
-                if path and not ' ' in path[:20]:  # Likely a path, not a sentence
-                    return path
-
-            return None
-
-        def track_file_access(file_path: str, toolkit: str):
-            """Add file to touched_entities for graph display."""
-            if not file_path:
-                return
-
-            # Create a unique ID for the file
-            file_id = f"file:{toolkit}:{file_path}"
-
-            # Check if already tracked
-            if any(e.get('id') == file_id for e in touched_entities):
-                return
-
-            # Extract file name for display
-            file_name = file_path.split('/')[-1] if '/' in file_path else file_path
-
-            touched_entities.append({
-                'id': file_id,
-                'name': file_name,
-                'type': 'file',
-                'layer': 'source',
-                'file_path': file_path,
-                'source_toolkit': toolkit,
-                'is_file_access': True,  # Flag for UI to handle differently
-            })
-            log.info(f"[_wrap_tools_with_tracking] Tracked file access: {file_path} from {toolkit}")
-
-        def create_wrapper(original_tool, toolkit: str):
-            """Create a wrapped version of the tool that tracks file accesses."""
-            original_func = original_tool.func
-
-            def wrapped_func(tool_input: str) -> str:
-                # Extract and track file path before calling original
-                file_path = extract_file_path(tool_input)
-                if file_path:
-                    track_file_access(file_path, toolkit)
-
-                # Call the original tool
-                return original_func(tool_input)
-
-            # Create new tool with wrapped function
-            return Tool(
-                name=original_tool.name,
-                func=wrapped_func,
-                description=original_tool.description,
-            )
-
-        # Wrap tools that likely read files
-        FILE_READING_PATTERNS = ('read_file', 'get_file', 'fetch_file', 'get_content', 'read_content')
-
-        wrapped_tools = []
-        for tool in tools:
-            tool_name = tool.name.lower() if hasattr(tool, 'name') else ''
-
-            # Check if this tool reads files
-            if any(pattern in tool_name for pattern in FILE_READING_PATTERNS):
-                wrapped_tools.append(create_wrapper(tool, toolkit_name))
-                log.debug(f"[_wrap_tools_with_tracking] Wrapped file-reading tool: {tool_name}")
-            else:
-                wrapped_tools.append(tool)
-
-        return wrapped_tools
+        return tools
