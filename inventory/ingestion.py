@@ -1767,29 +1767,37 @@ class IngestionPipeline(BaseModel):
         # Add file entity to the beginning (it's the container)
         all_entities.insert(0, file_entity)
         
-        # Create DEFINED_IN relationships from all entities to file
-        # AND CONTAINS relationships from file to all entities (inverse)
+        # Create relationships from file to all entities
+        # - CONTAINS for structural entities (classes, functions, facts, etc.)
+        # - IMPLEMENTS for semantic entities (features, requirements, etc.)
+        IMPLEMENTABLE_TYPES = {'feature', 'requirement', 'user_story', 'epic', 'capability'}
+
         for entity in all_entities[1:]:  # Skip the file entity itself
-            # Entity is defined_in the file
-            parser_relationships.append({
-                'source_id': entity['id'],
-                'target_id': file_entity_id,
-                'relation_type': 'defined_in',
-                'properties': {
-                    'source': 'parser',
-                    'source_toolkit': source_toolkit,
-                },
-            })
-            # File contains the entity (inverse relationship for easier traversal)
-            parser_relationships.append({
-                'source_id': file_entity_id,
-                'target_id': entity['id'],
-                'relation_type': 'contains',
-                'properties': {
-                    'source': 'parser',
-                    'source_toolkit': source_toolkit,
-                },
-            })
+            entity_type = entity.get('type', '').lower()
+
+            # Determine relationship type based on entity type
+            if entity_type in IMPLEMENTABLE_TYPES:
+                # File implements this feature/requirement
+                parser_relationships.append({
+                    'source_id': file_entity_id,
+                    'target_id': entity['id'],
+                    'relation_type': 'implements',
+                    'properties': {
+                        'source': 'parser',
+                        'source_toolkit': source_toolkit,
+                    },
+                })
+            else:
+                # File contains this structural entity
+                parser_relationships.append({
+                    'source_id': file_entity_id,
+                    'target_id': entity['id'],
+                    'relation_type': 'contains',
+                    'properties': {
+                        'source': 'parser',
+                        'source_toolkit': source_toolkit,
+                    },
+                })
         
         file_total_time = (time.time() - parser_start)
         logger.info(f"⏱️ [TIMING] File total: {file_total_time:.3f}s (parser: {parser_duration:.3f}s, llm_max: {max(entity_llm_duration, fact_llm_duration):.3f}s) for {Path(file_path).name}")
@@ -2380,6 +2388,125 @@ class IngestionPipeline(BaseModel):
                                 'confidence': 0.9
                             })
         
+        # ========================================================================
+        # PHASE 3: Semantic feature linking
+        # ========================================================================
+        # Connect similar features across files based on:
+        # - Same domain property
+        # - Similar names (word overlap)
+        # - Same capability property
+
+        LINKABLE_TYPES = {'feature', 'requirement', 'user_story', 'epic', 'capability'}
+
+        # Collect all linkable entities
+        linkable_entities = [
+            ent for ent in entities
+            if ent.get('type', '').lower() in LINKABLE_TYPES
+        ]
+
+        if len(linkable_entities) >= 2:
+            # Group by domain
+            by_domain: Dict[str, List[Dict]] = {}
+            # Group by capability
+            by_capability: Dict[str, List[Dict]] = {}
+            # For name similarity
+            name_words: Dict[str, Tuple[set, Dict]] = {}  # id -> (word_set, entity)
+
+            for ent in linkable_entities:
+                ent_id = ent.get('id', '')
+                props = ent.get('properties', {})
+
+                # Group by domain
+                domain = props.get('domain', '').lower().strip()
+                if domain:
+                    if domain not in by_domain:
+                        by_domain[domain] = []
+                    by_domain[domain].append(ent)
+
+                # Group by capability
+                capability = props.get('capability', '').lower().strip()
+                if capability:
+                    if capability not in by_capability:
+                        by_capability[capability] = []
+                    by_capability[capability].append(ent)
+
+                # Extract words from name for similarity
+                name = ent.get('name', '')
+                if name and ent_id:
+                    # Normalize and split into words
+                    normalized = name.lower().replace('-', ' ').replace('_', ' ')
+                    words = set(w for w in normalized.split() if len(w) >= 3)
+                    # Remove common stop words
+                    stop_words = {'the', 'and', 'for', 'from', 'with', 'into', 'that', 'this'}
+                    words = words - stop_words
+                    if words:
+                        name_words[ent_id] = (words, ent)
+
+            # Link features with same domain
+            for domain, domain_ents in by_domain.items():
+                if len(domain_ents) >= 2:
+                    for i, ent1 in enumerate(domain_ents):
+                        for ent2 in domain_ents[i+1:]:
+                            if ent1.get('id') != ent2.get('id'):
+                                cross_relations.append({
+                                    'source_id': ent1.get('id'),
+                                    'target_id': ent2.get('id'),
+                                    'type': 'RELATED_TO',
+                                    'properties': {
+                                        'discovered_by': 'semantic_domain_match',
+                                        'common_domain': domain,
+                                    },
+                                    'confidence': 0.85
+                                })
+
+            # Link features with same capability
+            for capability, cap_ents in by_capability.items():
+                if len(cap_ents) >= 2:
+                    for i, ent1 in enumerate(cap_ents):
+                        for ent2 in cap_ents[i+1:]:
+                            if ent1.get('id') != ent2.get('id'):
+                                cross_relations.append({
+                                    'source_id': ent1.get('id'),
+                                    'target_id': ent2.get('id'),
+                                    'type': 'RELATED_TO',
+                                    'properties': {
+                                        'discovered_by': 'semantic_capability_match',
+                                        'common_capability': capability,
+                                    },
+                                    'confidence': 0.80
+                                })
+
+            # Link features with similar names (word overlap >= 2)
+            entity_ids = list(name_words.keys())
+            for i, id1 in enumerate(entity_ids):
+                words1, ent1 = name_words[id1]
+                for id2 in entity_ids[i+1:]:
+                    words2, ent2 = name_words[id2]
+
+                    # Calculate word overlap
+                    common_words = words1 & words2
+                    if len(common_words) >= 2:
+                        # Significant overlap - link them
+                        cross_relations.append({
+                            'source_id': id1,
+                            'target_id': id2,
+                            'type': 'RELATED_TO',
+                            'properties': {
+                                'discovered_by': 'semantic_name_similarity',
+                                'common_words': list(common_words),
+                                'similarity_score': len(common_words) / max(len(words1), len(words2))
+                            },
+                            'confidence': min(0.6 + 0.1 * len(common_words), 0.9)
+                        })
+
+            if by_domain or by_capability or name_words:
+                domain_links = sum(len(ents) * (len(ents) - 1) // 2 for ents in by_domain.values() if len(ents) >= 2)
+                self._log_progress(
+                    f"🔗 Semantic linking: {len(by_domain)} domains, {len(by_capability)} capabilities, "
+                    f"{len(linkable_entities)} linkable entities",
+                    "relations"
+                )
+
         # Deduplicate
         seen = set()
         unique_relations = []
@@ -2388,7 +2515,7 @@ class IngestionPipeline(BaseModel):
             if key not in seen:
                 seen.add(key)
                 unique_relations.append(rel)
-        
+
         return unique_relations
     
     def run(

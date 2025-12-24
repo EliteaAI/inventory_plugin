@@ -4,7 +4,7 @@
 import { useState, useCallback } from 'react';
 import SandboxClient from '../utils/sandbox_client';
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 150;
 
 // Default toolkit types that can be used as data sources
 const DEFAULT_TOOLKIT_TYPES = [

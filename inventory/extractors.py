@@ -35,7 +35,7 @@ ENTITY_TAXONOMY = {
         "description": "Product and UX artifacts",
         "types": [
             {"name": "epic", "description": "Large feature grouping or initiative", "properties": ["name", "description", "acceptance_criteria", "priority"]},
-            {"name": "feature", "description": "Product capability or functionality", "properties": ["name", "description", "acceptance_criteria", "related_screens"]},
+            {"name": "feature", "description": "Product capability or functionality", "properties": ["name", "description", "domain", "capability", "dependencies", "acceptance_criteria", "related_screens"]},
             {"name": "user_story", "description": "User requirement in story format", "properties": ["name", "description", "persona", "acceptance_criteria", "story_points"]},
             {"name": "screen", "description": "UI page, screen, or view", "properties": ["name", "description", "url_path", "parent_screen"]},
             {"name": "ux_flow", "description": "User journey or navigation flow", "properties": ["name", "description", "start_screen", "end_screen", "steps"]},
@@ -517,7 +517,7 @@ class EntitySchemaDiscoverer:
                 {"name": "module", "description": "A code module or package", "properties": ["name", "path"]},
                 {"name": "function", "description": "A function or method", "properties": ["name", "signature"]},
                 {"name": "api", "description": "An API endpoint", "properties": ["name", "path", "method"]},
-                {"name": "feature", "description": "A product feature", "properties": ["name", "description"]},
+                {"name": "feature", "description": "A product feature", "properties": ["name", "description", "domain", "capability", "dependencies"]},
                 {"name": "requirement", "description": "A requirement or user story", "properties": ["name", "description"]},
             ],
             "relation_types": [

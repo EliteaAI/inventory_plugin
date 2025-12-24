@@ -176,15 +176,21 @@ class SandboxClient {
     }
 
     async _fetch(url, options = {}) {
+        // Build headers: only include Content-Type for requests with body
+        const headers = { ...this.headers, ...options.headers };
+
+        // Remove Content-Type for GET/HEAD requests (no body)
+        const method = (options.method || 'GET').toUpperCase();
+        if (method === 'GET' || method === 'HEAD') {
+            delete headers['Content-Type'];
+        }
+
         const response = await fetch(url, {
             ...options,
-            headers: {
-                ...this.headers,
-                ...options.headers
-            },
+            headers,
             credentials: this.withCredentials ? 'include' : 'same-origin' // Enable session cookie sharing
         });
-        
+
         return response;
     }
 
