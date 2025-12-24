@@ -62,7 +62,6 @@ export default function SourceCard({
     exclude_patterns = '',
     branch = '',
     preset = '',
-    progress_message = null,
   } = source;
 
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -168,34 +167,6 @@ export default function SourceCard({
           </IconButton>
         </Tooltip>
       </Box>
-
-      {/* Progress message row - shown during ingestion */}
-      {isIngesting && progress_message && (
-        <Box
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 1,
-            pl: 4, // Align with text (after icon)
-            mt: 0.5,
-          }}
-        >
-          <Typography
-            variant="caption"
-            sx={{
-              color: 'info.main',
-              fontFamily: 'monospace',
-              fontSize: '0.75rem',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              maxWidth: '100%',
-            }}
-          >
-            {progress_message}
-          </Typography>
-        </Box>
-      )}
 
       {/* Remove Confirmation Dialog */}
       <Dialog

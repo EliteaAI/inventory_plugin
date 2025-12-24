@@ -32,6 +32,8 @@ class Method:
         if task_id is None or status == "unknown":
             return
 
+        log.info(f"[TASK_CHANGE] Task {task_id} status changed to: {status}")
+
         if status == "pruned":
             # Cleanup pruned tasks from all toolkits
             with self.state_lock:
@@ -46,6 +48,8 @@ class Method:
         toolkit_name = task_meta.get("toolkit_name", "Toolkit")
         tool_name = task_meta.get("tool_name", "tool")
 
+        log.info(f"[TASK_CHANGE] Task {task_id} meta: toolkit_name={toolkit_name}, tool_name={tool_name}")
+
         with self.state_lock:
             # Ensure state structure exists
             if toolkit_name not in self.invocation_state:
@@ -59,6 +63,7 @@ class Method:
                     "task_id": task_id,
                     "added_ts": time.time(),
                 }
+                log.info(f"[TASK_CHANGE] Registered task {task_id} at invocation_state[{toolkit_name}][{tool_name}]")
 
             # Update status
             self.invocation_state[toolkit_name][tool_name][task_id]["status"] = status
@@ -119,7 +124,8 @@ class Method:
 
             task_id = tasknode_task.id
             task_meta = tasknode_task.meta
-        except:
+        except Exception as e:
+            log.debug(f"[STOP_CHECK] Could not get tasknode_task: {e}")
             return
 
         toolkit_name = task_meta.get("toolkit_name", "Toolkit")
@@ -127,12 +133,15 @@ class Method:
 
         with self.state_lock:
             if toolkit_name not in self.invocation_state:
+                log.debug(f"[STOP_CHECK] toolkit_name '{toolkit_name}' not in invocation_state (keys: {list(self.invocation_state.keys())})")
                 return
 
             if tool_name not in self.invocation_state[toolkit_name]:
+                log.debug(f"[STOP_CHECK] tool_name '{tool_name}' not in invocation_state[{toolkit_name}] (keys: {list(self.invocation_state[toolkit_name].keys())})")
                 return
 
             if task_id not in self.invocation_state[toolkit_name][tool_name]:
+                log.debug(f"[STOP_CHECK] task_id '{task_id}' not in invocation_state[{toolkit_name}][{tool_name}] (keys: {list(self.invocation_state[toolkit_name][tool_name].keys())})")
                 return
 
             invocation_state = self.invocation_state[toolkit_name][tool_name][task_id]
@@ -141,6 +150,7 @@ class Method:
                 return
 
             if invocation_state["stop_requested"]:
+                log.info(f"[STOP_CHECK] Stop requested! Raising InterruptTaskThread for task {task_id}")
                 # Terminate any managed processes
                 if "processes" in invocation_state:
                     for proc in invocation_state["processes"]:

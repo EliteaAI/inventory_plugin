@@ -1,5 +1,5 @@
 // SourcesList.jsx
-// Component for managing the list of configured data sources
+// Component for managing the list of configured sources
 
 import React, { useState, useCallback } from 'react';
 import {
@@ -171,7 +171,7 @@ export default function SourcesList({
               No sources configured
             </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Add a repository or data source to start ingesting data into your knowledge graph.
+              Add a source to start ingesting data into your knowledge graph.
             </Typography>
             <Button
               variant="outlined"

@@ -87,41 +87,81 @@ class Route:
 
         elif flask.request.method == "DELETE":
             # Handle DELETE - cancel/stop an invocation
+            log.info(f"[STOP_DELETE] Received stop request for {toolkit_name}/{tool_name}/{invocation_id}")
+            log.info(f"[STOP_DELETE] Current invocation_state keys: {list(self.invocation_state.keys())}")
+
+            # First, try to find the invocation in the in-memory state
+            found_in_state = False
             with self.state_lock:
-                # Check toolkit exists
-                if toolkit_name not in self.invocation_state:
-                    return {
-                        "errorCode": "404",
-                        "message": "Resource Not Found",
-                        "details": [f"Toolkit '{toolkit_name}' not found"],
-                    }, 404
+                if (toolkit_name in self.invocation_state and
+                    tool_name in self.invocation_state[toolkit_name] and
+                    invocation_id in self.invocation_state[toolkit_name][tool_name]):
 
-                # Check tool exists
-                if tool_name not in self.invocation_state[toolkit_name]:
-                    return {
-                        "errorCode": "404",
-                        "message": "Resource Not Found",
-                        "details": [f"Tool '{tool_name}' not found"],
-                    }, 404
+                    found_in_state = True
+                    invocation_state = self.invocation_state[toolkit_name][tool_name][invocation_id]
+                    invocation_state["stop_requested"] = True
+                    log.info(f"[STOP_DELETE] Successfully set stop_requested=True for {invocation_id}")
 
-                # Check invocation exists
-                if invocation_id not in self.invocation_state[toolkit_name][tool_name]:
-                    return {
-                        "errorCode": "404",
-                        "message": "Resource Not Found",
-                        "details": [f"Invocation '{invocation_id}' not found"],
-                    }, 404
+                    # Terminate any managed subprocesses
+                    if "processes" in invocation_state:
+                        for proc in invocation_state["processes"]:
+                            if proc.poll() is None:
+                                proc.terminate()
 
-                invocation_state = self.invocation_state[toolkit_name][tool_name][invocation_id]
-                invocation_state["stop_requested"] = True
+            if found_in_state:
+                return flask.Response(status=204)
 
-                # Terminate any managed subprocesses
-                if "processes" in invocation_state:
-                    for proc in invocation_state["processes"]:
-                        if proc.poll() is None:
-                            proc.terminate()
+            # If not found in in-memory state, check if it's a stale entry in IngestionTracker
+            # This happens when container restarts during an ingestion - the tracker persists
+            # to disk but invocation_state is lost
+            log.info(f"[STOP_DELETE] Task {invocation_id} not in invocation_state, checking IngestionTracker")
 
-            return flask.Response(status=204)
+            try:
+                # Check if this task is in the tracker
+                active_ingestions = self.ingestion_tracker.get_active_ingestions()
+                stale_ingestion = None
+                for ing in active_ingestions:
+                    if ing.get("task_id") == invocation_id:
+                        stale_ingestion = ing
+                        break
+
+                if stale_ingestion:
+                    log.info(f"[STOP_DELETE] Found stale task {invocation_id} in IngestionTracker, releasing slot")
+
+                    # Update source status to mark as stopped/error
+                    try:
+                        from ..utils.source_status import SourceStatusManager
+                        project_id = stale_ingestion.get("project_id")
+                        application_id = stale_ingestion.get("application_id")
+                        toolkit_id = stale_ingestion.get("toolkit_id")
+
+                        if project_id and application_id:
+                            graph_dir = f"/data/graphs/{project_id}/{application_id}"
+                            status_manager = SourceStatusManager(graph_dir)
+                            status_manager.fail_ingestion(
+                                toolkit_id=str(toolkit_id),
+                                error_message="Ingestion stopped by user (recovered from stale state)",
+                                documents_processed=0,
+                            )
+                            log.info(f"[STOP_DELETE] Updated source status for toolkit {toolkit_id}")
+                    except Exception as status_error:
+                        log.warning(f"[STOP_DELETE] Failed to update source status: {status_error}")
+
+                    # Release the slot in the tracker (cleans up the stale entry)
+                    self.ingestion_tracker.release_slot(invocation_id)
+                    log.info(f"[STOP_DELETE] Successfully released stale slot for {invocation_id}")
+                    return flask.Response(status=204)
+                else:
+                    log.warning(f"[STOP_DELETE] Task {invocation_id} not found in invocation_state or IngestionTracker")
+            except Exception as e:
+                log.warning(f"[STOP_DELETE] Error checking IngestionTracker: {e}")
+
+            # Not found anywhere - return 404
+            return {
+                "errorCode": "404",
+                "message": "Resource Not Found",
+                "details": [f"Invocation '{invocation_id}' not found"],
+            }, 404
 
         return {
             "errorCode": "500",

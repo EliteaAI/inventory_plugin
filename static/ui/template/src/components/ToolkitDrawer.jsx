@@ -9,7 +9,6 @@ import {
 } from '@mui/material';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import {
-  runIngestion,
   startProviderTool,
   pollProviderToolStatus,
   stopProviderTask,
@@ -183,35 +182,8 @@ function ToolkitDrawer({
     }, 5000);
   }, [checkIngestionStatus]);
 
-  // Handle triggering ingestion for a single source
-  const handleTriggerIngestion = useCallback(async (sourceToolkitId) => {
-    if (!projectId || !toolkitId) return;
-
-    setError(null);
-    setIsIngesting(true);
-
-    // Start polling to show progress
-    startStatusPolling();
-
-    try {
-      await runIngestion(projectId, toolkitId, sourceToolkitId);
-
-      if (onReindexComplete) {
-        onReindexComplete();
-      }
-    } catch (err) {
-      console.error(`Ingestion failed for source ${sourceToolkitId}:`, err);
-      const parsedError = parseIngestionError(err);
-      setError(parsedError.message);
-      // Re-throw to let the caller know it failed
-      throw err;
-    } finally {
-      // Check status one more time to update UI
-      await checkIngestionStatus();
-    }
-  }, [projectId, toolkitId, onReindexComplete, parseIngestionError, startStatusPolling, checkIngestionStatus]);
-
   // Run ingestion for a single source with tracking
+  // This properly tracks invocation_id for stop support
   const runIngestionWithTracking = useCallback(async (sourceToolkitId) => {
     // Create abort controller for this ingestion
     abortControllerRef.current = new AbortController();
@@ -242,6 +214,42 @@ function ToolkitDrawer({
       abortControllerRef.current = null;
     }
   }, []);
+
+  // Handle triggering ingestion for a single source
+  // Uses runIngestionWithTracking to properly track invocation_id for stop support
+  const handleTriggerIngestion = useCallback(async (sourceToolkitId) => {
+    if (!projectId || !toolkitId) return;
+
+    setError(null);
+    setIsIngesting(true);
+    ingestionAbortRef.current = false;
+
+    // Start polling to show progress
+    startStatusPolling();
+
+    try {
+      // Use runIngestionWithTracking to properly set currentInvocationRef for stop support
+      await runIngestionWithTracking(sourceToolkitId);
+
+      if (onReindexComplete) {
+        onReindexComplete();
+      }
+    } catch (err) {
+      // Don't show error if it was intentionally stopped
+      if (err.message === 'Polling aborted' || ingestionAbortRef.current) {
+        console.log(`[Ingestion] Stopped for source ${sourceToolkitId}`);
+      } else {
+        console.error(`Ingestion failed for source ${sourceToolkitId}:`, err);
+        const parsedError = parseIngestionError(err);
+        setError(parsedError.message);
+        // Re-throw to let the caller know it failed
+        throw err;
+      }
+    } finally {
+      // Check status one more time to update UI
+      await checkIngestionStatus();
+    }
+  }, [projectId, toolkitId, onReindexComplete, parseIngestionError, startStatusPolling, checkIngestionStatus, runIngestionWithTracking]);
 
   // Handle Update All - sequential ingestion of all sources
   const handleUpdateAll = useCallback(async () => {
@@ -391,11 +399,27 @@ function ToolkitDrawer({
           </Box>
           <LinearProgress sx={{ mb: 1 }} />
           <Typography variant="caption" color="text.secondary">
-            Source toolkit: {activeIngestion.toolkit_id}
+            Source: {activeIngestion.toolkit_name || `toolkit ${activeIngestion.toolkit_id}`}
           </Typography>
           {activeIngestion.started_at && (
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
               Started: {new Date(activeIngestion.started_at).toLocaleTimeString()}
+            </Typography>
+          )}
+          {activeIngestion.progress_message && (
+            <Typography
+              variant="caption"
+              sx={{
+                display: 'block',
+                mt: 0.5,
+                color: 'text.secondary',
+                fontFamily: 'monospace',
+                fontSize: '0.65rem',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {activeIngestion.progress_message}
             </Typography>
           )}
         </Box>

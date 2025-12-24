@@ -856,7 +856,7 @@ function App() {
             <Toolbar variant="dense" sx={{ gap: 1.5, height: 48, minHeight: 48 }}>
               {/* Menu toggle - hidden when drawer is open */}
               {!drawerOpen && (
-                <Tooltip title="Data Sources">
+                <Tooltip title="Sources">
                   <IconButton
                     size="small"
                     onClick={() => setDrawerOpen(true)}

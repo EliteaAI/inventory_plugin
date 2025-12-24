@@ -68,7 +68,7 @@ function StatsPanel({ stats, cacheStats, sources }) {
       {sources && sources.length > 0 && (
         <Paper variant="outlined" sx={{ p: 1.5 }}>
           <Typography variant="subtitle2" gutterBottom>
-            Data Sources ({sources.length})
+            Sources ({sources.length})
           </Typography>
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
             {sources.map((source) => (

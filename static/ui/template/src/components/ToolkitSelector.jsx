@@ -113,7 +113,7 @@ function ToolkitSelector({
       PaperProps={{ sx: { maxHeight: '70vh' } }}
     >
       <DialogTitle>
-        <Typography variant="h6">Add Data Source</Typography>
+        <Typography variant="h6">Add Source</Typography>
         <Typography variant="body2" color="text.secondary">
           Select a toolkit to ingest into the knowledge graph
         </Typography>

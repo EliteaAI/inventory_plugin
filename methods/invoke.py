@@ -1965,6 +1965,23 @@ class Method:
                 current_ingestion = ing
                 break
 
+        # If there's an active ingestion, try to get progress_message from sources_status.json
+        if current_ingestion and graph_path:
+            try:
+                from pathlib import Path
+                from ..utils.source_status import SourceStatusManager
+                # graph_path is the full path to graph.json, but SourceStatusManager expects directory
+                graph_dir = str(Path(graph_path).parent)
+                status_manager = SourceStatusManager(graph_dir)
+                sources_status = status_manager.get_sources()
+                toolkit_id = str(current_ingestion.get("toolkit_id"))
+                if toolkit_id in sources_status:
+                    source_info = sources_status[toolkit_id]
+                    current_ingestion["progress_message"] = source_info.get("progress_message")
+                    current_ingestion["toolkit_name"] = source_info.get("toolkit_name", f"toolkit_{toolkit_id}")
+            except Exception as e:
+                log.debug(f"Could not get progress_message from sources_status: {e}")
+
         result = {
             "has_active_ingestion": current_ingestion is not None,
             "current_ingestion": current_ingestion,
@@ -1981,8 +1998,10 @@ class Method:
             output = "# Active Ingestion\n\n"
             output += f"**Task ID:** {current_ingestion.get('task_id', 'unknown')}\n"
             output += f"**Source Toolkit:** {current_ingestion.get('toolkit_id', 'unknown')}\n"
-            output += f"**Started:** {current_ingestion.get('started_at', 'unknown')}\n\n"
-            output += f"Slots: {tracker_status['active_count']}/{tracker_status['max_parallel']} in use\n"
+            output += f"**Started:** {current_ingestion.get('started_at', 'unknown')}\n"
+            if current_ingestion.get("progress_message"):
+                output += f"**Progress:** {current_ingestion.get('progress_message')}\n"
+            output += f"\nSlots: {tracker_status['active_count']}/{tracker_status['max_parallel']} in use\n"
         else:
             output = "No active ingestion for this toolkit.\n\n"
             output += f"Slots: {tracker_status['active_count']}/{tracker_status['max_parallel']} in use\n"

@@ -1,5 +1,5 @@
 // AddSourceDialog.jsx
-// Modal dialog for searching and selecting toolkits to add as data sources
+// Modal dialog for searching and selecting toolkits to add as sources
 
 import React, { useState, useEffect } from 'react';
 import {
@@ -29,7 +29,6 @@ import GitHubIcon from '@mui/icons-material/GitHub';
 import CloudIcon from '@mui/icons-material/Cloud';
 import StorageIcon from '@mui/icons-material/Storage';
 import AddIcon from '@mui/icons-material/Add';
-import CheckIcon from '@mui/icons-material/Check';
 
 import useToolkitSearch from '../hooks/useToolkitSearch';
 
@@ -116,7 +115,7 @@ export default function AddSourceDialog({
       PaperProps={{ sx: { maxHeight: '80vh' } }}
     >
       <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <Typography variant="h6">Add Data Source</Typography>
+        <Typography variant="h6">Add Source</Typography>
         <IconButton onClick={onClose} size="small">
           <CloseIcon />
         </IconButton>
@@ -171,21 +170,28 @@ export default function AddSourceDialog({
         )}
 
         {/* Empty State */}
-        {!isLoading && toolkits.length === 0 && !error && (
-          <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
-            {selectedTypes.length === 0
-              ? 'Select at least one toolkit type'
-              : 'No toolkits found'}
-          </Typography>
+        {!isLoading && !error && (
+          selectedTypes.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+              Select at least one toolkit type
+            </Typography>
+          ) : toolkits.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+              No toolkits found
+            </Typography>
+          ) : toolkits.filter(t => !isAlreadyAdded(t.id)).length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+              All available toolkits have already been added
+            </Typography>
+          ) : null
         )}
 
-        {/* Results List */}
-        {toolkits.length > 0 && (
+        {/* Results List - filter out already added sources */}
+        {toolkits.filter(t => !isAlreadyAdded(t.id)).length > 0 && (
           <List sx={{ maxHeight: 300, overflow: 'auto' }}>
-            {toolkits.map(toolkit => {
-              const added = isAlreadyAdded(toolkit.id);
-
-              return (
+            {toolkits
+              .filter(toolkit => !isAlreadyAdded(toolkit.id))
+              .map(toolkit => (
                 <ListItem
                   key={toolkit.id}
                   sx={{
@@ -193,7 +199,6 @@ export default function AddSourceDialog({
                     borderColor: 'divider',
                     borderRadius: 1,
                     mb: 1,
-                    opacity: added ? 0.6 : 1,
                   }}
                 >
                   <ListItemIcon sx={{ minWidth: 40 }}>
@@ -212,18 +217,16 @@ export default function AddSourceDialog({
                   />
                   <ListItemSecondaryAction>
                     <Button
-                      variant={added ? 'outlined' : 'contained'}
+                      variant="contained"
                       size="small"
                       onClick={() => handleAdd(toolkit)}
-                      disabled={added}
-                      startIcon={added ? <CheckIcon /> : <AddIcon />}
+                      startIcon={<AddIcon />}
                     >
-                      {added ? 'Added' : 'Add'}
+                      Add
                     </Button>
                   </ListItemSecondaryAction>
                 </ListItem>
-              );
-            })}
+              ))}
           </List>
         )}
 

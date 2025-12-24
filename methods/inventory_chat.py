@@ -19,6 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
+# Allow nested event loops - required when running async code in environments
+# that already have an event loop (like pylon/Flask with threading)
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass  # nest_asyncio not installed, will fail if nested loops are used
+
 from pylon.core.tools import log, web
 
 from ..constants import (
@@ -39,6 +47,11 @@ from ..utils.langfuse_callback import (
 )
 
 
+class ChatCancelledException(Exception):
+    """Raised when a chat session is cancelled by the user."""
+    pass
+
+
 class InventoryChatCallback:
     """
     Callback handler for inventory chat that emits events for streaming.
@@ -53,6 +66,7 @@ class InventoryChatCallback:
         session_id: str,
         conversation_id: Optional[str] = None,
         file_tracking_fn: Optional[Callable[[str, str], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ):
         """
         Initialize callback handler.
@@ -62,13 +76,20 @@ class InventoryChatCallback:
             session_id: Unique session ID for this chat
             conversation_id: Optional conversation ID for history
             file_tracking_fn: Optional function to track file accesses (tool_name, input_str)
+            is_cancelled: Optional function to check if chat has been cancelled
         """
         self.emit_fn = emit_fn
         self.session_id = session_id
         self.conversation_id = conversation_id
         self.file_tracking_fn = file_tracking_fn
+        self.is_cancelled = is_cancelled or (lambda: False)
         self.tool_runs = {}  # Track active tool runs
         self.start_time = time.time()
+
+    def check_cancelled(self):
+        """Check if cancelled and raise exception if so."""
+        if self.is_cancelled():
+            raise ChatCancelledException("Chat cancelled by user")
 
     def emit(self, event_type: str, data: Dict[str, Any]):
         """Emit an event with session metadata."""
@@ -87,6 +108,9 @@ class InventoryChatCallback:
     # LangChain callback methods
     def on_llm_start(self, serialized: Dict, prompts: List[str], **kwargs):
         """Called when LLM starts processing."""
+        # Check for cancellation before starting LLM
+        self.check_cancelled()
+
         run_id = str(kwargs.get("run_id", uuid.uuid4()))
 
         # Extract model name from various possible locations
@@ -212,6 +236,9 @@ class InventoryChatCallback:
 
     def on_tool_start(self, serialized: Dict, input_str: str, **kwargs):
         """Called when a tool starts execution."""
+        # Check for cancellation before starting tool
+        self.check_cancelled()
+
         run_id = str(kwargs.get("run_id", uuid.uuid4()))
         tool_name = serialized.get("name", "unknown")
 
@@ -312,6 +339,7 @@ class Method:
         emit_fn: Optional[Callable] = None,
         model: Optional[str] = None,
         user_id: Optional[str] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Execute a chat query against the inventory knowledge graph.
@@ -332,6 +360,7 @@ class Method:
             emit_fn: Optional callback emit function for streaming
             model: Optional model name to use for chat (overrides toolkit config)
             user_id: Optional user ID for Langfuse tracing attribution
+            is_cancelled: Optional callback to check if chat should be cancelled
 
         Returns:
             Dict with:
@@ -339,6 +368,7 @@ class Method:
             - citations: List of source citations
             - tool_calls: List of tools that were called
             - error: Error message if failed
+            - cancelled: True if chat was cancelled
         """
         session_id = str(uuid.uuid4())
         filters = filters or {}
@@ -396,12 +426,13 @@ class Method:
                     })
                     log.info(f"[inventory_chat] Tracked file access: {file_path} from {toolkit_name}")
 
-        # Create callback handler with file tracking
+        # Create callback handler with file tracking and cancellation support
         callback = InventoryChatCallback(
             emit_fn=emit_fn or (lambda t, d: None),  # No-op if no emit function
             session_id=session_id,
             conversation_id=conversation_id,
             file_tracking_fn=track_file_from_tool,
+            is_cancelled=is_cancelled,
         )
 
         # Initialize Langfuse variables for finally block
@@ -534,6 +565,20 @@ class Method:
             })
 
             return result
+
+        except ChatCancelledException:
+            log.info(f"[inventory_chat] Chat cancelled: session_id={session_id}")
+
+            callback.emit("chat_cancelled", {"message": "Chat cancelled by user"})
+
+            return {
+                "answer": "",
+                "citations": [],
+                "tool_calls": [],
+                "touched_entities": touched_entities,
+                "error": None,
+                "cancelled": True,
+            }
 
         except Exception as e:
             log.exception(f"[inventory_chat] Error: {e}")
@@ -1465,6 +1510,65 @@ class Method:
         return read_only_tools
 
     @web.method()
+    def _prefix_tool_names(
+        self,
+        tools: List,
+        toolkit_name: str,
+    ) -> List:
+        """
+        Add toolkit name prefix to tool names to ensure uniqueness.
+
+        When multiple source toolkits of the same type are configured (e.g., 2 GitHub repos),
+        tools like 'read_file' would collide. This method prefixes each tool's name
+        with the toolkit name to make them unique (e.g., 'myrepo_read_file').
+
+        Args:
+            tools: List of LangChain tools
+            toolkit_name: Name of the source toolkit (used as prefix)
+
+        Returns:
+            List of tools with prefixed names
+        """
+        import re
+        from langchain.tools import Tool
+
+        prefixed_tools = []
+
+        # Sanitize toolkit name to be a valid tool name prefix
+        # Replace spaces, hyphens, dots with underscores, keep only alphanumeric + underscore
+        safe_prefix = re.sub(r'[^a-zA-Z0-9_]', '_', toolkit_name.lower())
+        # Remove leading underscores and digits
+        safe_prefix = re.sub(r'^[_0-9]+', '', safe_prefix)
+        # Limit length to avoid overly long names
+        safe_prefix = safe_prefix[:20]
+
+        if not safe_prefix:
+            safe_prefix = "source"
+
+        for tool in tools:
+            original_name = tool.name if hasattr(tool, 'name') else 'unknown'
+            prefixed_name = f"{safe_prefix}_{original_name}"
+
+            # Create a new tool with the prefixed name
+            # Update description to mention which source this is from
+            original_desc = tool.description if hasattr(tool, 'description') else ''
+            prefixed_desc = f"[Source: {toolkit_name}] {original_desc}"
+
+            # Create new Tool with prefixed name but same functionality
+            prefixed_tool = Tool(
+                name=prefixed_name,
+                func=tool.func if hasattr(tool, 'func') else tool._run,
+                description=prefixed_desc,
+                args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
+            )
+
+            prefixed_tools.append(prefixed_tool)
+            log.debug(f"[_prefix_tool_names] Renamed '{original_name}' -> '{prefixed_name}'")
+
+        log.info(f"[_prefix_tool_names] Prefixed {len(prefixed_tools)} tools from {toolkit_name} with '{safe_prefix}_'")
+        return prefixed_tools
+
+    @web.method()
     def _wrap_tools_with_tracking(
         self,
         tools: List,
@@ -1472,18 +1576,18 @@ class Method:
         touched_entities: List[Dict[str, Any]],
     ) -> List:
         """
-        Pass-through for tools - file tracking now happens via LangChain callbacks.
+        Prefix tool names and prepare for tracking.
 
-        Previously this method wrapped tools to intercept file accesses, but that
-        approach broke toolkit initialization (especially GitHub toolkit). Now
-        tracking happens in InventoryChatCallback.on_tool_start instead.
+        Adds toolkit name prefix to ensure unique tool names when multiple
+        toolkits of the same type are configured (e.g., 2 GitHub repos).
+        File tracking happens via LangChain callbacks in InventoryChatCallback.on_tool_start.
 
         Args:
             tools: List of LangChain tools
-            toolkit_name: Name of the source toolkit (unused, kept for compatibility)
-            touched_entities: Shared list (unused, tracking via callback now)
+            toolkit_name: Name of the source toolkit (used as prefix)
+            touched_entities: Shared list (tracking via callback)
 
         Returns:
-            Original tools list unchanged
+            List of tools with prefixed names
         """
-        return tools
+        return self._prefix_tool_names(tools, toolkit_name)

@@ -106,6 +106,17 @@ class SourceStatusManager:
         with self._lock:
             return self._read_status()
 
+    def get_sources(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get sources dict keyed by toolkit_id.
+
+        Returns:
+            Dict mapping toolkit_id -> source status dict
+        """
+        with self._lock:
+            status = self._read_status()
+            return status.get("sources", {})
+
     def get_source_status(self, source_key: str) -> Optional[Dict[str, Any]]:
         """
         Get status for a specific source.
