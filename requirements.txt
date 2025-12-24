@@ -1,4 +1,5 @@
 # Inventory Plugin Dependencies
 alita-sdk[runtime,tools]>=0.3.556
 networkx>=3.0
+langfuse>=3.0.0  # Optional: for tracing support
 

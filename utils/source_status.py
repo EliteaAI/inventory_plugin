@@ -157,12 +157,55 @@ class SourceStatusManager:
                 "relations_count": previous.get("relations_count", 0),
                 "documents_processed": 0,
                 "error_message": None,
+                "progress_message": "Starting ingestion...",
                 "branch": branch,
             }
 
             status["sources"] = sources
             self._write_status(status)
             log.info(f"Source ingestion started: {toolkit_name} (ID: {toolkit_id})")
+
+    def update_progress(
+        self,
+        toolkit_id: str,
+        progress_message: str,
+        documents_processed: Optional[int] = None,
+        entities_count: Optional[int] = None,
+    ) -> None:
+        """
+        Update progress message for an in-progress ingestion.
+
+        This is called frequently during ingestion to show real-time progress
+        in the UI. Only updates if source status is IN_PROGRESS.
+
+        Args:
+            toolkit_id: Toolkit ID
+            progress_message: Human-readable progress message (e.g., "📄 Processed 10 files | 📊 370 entities")
+            documents_processed: Optional update to documents processed count
+            entities_count: Optional update to entities count
+        """
+        with self._lock:
+            status = self._read_status()
+            sources = status.get("sources", {})
+            source_key = str(toolkit_id)
+
+            if source_key not in sources:
+                return  # Source not found
+
+            # Only update if status is IN_PROGRESS
+            if sources[source_key].get("status") != SourceStatus.IN_PROGRESS:
+                return
+
+            sources[source_key]["progress_message"] = progress_message
+            sources[source_key]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+            if documents_processed is not None:
+                sources[source_key]["documents_processed"] = documents_processed
+            if entities_count is not None:
+                sources[source_key]["entities_count"] = entities_count
+
+            status["sources"] = sources
+            self._write_status(status)
 
     def complete_ingestion(
         self,
@@ -199,6 +242,7 @@ class SourceStatusManager:
                 "relations_count": relations_count,
                 "documents_processed": documents_processed,
                 "error_message": None,
+                "progress_message": None,  # Clear progress message on completion
             })
 
             status["sources"] = sources
@@ -237,6 +281,7 @@ class SourceStatusManager:
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "documents_processed": documents_processed,
                 "error_message": error_message,
+                "progress_message": None,  # Clear progress message on error
             })
 
             status["sources"] = sources

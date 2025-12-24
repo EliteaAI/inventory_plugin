@@ -51,7 +51,6 @@ class Method:
                             "bucket",
                             "llm_model",
                             "embedding_model",
-                            "graph_name",
                             "sources"
                         ],
                         "parameters": {
@@ -76,12 +75,6 @@ class Method:
                                     "configuration_model": "embedding"
                                 },
                                 "default": ""
-                            },
-                            "graph_name": {
-                                "type": "String",
-                                "required": False,
-                                "description": "Name for the primary graph (default: 'main')",
-                                "default": "main"
                             },
                             "sources": {
                                 "type": "List[Integer]",

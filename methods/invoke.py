@@ -511,9 +511,10 @@ class Method:
             else:
                 source_toolkit = source_toolkit_instance
 
-            # Extract toolkit metadata from the api_wrapper
-            toolkit_name = getattr(source_toolkit, 'toolkit_name', None) or getattr(source_toolkit, 'name', f"toolkit_{toolkit_id}")
-            toolkit_type = getattr(source_toolkit, 'toolkit_type', None) or type(source_toolkit).__name__.lower().replace('apiwrapper', '').replace('alita', '')
+            # Extract toolkit metadata - prefer name from API response (user-friendly name like "websearch"),
+            # then try api_wrapper attributes, then fallback to toolkit_id
+            toolkit_name = toolkit_data.get('name') or getattr(source_toolkit, 'toolkit_name', None) or getattr(source_toolkit, 'name', f"toolkit_{toolkit_id}")
+            toolkit_type = toolkit_data.get('type') or getattr(source_toolkit, 'toolkit_type', None) or type(source_toolkit).__name__.lower().replace('apiwrapper', '').replace('alita', '')
 
             log.info(f"Source toolkit: {toolkit_name} (type: {toolkit_type})")
             self.invocation_thinking(f"Loaded {toolkit_type} toolkit: {toolkit_name}")
@@ -610,9 +611,14 @@ class Method:
                 model_config={'temperature': 0.0, 'max_tokens': 4096}
             )
 
-            # Create progress callback that checks for stop requests
+            # Create progress callback that checks for stop requests and updates status
             def progress_callback(message, phase):
                 self.invocation_thinking(f"[{phase}] {message}")
+                # Update source status with progress message for UI display
+                status_manager.update_progress(
+                    toolkit_id=str(toolkit_id),
+                    progress_message=message,
+                )
                 # Check for stop request periodically during ingestion
                 self.invocation_stop_checkpoint()
 

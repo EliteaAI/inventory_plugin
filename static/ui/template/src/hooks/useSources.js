@@ -40,6 +40,8 @@ export default function useSources() {
       // Status from sources_status.json or local state
       status: metadata.status || 'pending',
       last_ingested: metadata.last_ingested || null,
+      // Progress message for in-progress ingestions
+      progress_message: metadata.progress_message || null,
     };
   });
 
@@ -115,6 +117,8 @@ export default function useSources() {
             last_ingested: source.last_updated,
             entities_count: source.entities_count,
             relations_count: source.relations_count,
+            // Progress message for in-progress ingestions
+            progress_message: source.progress_message || null,
             // Prefer already-fetched name, fall back to status name only if not available
             toolkit_name: newMap[id]?.toolkit_name || source.toolkit_name,
             toolkit_type: newMap[id]?.toolkit_type || source.toolkit_type,

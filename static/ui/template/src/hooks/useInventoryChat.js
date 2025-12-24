@@ -36,9 +36,10 @@ export const ToolActionStatus = {
  * @param {number} options.toolkitId - Inventory toolkit ID
  * @param {Object} options.filters - Current filters (entity_types, sources, layers)
  * @param {Function} options.onTouchedEntities - Callback when entities are accessed during chat
+ * @param {string} options.model - Optional model name to use for chat
  * @returns {Object} Chat state and functions
  */
-export function useInventoryChat({ projectId, toolkitId, filters = {}, onTouchedEntities }) {
+export function useInventoryChat({ projectId, toolkitId, filters = {}, onTouchedEntities, model }) {
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -188,6 +189,7 @@ export function useInventoryChat({ projectId, toolkitId, filters = {}, onTouched
           prompt: userInput.trim(),
           filters,
           history,
+          model: model || undefined,  // Include model if specified
         }),
         signal: abortControllerRef.current.signal,
         credentials: 'include',
@@ -257,7 +259,7 @@ export function useInventoryChat({ projectId, toolkitId, filters = {}, onTouched
       setIsStreaming(false);
       abortControllerRef.current = null;
     }
-  }, [projectId, toolkitId, filters, saveMessage]);
+  }, [projectId, toolkitId, filters, saveMessage, model]);
 
   /**
    * Handle streaming events from SSE

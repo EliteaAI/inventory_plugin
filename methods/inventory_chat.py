@@ -31,6 +31,12 @@ from ..constants import (
     DEFAULT_LLM_MAX_TOKENS,
     DEFAULT_TOOL_LLM_MAX_TOKENS,
 )
+from ..utils.langfuse_callback import (
+    fetch_langfuse_config,
+    create_langfuse_callback,
+    flush_langfuse_callback,
+    langfuse_trace_context,
+)
 
 
 class InventoryChatCallback:
@@ -304,12 +310,14 @@ class Method:
         conversation_id: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
         emit_fn: Optional[Callable] = None,
+        model: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute a chat query against the inventory knowledge graph.
 
         This method:
-        1. Loads LLM from inventory toolkit configuration
+        1. Loads LLM from inventory toolkit configuration (or uses specified model)
         2. Auto-compiles tools (graph search + each source as hybrid search)
         3. Executes the agent with streaming callbacks
         4. Returns structured response with citations
@@ -322,6 +330,8 @@ class Method:
             conversation_id: Optional conversation ID for history persistence
             history: Optional chat history [(role, content), ...]
             emit_fn: Optional callback emit function for streaming
+            model: Optional model name to use for chat (overrides toolkit config)
+            user_id: Optional user ID for Langfuse tracing attribution
 
         Returns:
             Dict with:
@@ -394,6 +404,10 @@ class Method:
             file_tracking_fn=track_file_from_tool,
         )
 
+        # Initialize Langfuse variables for finally block
+        langfuse_client = None
+        langfuse_callback = None
+
         try:
             # 1. Get AlitaClient for platform API
             alita_client = self._get_alita_client(project_id)
@@ -420,14 +434,34 @@ class Method:
 
             toolkit_data = resp.json()
             settings = toolkit_data.get("settings", {})
+            toolkit_name = toolkit_data.get("name", f"inventory-{toolkit_id}")
 
-            # 3. Get LLM model from toolkit configuration
-            llm_model = (
+            # 3. Fetch Langfuse config for tracing (optional)
+            langfuse_config = fetch_langfuse_config(alita_client)
+            langfuse_trace_attrs = None
+
+            if langfuse_config:
+                langfuse_metadata = {
+                    "project_id": str(project_id),
+                    "toolkit_id": str(toolkit_id),
+                    "toolkit_name": toolkit_name,
+                    "conversation_id": conversation_id or "",
+                }
+                langfuse_client, langfuse_callback, langfuse_trace_attrs = create_langfuse_callback(
+                    langfuse_config,
+                    trace_name=f"inventory-chat:{toolkit_name}",
+                    session_id=conversation_id or session_id,
+                    user_id=user_id,
+                    metadata=langfuse_metadata,
+                )
+
+            # 4. Get LLM model - prefer passed model, fallback to toolkit configuration
+            llm_model = model or (
                 settings.get("toolkit_configuration_llm_model") or
                 settings.get("llm_model") or
                 "gpt-4o-mini"
             )
-            log.info(f"[inventory_chat] Using LLM model: {llm_model}")
+            log.info(f"[inventory_chat] Using LLM model: {llm_model} (requested: {model})")
 
             # 4. Get graph path
             graph_path = f"/data/graphs/{project_id}/{toolkit_id}/graph.json"
@@ -477,15 +511,17 @@ class Method:
                 model_config=model_config,
             )
 
-            # 8. Build the agent and execute
-            result = self._execute_chat_agent(
-                llm=llm,
-                tools=tools,
-                prompt=prompt,
-                history=history,
-                filters=filters,
-                callback=callback,
-            )
+            # 8. Build the agent and execute with Langfuse tracing
+            with langfuse_trace_context(langfuse_trace_attrs):
+                result = self._execute_chat_agent(
+                    llm=llm,
+                    tools=tools,
+                    prompt=prompt,
+                    history=history,
+                    filters=filters,
+                    callback=callback,
+                    langfuse_callback=langfuse_callback,
+                )
 
             # Add touched entities to result
             result["touched_entities"] = touched_entities
@@ -512,6 +548,9 @@ class Method:
                 "touched_entities": [],
                 "error": error_msg,
             }
+        finally:
+            # Flush Langfuse traces
+            flush_langfuse_callback(langfuse_client, langfuse_callback)
 
     @web.method()
     def _build_chat_tools(
@@ -915,11 +954,15 @@ class Method:
         history: List[Dict[str, str]],
         filters: Dict[str, Any],
         callback: InventoryChatCallback,
+        langfuse_callback=None,
     ) -> Dict[str, Any]:
         """
         Execute the chat agent with the given tools and prompt.
 
         Uses LangGraph agent pattern (same as alita-sdk) for better tool calling support.
+
+        Args:
+            langfuse_callback: Optional Langfuse CallbackHandler for tracing
 
         Returns structured response with answer and citations.
         """
@@ -1067,9 +1110,14 @@ class Method:
 
             # Invoke the agent with callbacks
             thread_id = str(uuid.uuid4())
+            callbacks = [lc_callback]
+            if langfuse_callback:
+                callbacks.append(langfuse_callback)
+                log.info("[_execute_chat_agent] Langfuse callback added for tracing")
+
             config = {
                 "configurable": {"thread_id": thread_id},
-                "callbacks": [lc_callback],
+                "callbacks": callbacks,
             }
 
             result = agent.invoke(

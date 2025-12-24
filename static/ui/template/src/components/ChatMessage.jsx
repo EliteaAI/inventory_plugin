@@ -14,7 +14,7 @@ import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import PersonOutlineIcon from '@mui/icons-material/PersonOutline';
-import SmartToyOutlinedIcon from '@mui/icons-material/SmartToyOutlined';
+import AlitaIcon from './AlitaIcon';
 import { ROLES, ToolActionStatus } from '../hooks/useChatPredict';
 import './ChatMessage.css';
 
@@ -206,7 +206,7 @@ function ChatMessage({ message, isStreaming }) {
   return (
     <div className={`chat-message ${isUser ? 'user' : 'assistant'} ${hasError ? 'error' : ''}`}>
       <div className="chat-message-avatar">
-        {isUser ? <PersonOutlineIcon sx={{ fontSize: 18 }} /> : <SmartToyOutlinedIcon sx={{ fontSize: 18 }} />}
+        {isUser ? <PersonOutlineIcon sx={{ fontSize: 18 }} /> : <AlitaIcon sx={{ fontSize: 18 }} />}
       </div>
       <div className="chat-message-content">
         {/* Tool actions (for assistant messages) */}

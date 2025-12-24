@@ -11,8 +11,10 @@ import StopIcon from '@mui/icons-material/Stop';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import CloseIcon from '@mui/icons-material/Close';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import ChatMessages from './ChatMessages';
 import { useInventoryChat, ROLES, ToolActionStatus } from '../hooks/useInventoryChat';
+import { getChatModels } from '../utils/api';
 import './ChatPanel.css';
 import './ChatHeader.css';
 
@@ -123,14 +125,91 @@ function ChatInput({ onSend, disabled, isStreaming, onStop }) {
 }
 
 /**
+ * Model selector dropdown
+ */
+function ModelSelector({ models, selectedModel, onSelectModel, isLoading, theme }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef(null);
+
+  // Close on click outside
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    }
+
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isOpen]);
+
+  // Get display name for selected model
+  const selectedDisplay = selectedModel
+    ? models.find(m => m.name === selectedModel)?.display_name || selectedModel
+    : 'Default';
+
+  return (
+    <div className="chat-model-selector" ref={dropdownRef}>
+      <button
+        className="chat-model-selector-btn"
+        onClick={() => setIsOpen(!isOpen)}
+        disabled={isLoading || models.length === 0}
+        title="Select model"
+      >
+        <span className="chat-model-selector-name">{selectedDisplay}</span>
+        <KeyboardArrowDownIcon sx={{ fontSize: 14, opacity: 0.7 }} />
+      </button>
+
+      {isOpen && models.length > 0 && (
+        <div className={`chat-model-dropdown ${theme === 'light' ? 'chat-model-dropdown--light' : ''}`}>
+          <div
+            className={`chat-model-dropdown-item ${!selectedModel ? 'active' : ''}`}
+            onClick={() => {
+              onSelectModel(null);
+              setIsOpen(false);
+            }}
+          >
+            Default (from toolkit)
+          </div>
+          {models.map((model) => (
+            <div
+              key={model.id || model.name}
+              className={`chat-model-dropdown-item ${selectedModel === model.name ? 'active' : ''}`}
+              onClick={() => {
+                onSelectModel(model.name);
+                setIsOpen(false);
+              }}
+            >
+              {model.display_name || model.name}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * Chat header component - simplified for inventory
  * Height aligned with right panel tabs (36px)
  */
-function ChatHeader({ onClearHistory, onClose, isLoading, theme }) {
+function ChatHeader({ onClearHistory, onClose, isLoading, theme, models, selectedModel, onSelectModel }) {
   return (
     <div className="chat-header">
       <div className="chat-header-left">
         <span className="chat-header-selector-name">Inventory Chat</span>
+        <ModelSelector
+          models={models}
+          selectedModel={selectedModel}
+          onSelectModel={onSelectModel}
+          isLoading={isLoading}
+          theme={theme}
+        />
       </div>
 
       <div className="chat-header-right">
@@ -171,6 +250,23 @@ function ChatPanel({ projectId, toolkitId, toolkit, filters = {}, onClose, onTou
   // Modal state for clear history confirmation
   const [showClearConfirm, setShowClearConfirm] = useState(false);
 
+  // Model selection state
+  const [availableModels, setAvailableModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState(null);
+
+  // Fetch available models on mount
+  useEffect(() => {
+    async function fetchModels() {
+      try {
+        const models = await getChatModels();
+        setAvailableModels(models);
+      } catch (err) {
+        console.error('[ChatPanel] Failed to fetch models:', err);
+      }
+    }
+    fetchModels();
+  }, [projectId, toolkitId]);
+
   // Use the inventory-specific chat hook
   const {
     messages,
@@ -185,6 +281,7 @@ function ChatPanel({ projectId, toolkitId, toolkit, filters = {}, onClose, onTou
     toolkitId: parseInt(toolkitId, 10),
     filters,
     onTouchedEntities,
+    model: selectedModel,
   });
 
   /**
@@ -232,6 +329,9 @@ function ChatPanel({ projectId, toolkitId, toolkit, filters = {}, onClose, onTou
         onClose={onClose}
         isLoading={isLoading}
         theme={theme}
+        models={availableModels}
+        selectedModel={selectedModel}
+        onSelectModel={setSelectedModel}
       />
 
       <ChatMessages

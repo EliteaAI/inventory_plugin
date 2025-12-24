@@ -12,6 +12,7 @@ import flask
 import json
 import uuid
 from typing import Optional
+import requests as http_requests
 
 from pylon.core.tools import log, web
 
@@ -87,8 +88,9 @@ class Route:
         filters = request_data.get("filters", {})
         conversation_id = request_data.get("conversation_id")
         history = request_data.get("history", [])
+        model = request_data.get("model")  # Optional model override
 
-        log.info(f"[chat_route] Received chat request: project={effective_project_id}, toolkit={effective_toolkit_id}")
+        log.info(f"[chat_route] Received chat request: project={effective_project_id}, toolkit={effective_toolkit_id}, model={model}")
 
         # Call the inventory_chat method
         try:
@@ -100,6 +102,7 @@ class Route:
                 conversation_id=conversation_id,
                 history=history,
                 emit_fn=None,  # No streaming for HTTP route
+                model=model,
             )
 
             return result, 200
@@ -153,6 +156,7 @@ class Route:
         filters = request_data.get("filters", {})
         conversation_id = request_data.get("conversation_id")
         history = request_data.get("history", [])
+        model = request_data.get("model")  # Optional model override
 
         # Use a queue for real-time streaming
         event_queue = queue.Queue()
@@ -175,6 +179,7 @@ class Route:
                     conversation_id=conversation_id,
                     history=history,
                     emit_fn=emit_fn,
+                    model=model,
                 )
                 # Push final result
                 event_queue.put({
@@ -391,3 +396,65 @@ class Route:
         except Exception as e:
             log.exception(f"[chat_history_clear_route] Error: {e}")
             return {"error": str(e)}, 500
+
+    # Route for ui_host proxy: /ui/{toolkit_id}/chat/models
+    @web.route("/ui/<int:toolkit_id>/chat/models", methods=["GET"], endpoint="chat_models_route_proxy")
+    # Route for direct access
+    @web.route("/ui/<int:project_id>/<int:toolkit_id>/chat/models", methods=["GET"], endpoint="chat_models_route_direct")
+    def chat_models_route(self, project_id=None, toolkit_id=None):
+        """
+        Get available LLM models for chat.
+
+        Returns list of models from platform configurations.
+        """
+        # Get project_id from header (ui_host proxy) or path param
+        header_project_id = flask.request.headers.get('X-Project-Id')
+        effective_project_id = header_project_id or project_id
+
+        if not effective_project_id:
+            return {"error": "project_id is required", "models": []}, 400
+
+        log.info(f"[chat_models_route] Getting models for project={effective_project_id}")
+
+        try:
+            # Get AlitaClient to fetch models from platform
+            alita_client = self._get_alita_client(int(effective_project_id))
+            if not alita_client:
+                return {"error": "Platform API not configured", "models": []}, 500
+
+            # Fetch LLM models from platform (includes shared models)
+            models_url = f"{alita_client.base_url}/api/v2/configurations/models/{effective_project_id}?include_shared=true"
+            resp = http_requests.get(models_url, headers=alita_client.headers, verify=False)
+
+            if not resp.ok:
+                log.warning(f"[chat_models_route] Failed to fetch models: {resp.status_code}")
+                return {"error": f"Failed to fetch models: {resp.status_code}", "models": []}, 500
+
+            data = resp.json()
+
+            # Extract model names from items array
+            models = []
+            default_model = data.get("default_model_name")
+
+            for item in data.get("items", []):
+                model_name = item.get("name", "")
+                display_name = item.get("display_name", model_name)
+                if model_name:
+                    models.append({
+                        "name": model_name,
+                        "display_name": display_name,
+                        "is_default": model_name == default_model,
+                        "context_window": item.get("context_window"),
+                        "supports_reasoning": item.get("supports_reasoning", False),
+                    })
+
+            # Sort: default first, then by display name
+            models.sort(key=lambda x: (not x.get("is_default", False), x["display_name"].lower()))
+
+            log.info(f"[chat_models_route] Found {len(models)} models")
+
+            return {"models": models}, 200
+
+        except Exception as e:
+            log.exception(f"[chat_models_route] Error: {e}")
+            return {"error": str(e), "models": []}, 500

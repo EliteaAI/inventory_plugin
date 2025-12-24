@@ -902,3 +902,20 @@ function parseToolResult(response) {
     return result;
   }
 }
+
+/**
+ * Get available chat models from the platform
+ * @returns {Promise<Array>} Array of model objects with { id, name, display_name }
+ */
+export async function getChatModels() {
+  const config = getConfig();
+  const basePath = getProviderBasePath();
+
+  try {
+    const response = await apiRequest(`${basePath}/${config.toolkit_id}/chat/models`);
+    return response.models || [];
+  } catch (e) {
+    console.error('[getChatModels] Error fetching models:', e);
+    return [];
+  }
+}
