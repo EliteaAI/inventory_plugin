@@ -59,6 +59,16 @@ function formatDuration(ms) {
 }
 
 /**
+ * Format token count in human-readable format
+ */
+function formatTokens(count) {
+  if (!count || count <= 0) return '';
+  if (count < 1000) return `${count}`;
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+  return `${Math.round(count / 1000)}k`;
+}
+
+/**
  * Copy icon button for assistant messages (icon only)
  */
 function CopyIconButton({ text }) {
@@ -295,11 +305,23 @@ function ChatMessage({ message, isStreaming }) {
           </div>
         )}
 
-        {/* Footer: Duration (left) and Copy icon (right) for assistant messages */}
+        {/* Footer: Tokens, Duration (left) and Copy icon (right) for assistant messages */}
         {!isUser && !message.isStreaming && message.content && (
           <div className="chat-message-footer">
-            <span className="chat-message-duration">
-              {formatDuration(message.duration_ms)}
+            <span className="chat-message-stats">
+              {(message.tokens_in > 0 || message.tokens_out > 0) && (
+                <span className="chat-message-tokens" title={`Input: ${message.tokens_in || 0} tokens | Output: ${message.tokens_out || 0} tokens`}>
+                  {formatTokens(message.tokens_in || 0)} in / {formatTokens(message.tokens_out || 0)} out
+                </span>
+              )}
+              {(message.tokens_in > 0 || message.tokens_out > 0) && message.duration_ms > 0 && (
+                <span className="chat-message-separator">·</span>
+              )}
+              {message.duration_ms > 0 && (
+                <span className="chat-message-duration">
+                  {formatDuration(message.duration_ms)}
+                </span>
+              )}
             </span>
             <CopyIconButton text={message.content} />
           </div>

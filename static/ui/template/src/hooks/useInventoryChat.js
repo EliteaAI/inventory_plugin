@@ -358,6 +358,9 @@ export function useInventoryChat({ projectId, toolkitId, filters = {}, onTouched
           msg.touchedEntities = data.touched_entities || [];
           msg.isStreaming = false;
           msg.error = data.error || null;
+          // Extract token usage
+          msg.tokens_in = data.tokens_in || 0;
+          msg.tokens_out = data.tokens_out || 0;
           // Calculate duration if we have a start time
           if (msg.started_at) {
             msg.duration_ms = Date.now() - msg.started_at;

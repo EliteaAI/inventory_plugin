@@ -18,7 +18,187 @@ try:
 except ImportError:
     nx = None
 
+# Import type normalization constants from central location
+# Handle both relative import (when used as subpackage) and direct import contexts
+try:
+    from ..constants import (
+        TYPE_NORMALIZATION_MAP,
+        TYPE_PRIORITY,
+        NEVER_DEDUPLICATE_TYPES,
+        KNOWN_TYPE_PREFIXES,
+        KNOWN_TYPE_SUFFIXES,
+        TYPE_SUFFIX_NORMALIZATION,
+    )
+except ImportError:
+    from plugins.inventory_plugin.constants import (
+        TYPE_NORMALIZATION_MAP,
+        TYPE_PRIORITY,
+        NEVER_DEDUPLICATE_TYPES,
+        KNOWN_TYPE_PREFIXES,
+        KNOWN_TYPE_SUFFIXES,
+        TYPE_SUFFIX_NORMALIZATION,
+    )
+
 logger = logging.getLogger(__name__)
+
+
+def _normalize_entity_type(entity_type: str) -> str:
+    """
+    Normalize entity type to canonical lowercase form.
+
+    Handles many LLM-generated type variations:
+    - Explicit mappings from TYPE_NORMALIZATION_MAP
+    - Slash/comma/colon-separated composite types (picks highest priority part)
+    - Triple-underscore separators (api_contract___parameter)
+    - Trailing underscore before slash (api_contract_/integration)
+    - '_or_' patterns (api_contract_or_integration_point)
+    - Parenthetical suffixes (api_contract(parameter))
+    - Joined words without underscores (businessrule → business_rule)
+    - Plural forms
+    """
+    if not entity_type:
+        return "unknown"
+
+    # Check explicit mapping first (before any processing)
+    if entity_type in TYPE_NORMALIZATION_MAP:
+        return TYPE_NORMALIZATION_MAP[entity_type]
+
+    # Pre-cleanup: normalize separators
+    normalized = entity_type.lower().strip()
+    normalized = normalized.replace(" ", "_").replace("-", "_")
+    normalized = normalized.replace("_/", "/")      # api_contract_/integration → api_contract/integration
+    normalized = normalized.replace("___", "/")     # api_contract___parameter → api_contract/parameter
+    normalized = normalized.replace("::", "/")      # documentation::guide → documentation/guide
+    if ":" in normalized and "/" not in normalized:
+        normalized = normalized.replace(":", "/")   # documentation:guide → documentation/guide
+
+    # Remove duplicate underscores
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+
+    # Strip leading/trailing underscores
+    normalized = normalized.strip("_")
+
+    # Check mapping after cleanup
+    if normalized in TYPE_NORMALIZATION_MAP:
+        return TYPE_NORMALIZATION_MAP[normalized]
+
+    # Handle parenthetical suffixes: api_contract(parameter) → extract base or pick best
+    if "(" in normalized and normalized.endswith(")"):
+        base = normalized.split("(")[0].strip("_")
+        inner = normalized.split("(")[1].rstrip(")").strip("_")
+        if base and inner:
+            # Treat as composite, pick higher priority
+            parts = [base, inner]
+            normalized = _pick_best_type_part(parts)
+        elif base:
+            normalized = base
+
+    # Handle '_or_' patterns: api_contract_or_integration_point → pick first part
+    if "_or_" in normalized:
+        parts = normalized.split("_or_")
+        normalized = _pick_best_type_part(parts)
+
+    # Handle comma-separated: workflows,processes,procedures → pick best
+    if "," in normalized:
+        parts = [p.strip().strip("_") for p in normalized.split(",")]
+        parts = [p for p in parts if p]
+        if parts:
+            normalized = _pick_best_type_part(parts)
+
+    # Handle slash-separated composite types (most common)
+    if "/" in normalized:
+        parts = [p.strip().strip("_") for p in normalized.split("/")]
+        parts = [p for p in parts if p]
+        if parts:
+            normalized = _pick_best_type_part(parts)
+        else:
+            return "unknown"
+
+    # Try to split joined words (businessrule → business_rule)
+    normalized = _insert_word_boundaries(normalized)
+
+    # Check mapping again after all transformations
+    if normalized in TYPE_NORMALIZATION_MAP:
+        return TYPE_NORMALIZATION_MAP[normalized]
+
+    # Handle plural forms by removing trailing 's' (but not 'ss' like 'class')
+    if normalized.endswith('s') and not normalized.endswith('ss') and len(normalized) > 3:
+        singular = normalized[:-1]
+        if singular in TYPE_NORMALIZATION_MAP:
+            return TYPE_NORMALIZATION_MAP[singular]
+        # Check if singular form is in the map values (canonical forms)
+        if singular in set(TYPE_NORMALIZATION_MAP.values()):
+            return singular
+
+    # Apply suffix-based normalization for compound types like "validation_rule" → "rule"
+    # Check longest suffixes first to avoid partial matches
+    for suffix in sorted(TYPE_SUFFIX_NORMALIZATION.keys(), key=len, reverse=True):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            # Make sure we're not just matching the suffix alone
+            prefix = normalized[:-len(suffix)]
+            if prefix and prefix != "_":
+                return TYPE_SUFFIX_NORMALIZATION[suffix]
+
+    return normalized
+
+
+def _pick_best_type_part(parts: list) -> str:
+    """Pick the part with highest TYPE_PRIORITY from a list of type parts."""
+    if not parts:
+        return "unknown"
+    if len(parts) == 1:
+        return parts[0]
+
+    def get_priority(part):
+        # Try to normalize the part first
+        p = part.lower().strip().strip("_")
+        # Insert word boundaries for joined words
+        p = _insert_word_boundaries(p)
+        # Handle plurals
+        if p.endswith('s') and not p.endswith('ss') and len(p) > 3:
+            singular = p[:-1]
+            if singular in TYPE_NORMALIZATION_MAP or singular in TYPE_PRIORITY:
+                p = singular
+        mapped = TYPE_NORMALIZATION_MAP.get(p, p)
+        return TYPE_PRIORITY.get(mapped, 0)
+
+    best = max(parts, key=get_priority)
+    # Return the normalized form of the best part
+    p = best.lower().strip().strip("_")
+    p = _insert_word_boundaries(p)
+    if p.endswith('s') and not p.endswith('ss') and len(p) > 3:
+        singular = p[:-1]
+        if singular in TYPE_NORMALIZATION_MAP or singular in TYPE_PRIORITY:
+            p = singular
+    return p
+
+
+def _insert_word_boundaries(type_str: str) -> str:
+    """
+    Insert underscores at word boundaries for joined words.
+    E.g., 'businessrule' → 'business_rule', 'domainconcept' → 'domain_concept'
+    Only splits if both prefix AND suffix are recognized words.
+    """
+    if "_" in type_str:
+        # Already has underscores, don't modify
+        return type_str
+
+    result = type_str
+    for prefix in KNOWN_TYPE_PREFIXES:
+        if result.startswith(prefix) and len(result) > len(prefix):
+            suffix = result[len(prefix):]
+            if suffix and suffix[0] != "_":
+                # Only split if suffix starts with a known suffix word
+                # or is itself a known type
+                suffix_valid = any(suffix.startswith(s) for s in KNOWN_TYPE_SUFFIXES)
+                suffix_valid = suffix_valid or suffix in TYPE_NORMALIZATION_MAP
+                suffix_valid = suffix_valid or suffix in TYPE_PRIORITY
+                if suffix_valid:
+                    result = prefix + "_" + suffix
+                    break  # Only split at first match
+
+    return result
 
 
 class Citation:
@@ -195,6 +375,10 @@ class KnowledgeGraph:
         Returns:
             The entity_id (node ID in graph)
         """
+        # Normalize entity type to canonical lowercase form
+        # This ensures consistent type handling regardless of source variations
+        entity_type = _normalize_entity_type(entity_type)
+
         # Check if entity already exists (for merging citations)
         existing = self._graph.nodes.get(entity_id)
         
@@ -1236,7 +1420,7 @@ class KnowledgeGraph:
             path: File path to write JSON
         """
         # Use edges="links" explicitly for NetworkX 3.5+ compatibility
-        # This ensures consistent format that visualize.py and load_from_json expect
+        # This ensures consistent format that load_from_json expects
         data = nx.node_link_data(self._graph, edges="links")
         
         # Add index data for persistence
@@ -1333,10 +1517,14 @@ class KnowledgeGraph:
             if name:
                 self._entity_index[name].add(node_id)
             
-            # Type index
-            entity_type = data.get('type', '').lower()
-            if entity_type:
+            # Type index - normalize for consistency
+            raw_type = data.get('type', '')
+            if raw_type:
+                entity_type = _normalize_entity_type(raw_type)
                 self._type_index[entity_type].add(node_id)
+                # Also update the node data if type changed during normalization
+                if entity_type != raw_type:
+                    self._graph.nodes[node_id]['type'] = entity_type
             
             # File index (from file_path attribute)
             file_path = data.get('file_path', '')

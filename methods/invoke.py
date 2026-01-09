@@ -16,6 +16,12 @@ plugin_dir = Path(__file__).parent.parent
 if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
+# Import CANONICAL_TYPES for smart normalization
+try:
+    from ..constants import CANONICAL_TYPES
+except ImportError:
+    from plugins.inventory_plugin.constants import CANONICAL_TYPES
+
 
 class Method:
     """
@@ -144,12 +150,12 @@ class Method:
 
         log.info(f"Invoking tool: {toolkit_name}:{tool_name}")
 
-        # Validate toolkit - now only "inventory" is valid
-        if toolkit_name != "inventory":
+        # Validate toolkit - supports "inventory" and "inventory_search"
+        if toolkit_name not in ("inventory", "inventory_search"):
             return self._create_error_response(
                 invocation_id=invocation_id,
                 operation=tool_name,
-                exception=ValueError(f"Unknown toolkit: {toolkit_name}. Expected: inventory"),
+                exception=ValueError(f"Unknown toolkit: {toolkit_name}. Expected: inventory or inventory_search"),
                 include_traceback=False,
             )
 
@@ -170,8 +176,11 @@ class Method:
                 if key not in params or value:
                     params[key] = value
 
-            # Route to tool handler
-            return self._handle_inventory_tool(invocation_id, tool_name, params, request_data)
+            # Route to appropriate handler based on toolkit type
+            if toolkit_name == "inventory_search":
+                return self._handle_inventory_search_tool(invocation_id, tool_name, params, request_data)
+            else:
+                return self._handle_inventory_tool(invocation_id, tool_name, params, request_data)
 
         except Exception as e:
             log.exception(f"Tool invocation failed: {toolkit_name}:{tool_name}")
@@ -225,6 +234,10 @@ class Method:
             "get_entities_by_ids": self._tool_get_entities_by_ids,
             # Entity neighbor expansion (for graph UI context menu)
             "get_entity_neighbors": self._tool_get_entity_neighbors,
+            # Maintenance tools
+            "normalize_types": self._tool_normalize_types,
+            "rebuild_indices": self._tool_rebuild_indices,
+            "smart_normalize_types": self._tool_smart_normalize_types,
         }
 
         if tool_name not in tools:
@@ -261,7 +274,426 @@ class Method:
             return self._create_success_response(invocation_id, result[0], result[1])
         return self._create_success_response(invocation_id, result)
 
+    @web.method()
+    def _handle_inventory_search_tool(self, invocation_id, tool_name, params, request_data):
+        """Handle inventory_search toolkit tools - read-only access to referenced inventory graph.
+
+        This toolkit references an existing inventory application and exposes only
+        read-only search/query tools for use by other agents.
+        """
+        log.info(f"[inventory_search] Handling tool: {tool_name}")
+        log.info(f"[inventory_search] params: {params}")
+        log.info(f"[inventory_search] request_data keys: {request_data.keys() if request_data else 'None'}")
+        log.info(f"[inventory_search] configuration: {request_data.get('configuration', {})}")
+
+        # Tool name mapping: inventory_search tool names -> internal handler names
+        tool_mapping = {
+            "search_knowledge_graph": "search_graph",
+            "get_entity_details": "get_entity",
+            "get_related_entities": "get_related_entities",
+            "query_graph": "query_graph",
+            "list_entity_types": "list_entity_types",
+            "investigate": "investigate",
+        }
+
+        if tool_name not in tool_mapping:
+            return self._create_error_response(
+                invocation_id=invocation_id,
+                operation=tool_name,
+                exception=ValueError(f"Unknown inventory_search tool: {tool_name}. Available: {list(tool_mapping.keys())}"),
+                include_traceback=False,
+            )
+
+        # Get the referenced inventory toolkit - can be an ID or a full toolkit object
+        inventory_toolkit_ref = params.get("inventory_toolkit")
+        if not inventory_toolkit_ref:
+            return self._create_error_response(
+                invocation_id=invocation_id,
+                operation=tool_name,
+                exception=ValueError("inventory_toolkit parameter is required - specify which inventory toolkit to use"),
+                include_traceback=False,
+            )
+
+        # Extract toolkit ID - handle both int and dict (full toolkit object)
+        if isinstance(inventory_toolkit_ref, dict):
+            inventory_toolkit_id = inventory_toolkit_ref.get("id")
+            log.info(f"[inventory_search] Extracted toolkit ID from object: {inventory_toolkit_id}")
+        else:
+            inventory_toolkit_id = inventory_toolkit_ref
+            log.info(f"[inventory_search] Using toolkit ID directly: {inventory_toolkit_id}")
+
+        if not inventory_toolkit_id:
+            return self._create_error_response(
+                invocation_id=invocation_id,
+                operation=tool_name,
+                exception=ValueError("Could not extract toolkit ID from inventory_toolkit parameter"),
+                include_traceback=False,
+            )
+
+        # Get project_id - it's at the root level of request_data (not in configuration)
+        project_id = request_data.get("project_id")
+        log.info(f"[inventory_search] project_id={project_id}, type={type(project_id)}, raw_value={repr(request_data.get('project_id'))}")
+
+        # Debug: dump all request_data keys and values for project_id
+        for key in request_data.keys():
+            if 'project' in key.lower() or 'id' in key.lower():
+                log.info(f"[inventory_search] request_data[{key}]={request_data.get(key)}")
+
+        if not project_id:
+            return self._create_error_response(
+                invocation_id=invocation_id,
+                operation=tool_name,
+                exception=ValueError("project_id not found in request configuration"),
+                include_traceback=False,
+            )
+
+        # Construct graph path from the referenced inventory toolkit
+        # The inventory toolkit stores its graph at /data/graphs/<project_id>/<toolkit_id>/graph.json
+        graph_path = f"/data/graphs/{project_id}/{inventory_toolkit_id}/graph.json"
+        log.info(f"[inventory_search] Using graph from inventory toolkit {inventory_toolkit_id}: {graph_path}")
+
+        # Track cache access
+        self.cache_manager.touch(str(project_id), str(inventory_toolkit_id))
+
+        # Route to internal tool handlers
+        internal_tool_name = tool_mapping[tool_name]
+
+        # Map to internal tool handlers
+        tools = {
+            "search_graph": self._tool_search_graph,
+            "get_entity": self._tool_get_entity,
+            "get_related_entities": self._tool_get_related_entities,
+            "query_graph": self._tool_query_graph,
+            "list_entity_types": self._tool_list_entity_types_only,
+            "investigate": self._tool_investigate,
+        }
+
+        # Execute tool - investigate needs project_id and toolkit_id
+        if internal_tool_name == "investigate":
+            result = tools[internal_tool_name](params, project_id, inventory_toolkit_id, request_data)
+        else:
+            result = tools[internal_tool_name](params, graph_path, request_data)
+
+        # Handle tuple returns (result, artifacts)
+        if isinstance(result, tuple):
+            return self._create_success_response(invocation_id, result[0], result[1])
+        return self._create_success_response(invocation_id, result)
+
+    @web.method()
+    def _tool_list_entity_types_only(self, params, graph_path, request_data):
+        """List all entity types in the graph with counts - simplified version for inventory_search toolkit."""
+        if not graph_path:
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+
+        # Get entity type counts from the graph
+        type_counts = {}
+        for node_id in wrapper._knowledge_graph._graph.nodes():
+            node_data = wrapper._knowledge_graph._graph.nodes[node_id]
+            entity_type = node_data.get('type', 'unknown')
+            type_counts[entity_type] = type_counts.get(entity_type, 0) + 1
+
+        # Sort by count descending
+        sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+
+        # Format output
+        lines = ["Entity Types in Knowledge Graph:", "=" * 40]
+        total = 0
+        for entity_type, count in sorted_types:
+            lines.append(f"  {entity_type}: {count}")
+            total += count
+        lines.append("-" * 40)
+        lines.append(f"  Total: {total} entities")
+
+        return "\n".join(lines)
+
+    @web.method()
+    def _tool_investigate(self, params, project_id, toolkit_id, request_data):
+        """
+        Investigate/ask questions about the knowledge graph using an AI agent.
+
+        This tool provides a natural language interface to query the knowledge graph.
+        It uses an LLM-powered agent that can:
+        - Search the knowledge graph
+        - Get entity details
+        - Explore relationships
+        - Analyze impact
+
+        Args (via params):
+            question: The question to investigate (required)
+            entity_types: Filter to specific entity types (optional)
+            sources: Filter to specific source toolkits (optional)
+            layers: Filter to specific layers (optional)
+            depth: Max relationship hops (default: 2)
+            max_nodes: Max results per search (default: 500)
+
+        Returns:
+            Structured response with answer, citations, and token usage
+        """
+        import json as json_module
+
+        # Extract question
+        question = params.get("question") or params.get("query") or params.get("prompt")
+        if not question:
+            return json_module.dumps({
+                "error": "Missing required parameter: question",
+                "usage": "Provide a 'question' parameter with your investigation query"
+            })
+
+        # Build filters from params
+        filters = {}
+        if params.get("entity_types"):
+            entity_types = params.get("entity_types")
+            if isinstance(entity_types, str):
+                entity_types = [t.strip() for t in entity_types.split(",")]
+            filters["entity_types"] = entity_types
+
+        if params.get("sources"):
+            sources = params.get("sources")
+            if isinstance(sources, str):
+                sources = [s.strip() for s in sources.split(",")]
+            filters["sources"] = sources
+
+        if params.get("layers"):
+            layers = params.get("layers")
+            if isinstance(layers, str):
+                layers = [l.strip() for l in layers.split(",")]
+            filters["layers"] = layers
+
+        # Search scope settings
+        filters["depth"] = params.get("depth", 2)
+        filters["max_nodes"] = params.get("max_nodes", 500)
+
+        log.info(f"[investigate] Question: {question[:100]}...")
+        log.info(f"[investigate] Filters: {filters}")
+        log.info(f"[investigate] project_id={project_id}, toolkit_id={toolkit_id}")
+
+        try:
+            # Call inventory_chat method (no emit_fn for non-streaming)
+            result = self.inventory_chat(
+                project_id=project_id,
+                toolkit_id=toolkit_id,
+                prompt=question,
+                filters=filters,
+                conversation_id=None,  # No conversation tracking for tool invocations
+                history=[],  # No history for single-shot queries
+                emit_fn=None,  # No streaming
+                model=None,  # Use toolkit's configured model
+            )
+
+            # Format response
+            response = {
+                "answer": result.get("answer", ""),
+                "citations": result.get("citations", []),
+                "tool_calls": result.get("tool_calls", []),
+                "tokens_in": result.get("tokens_in", 0),
+                "tokens_out": result.get("tokens_out", 0),
+                "total_tokens": result.get("tokens_in", 0) + result.get("tokens_out", 0),
+            }
+
+            if result.get("error"):
+                response["error"] = result["error"]
+
+            # Also return as formatted text for better readability
+            output_format = params.get("output_format", "text")
+            if output_format == "json":
+                return json_module.dumps(response, indent=2)
+
+            # Text format
+            lines = []
+            lines.append("=" * 60)
+            lines.append("INVESTIGATION RESULT")
+            lines.append("=" * 60)
+            lines.append("")
+            lines.append(result.get("answer", "No answer generated"))
+            lines.append("")
+
+            if result.get("citations"):
+                lines.append("-" * 40)
+                lines.append("Citations:")
+                for citation in result["citations"][:10]:  # Limit to 10
+                    if citation.get("entity_name"):
+                        lines.append(f"  - {citation['entity_name']}")
+                    elif citation.get("source_toolkit"):
+                        path = citation.get("file_path", "")
+                        lines.append(f"  - {citation['source_toolkit']}: {path}")
+
+            if result.get("tool_calls"):
+                lines.append("-" * 40)
+                lines.append(f"Tools used: {len(result['tool_calls'])}")
+                for tc in result["tool_calls"][:5]:  # Show first 5
+                    lines.append(f"  - {tc.get('tool', 'unknown')}")
+
+            lines.append("-" * 40)
+            lines.append(f"Tokens: {response['total_tokens']} (in: {response['tokens_in']}, out: {response['tokens_out']})")
+
+            if result.get("error"):
+                lines.append(f"Error: {result['error']}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            log.exception(f"[investigate] Error: {e}")
+            return json_module.dumps({
+                "error": str(e),
+                "answer": "",
+                "citations": [],
+            })
+
     # ========== Graph/Wrapper Management ==========
+
+    @web.method()
+    def _parse_entity_reference(self, entity_ref: str):
+        """
+        Parse entity reference string.
+
+        Supports formats from search results:
+        - "Name" -> returns (name, None)
+        - "Name (type)" -> returns (name, type)
+        - "Name (type) @ source" -> returns (name, type)
+        - "Name (type) @ source - file_path" -> returns (name, type)
+
+        The parser strips everything after " @ " before parsing Name (type),
+        allowing users to copy search results directly as input.
+        """
+        entity_ref = entity_ref.strip()
+
+        # Strip source and file path info: "Name (type) @ source - path" -> "Name (type)"
+        if ' @ ' in entity_ref:
+            entity_ref = entity_ref.split(' @ ')[0].strip()
+
+        # Check if ends with "(type)" pattern
+        if entity_ref.endswith(')'):
+            # Find the last opening parenthesis
+            paren_start = entity_ref.rfind('(')
+            if paren_start > 0:  # Must have something before the parenthesis
+                name = entity_ref[:paren_start].strip()
+                type_str = entity_ref[paren_start + 1:-1].strip()
+                if name and type_str:
+                    return name, type_str
+
+        # Plain name without type
+        return entity_ref, None
+
+    @web.method()
+    def _find_entity_by_reference(self, wrapper, entity_ref: str):
+        """
+        Find entity by reference string, supporting "Name", "Name (type)", and full search result formats.
+
+        Returns:
+            Tuple of (entity, error_message) - entity is None if not found
+        """
+        parsed_name, parsed_type = self._parse_entity_reference(entity_ref)
+
+        # Find all entities with this name to provide helpful feedback
+        all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
+
+        if parsed_type:
+            # Input has type specified - filter by type
+            for e in all_matches:
+                if e.get('type', '').lower() == parsed_type.lower():
+                    return e, None
+
+            # Not found with specified type
+            if all_matches:
+                available = [f"{e.get('name')} ({e.get('type', 'unknown')})" for e in all_matches[:10]]
+                return None, f"Entity '{parsed_name}' not found with type '{parsed_type}'.\n\nAvailable entities with this name:\n" + "\n".join(f"  - {a}" for a in available)
+            return None, f"Entity '{parsed_name}' not found. Try search_knowledge_graph to find the correct name."
+        else:
+            # No type specified - check if multiple matches exist
+            if len(all_matches) > 1:
+                # Multiple matches - ask user to specify type
+                options = [f"{e.get('name')} ({e.get('type', 'unknown')}) @ {e.get('source_toolkit', '?')} - {e.get('file_path', '?')}" for e in all_matches[:10]]
+                return None, f"Multiple entities named '{parsed_name}' found. Please specify the type:\n\n" + "\n".join(f"  - {o}" for o in options) + "\n\nUse format: \"Name (type)\" or copy full reference from above."
+            elif all_matches:
+                return all_matches[0], None
+            return None, f"Entity '{entity_ref}' not found. Try search_knowledge_graph to find the correct name."
+
+    @web.method()
+    def _parse_graph_query(self, query_str: str) -> dict:
+        """
+        Parse JQL-like query string into parameters dict.
+
+        Syntax:
+            type:class,function    - Entity types (comma-separated)
+            layer:code,service     - Layers to filter
+            file:*.py,src/*.ts     - File patterns
+            name:UserService       - Name substring filter
+            related:EntityName     - Find entities related to this
+            related:"Name (type) @ source - path"  - Full search result format
+            rel:calls,imports      - Relation types filter
+            dir:in|out|both        - Relation direction
+            limit:50               - Max results
+
+        Examples:
+            type:class layer:code
+            related:UserService type:function dir:out
+            related:"read_file (method) @ sdk - path" type:class
+
+        Copy-paste from search results is supported for related: operator.
+        """
+        import shlex
+
+        params = {}
+        query_str = query_str.strip()
+
+        if not query_str:
+            return params
+
+        operators = {
+            'type': 'types', 'types': 'types',
+            'layer': 'layers', 'layers': 'layers',
+            'file': 'files', 'files': 'files',
+            'name': 'name', 'text': 'name', 'query': 'name',
+            'related': 'related_to', 'related_to': 'related_to',
+            'rel': 'relation_types', 'relation': 'relation_types',
+            'dir': 'direction', 'direction': 'direction',
+            'has_rel': 'has_relations', 'has_relations': 'has_relations',
+            'limit': 'limit',
+        }
+
+        list_params = {'types', 'layers', 'files', 'relation_types'}
+
+        try:
+            tokens = shlex.split(query_str)
+        except ValueError:
+            tokens = query_str.split()
+
+        unmatched_tokens = []
+
+        for token in tokens:
+            if ':' in token:
+                key, value = token.split(':', 1)
+                key = key.lower().strip()
+
+                if key in operators:
+                    param_name = operators[key]
+
+                    if param_name in list_params:
+                        values = [v.strip() for v in value.split(',') if v.strip()]
+                        if param_name in params:
+                            params[param_name].extend(values)
+                        else:
+                            params[param_name] = values
+                    elif param_name == 'limit':
+                        try:
+                            params[param_name] = int(value)
+                        except ValueError:
+                            pass
+                    elif param_name == 'has_relations':
+                        params[param_name] = value.lower() in ('true', 'yes', '1')
+                    else:
+                        params[param_name] = value
+                else:
+                    unmatched_tokens.append(token)
+            else:
+                unmatched_tokens.append(token)
+
+        if unmatched_tokens and 'name' not in params:
+            params['name'] = ' '.join(unmatched_tokens)
+
+        return params
 
     @web.method()
     def _is_artifact_error(self, data):
@@ -479,8 +911,8 @@ class Method:
                 import requests as http_requests
                 from alita_sdk.tools import instantiate_toolkit
 
-                # Fetch toolkit data using correct API path
-                toolkit_api_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
+                # Fetch toolkit data using correct API path with expand=true to get expanded credentials
+                toolkit_api_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
                 log.info(f"[run_ingestion] Fetching toolkit from: {toolkit_api_url}")
 
                 resp = http_requests.get(toolkit_api_url, headers=alita_client.headers, verify=False)
@@ -677,6 +1109,25 @@ class Method:
                     relations_count=result.relations_added,
                     documents_processed=result.documents_processed,
                 )
+
+                # Auto-normalize entity types after successful ingestion
+                try:
+                    log.info(f"[run_ingestion] Running automatic type normalization...")
+                    self.invocation_thinking("Normalizing entity types...")
+                    normalize_result = self._tool_normalize_types(
+                        {"smart": True, "output_format": "json"},
+                        graph_path,
+                        request_data
+                    )
+                    if normalize_result:
+                        normalize_data = json_module.loads(normalize_result) if isinstance(normalize_result, str) else normalize_result
+                        types_reduced = normalize_data.get("types_reduced", 0)
+                        if types_reduced > 0:
+                            log.info(f"[run_ingestion] Type normalization reduced {types_reduced} types")
+                        else:
+                            log.info(f"[run_ingestion] Type normalization complete (no changes needed)")
+                except Exception as norm_err:
+                    log.warning(f"[run_ingestion] Type normalization failed (non-fatal): {norm_err}")
             else:
                 error_summary = result.errors[0] if result.errors else "Unknown error"
                 status_manager.fail_ingestion(
@@ -976,7 +1427,7 @@ class Method:
 
     @web.method()
     def _get_all_edges(self, wrapper):
-        """Get ALL edges in the graph (like visualize.py does)"""
+        """Get ALL edges in the graph (for UI visualization)"""
         edges = []
         for source, target, data in wrapper._knowledge_graph._graph.edges(data=True):
             edges.append({
@@ -989,7 +1440,7 @@ class Method:
 
     @web.method()
     def _get_edges_for_entities(self, wrapper, entity_ids):
-        """Get ALL edges connected to any entity in the set (like visualize.py)"""
+        """Get ALL edges connected to any entity in the set (for visualization)"""
         entity_set = set(entity_ids)
         edges = []
         connected_node_ids = set()
@@ -1136,9 +1587,9 @@ class Method:
                 all_results = results
                 entity_ids = initial_entity_ids
             
-            # Get ALL edges connected to entities (like visualize.py)
+            # Get ALL edges connected to entities (for visualization)
             if show_all_edges:
-                # Show ALL edges in the graph, just like visualize.py does
+                # Show ALL edges in the graph, just for UI visualization
                 edges = self._get_all_edges(wrapper)
                 log.info(f"[DEBUG] Returning ALL {len(edges)} edges in graph (show_all_edges=True)")
             else:
@@ -1233,11 +1684,14 @@ class Method:
         entity_name = params.get("entity_name", "")
         include_relations = params.get("include_relations", True)
 
-        if output_format == "json":
-            entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-            if not entity:
-                return json_module.dumps({"error": f"Entity '{entity_name}' not found"})
+        # Find entity supporting both "Name" and "Name (type)" formats
+        entity, error_msg = self._find_entity_by_reference(wrapper, entity_name)
+        if not entity:
+            if output_format == "json":
+                return json_module.dumps({"error": error_msg})
+            return error_msg
 
+        if output_format == "json":
             result = {"entity": entity}
 
             if include_relations:
@@ -1283,11 +1737,14 @@ class Method:
         direction = params.get("direction", "downstream")
         max_depth = params.get("max_depth", 3)
 
-        if output_format == "json":
-            entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-            if not entity:
-                return json_module.dumps({"error": f"Entity '{entity_name}' not found"})
+        # Find entity supporting both "Name" and "Name (type)" formats
+        entity, error_msg = self._find_entity_by_reference(wrapper, entity_name)
+        if not entity:
+            if output_format == "json":
+                return json_module.dumps({"error": error_msg})
+            return error_msg
 
+        if output_format == "json":
             entity_id = entity.get("id")
             if not entity_id:
                 return json_module.dumps({"error": "Entity has no ID"})
@@ -1324,11 +1781,14 @@ class Method:
         relation_type = params.get("relation_type")
         direction = params.get("direction", "both")
 
-        if output_format == "json":
-            entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-            if not entity:
-                return json_module.dumps({"error": f"Entity '{entity_name}' not found"})
+        # Find entity supporting both "Name" and "Name (type)" formats
+        entity, error_msg = self._find_entity_by_reference(wrapper, entity_name)
+        if not entity:
+            if output_format == "json":
+                return json_module.dumps({"error": error_msg})
+            return error_msg
 
+        if output_format == "json":
             entity_id = entity.get("id")
             if not entity_id:
                 return json_module.dumps({"error": "Entity has no ID"})
@@ -1345,6 +1805,223 @@ class Method:
         return wrapper.get_related_entities(
             entity_name, relation_type=relation_type, direction=direction
         )
+
+    @web.method()
+    def _tool_query_graph(self, params, graph_path, request_data):
+        """Query graph with structured filters - no similarity search"""
+        import json as json_module
+
+        if not graph_path:
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        output_format = params.get("output_format", "text")
+
+        # Check for JQL query string parameter
+        jql_query = params.get("query", "")
+        if jql_query and not any(params.get(k) for k in ['types', 'layers', 'files', 'related_to']):
+            # Parse JQL query and merge into params
+            parsed = self._parse_graph_query(jql_query)
+            for k, v in parsed.items():
+                if k not in params or not params[k]:
+                    params[k] = v
+
+        # Helper to parse comma-separated strings to lists
+        def to_list(val):
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str) and val.strip():
+                return [v.strip() for v in val.split(',') if v.strip()]
+            return []
+
+        # Extract parameters
+        entity_types = to_list(params.get("types", params.get("entity_types", [])))
+        layers = to_list(params.get("layers", []))
+        file_patterns = to_list(params.get("files", params.get("file_patterns", [])))
+        text_filter = params.get("name", params.get("text", ""))
+        has_relations = params.get("has_relations")
+        limit = min(params.get("limit", 30), 100)
+
+        # Relationship-based query
+        related_to = params.get("related_to")
+        relation_types = to_list(params.get("relation_types", []))
+        relation_direction = params.get("direction", "both")
+
+        # Handle relationship-based query
+        if related_to:
+            entity, error_msg = self._find_entity_by_reference(wrapper, related_to)
+            if not entity:
+                if output_format == "json":
+                    return json_module.dumps({"error": error_msg})
+                return error_msg
+
+            entity_id = entity.get('id')
+            if not entity_id:
+                error = f"Entity '{entity.get('name')}' ({entity.get('type')}) has no ID. This may be a graph integrity issue."
+                if output_format == "json":
+                    return json_module.dumps({"error": error})
+                return error
+
+            # Get relations
+            relations = wrapper._knowledge_graph.get_relations(entity_id, direction=relation_direction)
+
+            # Filter by relation types
+            if relation_types:
+                rel_types_lower = [rt.lower() for rt in relation_types]
+                relations = [r for r in relations if r.get('relation_type', '').lower() in rel_types_lower]
+
+            # Collect related entities
+            results = []
+            seen_ids = set()
+
+            for rel in relations:
+                if rel['source'] == entity_id:
+                    related_id = rel['target']
+                    rel_dir = "outgoing"
+                else:
+                    related_id = rel['source']
+                    rel_dir = "incoming"
+
+                if related_id in seen_ids:
+                    continue
+                seen_ids.add(related_id)
+
+                related_entity = wrapper._knowledge_graph.get_entity(related_id)
+                if not related_entity:
+                    continue
+
+                # Apply filters
+                etype = related_entity.get('type', '').lower()
+                elayer = related_entity.get('layer', '') or wrapper._knowledge_graph.TYPE_TO_LAYER.get(etype, '')
+
+                if entity_types:
+                    types_lower = [t.lower() for t in entity_types]
+                    expanded_types = set(types_lower)
+                    for t in types_lower:
+                        if t in wrapper._knowledge_graph.LAYER_TYPE_MAPPING:
+                            expanded_types.update(wrapper._knowledge_graph.LAYER_TYPE_MAPPING[t])
+                    if etype not in expanded_types:
+                        continue
+
+                if layers:
+                    if elayer.lower() not in [l.lower() for l in layers]:
+                        continue
+
+                if text_filter:
+                    if text_filter.lower() not in related_entity.get('name', '').lower():
+                        continue
+
+                results.append({
+                    'entity': related_entity,
+                    'relation_type': rel.get('relation_type', 'RELATED'),
+                    'direction': rel_dir,
+                })
+
+                if len(results) >= limit:
+                    break
+
+            if output_format == "json":
+                return json_module.dumps({
+                    "base_entity": entity,
+                    "related": results,
+                    "total": len(results),
+                })
+
+            if not results:
+                return f"No related entities found for '{related_to}' matching filters."
+
+            output = f"# Entities related to {entity.get('name', 'Unknown')} ({entity.get('type', '')})\n"
+            output += f"Found {len(results)} results\n\n"
+
+            for r in results:
+                e = r['entity']
+                arrow = "→" if r['direction'] == "outgoing" else "←"
+                output += f"- {arrow} [{r['relation_type']}] **{e.get('name', 'Unknown')}** ({e.get('type', '')})"
+                if e.get('source_toolkit'):
+                    output += f" @ {e.get('source_toolkit')}"
+                if e.get('file_path'):
+                    output += f" - {e.get('file_path')}"
+                output += "\n"
+
+            return output
+
+        # Standard structured query
+        results = wrapper._knowledge_graph.search_advanced(
+            query=text_filter if text_filter else None,
+            entity_types=entity_types if entity_types else None,
+            layers=layers if layers else None,
+            file_patterns=file_patterns if file_patterns else None,
+            has_relations=has_relations,
+            top_k=limit,
+        )
+
+        if output_format == "json":
+            return json_module.dumps({
+                "results": results,
+                "total": len(results),
+                "filters": {
+                    "types": entity_types,
+                    "layers": layers,
+                    "files": file_patterns,
+                    "text": text_filter,
+                }
+            })
+
+        if not results:
+            filters = []
+            if entity_types:
+                filters.append(f"types={entity_types}")
+            if layers:
+                filters.append(f"layers={layers}")
+            if file_patterns:
+                filters.append(f"files={file_patterns}")
+            if text_filter:
+                filters.append(f"text='{text_filter}'")
+            return f"No entities found matching filters: {', '.join(filters) or 'none'}"
+
+        # Group by layer
+        by_layer = {}
+        for r in results:
+            e = r['entity']
+            etype = e.get('type', '').lower()
+            layer = e.get('layer', '') or wrapper._knowledge_graph.TYPE_TO_LAYER.get(etype, 'other')
+            if layer not in by_layer:
+                by_layer[layer] = []
+            by_layer[layer].append(r)
+
+        output = f"# Query Results | {len(results)} entities\n"
+
+        filters = []
+        if entity_types:
+            filters.append(f"types: {', '.join(entity_types)}")
+        if layers:
+            filters.append(f"layers: {', '.join(layers)}")
+        if file_patterns:
+            filters.append(f"files: {', '.join(file_patterns)}")
+        if text_filter:
+            filters.append(f"text: '{text_filter}'")
+        if filters:
+            output += f"Filters: {' | '.join(filters)}\n"
+        output += "\n"
+
+        for layer in ['code', 'service', 'data', 'testing', 'configuration', 'documentation', 'domain', 'product', 'knowledge', 'structure', 'tooling', 'other']:
+            if layer not in by_layer:
+                continue
+            entities = by_layer[layer]
+            output += f"## {layer.title()} ({len(entities)})\n"
+
+            for r in entities:
+                e = r['entity']
+                output += f"- **{e.get('name', 'Unknown')}** ({e.get('type', '')})"
+                if e.get('source_toolkit'):
+                    output += f" @ {e.get('source_toolkit')}"
+                if e.get('file_path'):
+                    output += f" - {e.get('file_path')}"
+                output += "\n"
+
+            output += "\n"
+
+        return output
 
     @web.method()
     def _tool_get_cross_source_relations(self, params, graph_path, request_data):
@@ -2131,5 +2808,828 @@ class Method:
 
         if edges:
             output += f"\n{len(edges)} edges connecting these entities.\n"
+
+        return output
+
+    # ========== Graph Maintenance Tools ==========
+
+    @web.method()
+    def _tool_normalize_types(self, params, graph_path, request_data):
+        """
+        Normalize all entity types in the graph to canonical forms.
+
+        This performs two-stage normalization:
+        1. Rule-based: Consolidates variations like "Feature", "Features", "feature" into "feature"
+        2. Smart (LLM-based): Maps remaining types to ~50 canonical types for consistency
+
+        Parameters:
+            smart: bool (default True) - Whether to run LLM-based smart normalization after rule-based
+            smart_threshold: int (default len(CANONICAL_TYPES)) - Only run smart normalization if types exceed this threshold
+
+        Returns statistics about normalized types.
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+        run_smart = params.get("smart", True)
+        smart_threshold = params.get("smart_threshold", len(CANONICAL_TYPES))
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured", "normalized_count": 0})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        # Get stats before normalization
+        stats_before = kg.get_stats()
+        types_before = len(stats_before.get('entity_types', {}))
+
+        # Stage 1: Rule-based normalization via index rebuild
+        kg._rebuild_indices()
+        kg.dump_to_json(graph_path)
+
+        # Get stats after rule-based normalization
+        stats_after_rules = kg.get_stats()
+        types_after_rules = len(stats_after_rules.get('entity_types', {}))
+
+        smart_result = None
+        types_final = types_after_rules
+
+        # Stage 2: Smart (LLM-based) normalization if enabled and threshold exceeded
+        if run_smart and types_after_rules > smart_threshold:
+            log.info(f"[normalize_types] Running smart normalization: {types_after_rules} types > threshold {smart_threshold}")
+            try:
+                smart_result = self._tool_smart_normalize_types(
+                    {"dry_run": False},
+                    graph_path,
+                    request_data
+                )
+                # Parse result to get final count
+                if isinstance(smart_result, str):
+                    smart_data = json_module.loads(smart_result)
+                    types_final = smart_data.get("types_after", types_after_rules)
+            except Exception as e:
+                log.error(f"[normalize_types] Smart normalization failed: {e}")
+                smart_result = {"error": str(e)}
+
+        # Get final stats
+        stats_final = kg.get_stats()
+        types_final = len(stats_final.get('entity_types', {}))
+
+        result = {
+            "success": True,
+            "types_before": types_before,
+            "types_after_rules": types_after_rules,
+            "types_after": types_final,
+            "types_reduced": types_before - types_final,
+            "rule_based_reduction": types_before - types_after_rules,
+            "smart_reduction": types_after_rules - types_final if run_smart else 0,
+            "smart_normalization_ran": run_smart and types_after_rules > smart_threshold,
+            "entity_types": stats_final.get('entity_types', {}),
+            "message": f"Normalized entity types: {types_before} -> {types_final} unique types (rule-based: {types_after_rules}, smart: {types_final})"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        return f"Type normalization complete:\n- Types before: {types_before}\n- After rule-based: {types_after_rules}\n- After smart: {types_final}\n- Total reduced: {types_before - types_final}"
+
+    @web.method()
+    def _tool_rebuild_indices(self, params, graph_path, request_data):
+        """
+        Rebuild all graph indices (name, type, file, source).
+
+        Use this after manual graph modifications or to fix index inconsistencies.
+        Also normalizes entity types during rebuild.
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured"})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        # Rebuild all indices
+        kg._rebuild_indices()
+
+        # Save updated graph
+        kg.dump_to_json(graph_path)
+
+        # Get updated stats
+        stats = kg.get_stats()
+
+        result = {
+            "success": True,
+            "entity_count": stats.get('entity_count', 0),
+            "relation_count": stats.get('relation_count', 0),
+            "unique_types": len(stats.get('entity_types', {})),
+            "unique_names": len(kg._entity_index),
+            "indexed_files": len(kg._file_index),
+            "message": "Indices rebuilt successfully"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        return f"Indices rebuilt:\n- Entities: {result['entity_count']}\n- Relations: {result['relation_count']}\n- Types: {result['unique_types']}\n- Files: {result['indexed_files']}"
+
+    @web.method()
+    def _tool_smart_normalize_types(self, params, graph_path, request_data):
+        """
+        Use LLM to intelligently normalize entity types to a small set of canonical types.
+
+        This tool sends uncommon entity types to an LLM which maps them to canonical types.
+        Uses structured output to ensure consistent mapping format.
+
+        Parameters:
+            threshold: Only normalize types with count below this (default: 1000)
+            dry_run: If true, show proposed changes without applying (default: false)
+            llm_model: LLM model to use (default: from toolkit config)
+            batch_size: Number of types to process per LLM call (default: 100)
+
+        Returns:
+            Statistics about normalized types and the mapping applied.
+        """
+        import json as json_module
+        from pydantic import BaseModel, Field
+        from typing import Dict, List
+
+        output_format = params.get("output_format", "json")
+        threshold = int(params.get("threshold", 1000))
+        dry_run = str(params.get("dry_run", "false")).lower() == "true"
+        batch_size = int(params.get("batch_size", 100))
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured"})
+            return "No graph configured"
+
+        # CANONICAL_TYPES is imported from constants.py
+
+        # Pydantic model for structured output
+        class TypeMapping(BaseModel):
+            """Mapping of original type to canonical type."""
+            original: str = Field(description="The original entity type name")
+            canonical: str = Field(description="The canonical type to map to")
+            confidence: float = Field(description="Confidence score 0-1", ge=0, le=1)
+
+        class TypeMappingResponse(BaseModel):
+            """Response containing all type mappings."""
+            mappings: List[TypeMapping] = Field(description="List of type mappings")
+
+        self.invocation_thinking("Loading graph and analyzing types...")
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        # Get current type statistics
+        stats = kg.get_stats()
+        entity_types = stats.get('entity_types', {})
+
+        # Filter types below threshold (these are candidates for normalization)
+        types_to_normalize = {
+            t: count for t, count in entity_types.items()
+            if count < threshold and t not in CANONICAL_TYPES
+        }
+
+        if not types_to_normalize:
+            result = {
+                "success": True,
+                "message": f"No types to normalize (all types either have count >= {threshold} or are already canonical)",
+                "types_checked": len(entity_types),
+                "canonical_types": len(CANONICAL_TYPES),
+            }
+            if output_format == "json":
+                return json_module.dumps(result)
+            return result["message"]
+
+        self.invocation_thinking(f"Found {len(types_to_normalize)} types to normalize...")
+
+        # Get LLM for smart normalization
+        config = request_data.get("configuration", {})
+        project_id = config.get("project_id") or params.get("project_id")
+        inventory_settings = config.get("settings", {})
+
+        llm_model = (
+            params.get("llm_model") or
+            inventory_settings.get("toolkit_configuration_llm_model") or
+            inventory_settings.get("llm_model") or
+            "gpt-4o-mini"
+        )
+
+        alita_client = self._get_alita_client(project_id)
+        if not alita_client:
+            if output_format == "json":
+                return json_module.dumps({"error": "Platform API not configured"})
+            return "Error: Platform API not configured"
+
+        llm = alita_client.get_llm(
+            model_name=llm_model,
+            model_config={'temperature': 0.0, 'max_tokens': 4096}
+        )
+
+        # Create structured LLM
+        structured_llm = llm.with_structured_output(TypeMappingResponse)
+
+        # Process types in batches
+        all_mappings = {}
+        type_list = list(types_to_normalize.keys())
+        total_batches = (len(type_list) + batch_size - 1) // batch_size
+
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(type_list))
+            batch_types = type_list[start_idx:end_idx]
+
+            self.invocation_thinking(f"Processing batch {batch_num + 1}/{total_batches} ({len(batch_types)} types)...")
+
+            # Build prompt
+            prompt = f"""You are a knowledge graph type normalizer. Map each entity type to the most appropriate canonical type.
+
+CANONICAL TYPES (you MUST map to one of these):
+{', '.join(sorted(CANONICAL_TYPES))}
+
+RULES:
+1. Map each type to the SINGLE most appropriate canonical type from the list above
+2. Consider semantic meaning, not just string similarity
+3. Types ending in _rule, _policy, _constraint → "rule"
+4. Types ending in _requirement → "requirement"
+5. Types ending in _step, _procedure → "process" or "step"
+6. Types ending in _example, _sample → "example"
+7. Types ending in _guide, _guideline, _note, _documentation → "documentation"
+8. Types ending in _parameter, _field, _attribute → "parameter"
+9. Types ending in _feature, _capability → "feature"
+10. Types ending in _config, _setting, _option → "configuration"
+11. Types about facts, behaviors, details, info → "fact"
+12. Types about UI, interaction, presentation → "component" or "feature"
+13. Unknown or unclear types → "fact" (safest default)
+
+TYPES TO NORMALIZE:
+{json_module.dumps(batch_types, indent=2)}
+
+Map each type to exactly one canonical type. Be aggressive in consolidation - we want fewer unique types."""
+
+            try:
+                response = structured_llm.invoke(prompt)
+
+                for mapping in response.mappings:
+                    if mapping.canonical in CANONICAL_TYPES:
+                        all_mappings[mapping.original] = mapping.canonical
+                    else:
+                        # If LLM returned non-canonical type, default to "fact"
+                        all_mappings[mapping.original] = "fact"
+
+            except Exception as e:
+                log.warning(f"Error processing batch {batch_num + 1}: {e}")
+                # Fallback: map all types in this batch to "fact"
+                for t in batch_types:
+                    all_mappings[t] = "fact"
+
+            # Check for stop request
+            self.invocation_stop_checkpoint()
+
+        self.invocation_thinking(f"Generated {len(all_mappings)} type mappings...")
+
+        # Calculate impact
+        entities_affected = sum(types_to_normalize.get(t, 0) for t in all_mappings.keys())
+        target_type_counts = {}
+        for orig, canonical in all_mappings.items():
+            count = types_to_normalize.get(orig, 0)
+            target_type_counts[canonical] = target_type_counts.get(canonical, 0) + count
+
+        if dry_run:
+            # Return preview without applying
+            result = {
+                "success": True,
+                "dry_run": True,
+                "types_to_normalize": len(all_mappings),
+                "entities_affected": entities_affected,
+                "target_types": len(set(all_mappings.values())),
+                "mapping_preview": dict(list(all_mappings.items())[:50]),  # First 50 mappings
+                "target_type_distribution": target_type_counts,
+                "message": f"DRY RUN: Would normalize {len(all_mappings)} types affecting {entities_affected} entities"
+            }
+            if output_format == "json":
+                return json_module.dumps(result)
+            return result["message"]
+
+        # Apply mappings to the graph
+        self.invocation_thinking("Applying type mappings to graph...")
+
+        normalized_count = 0
+        for node_id in kg._graph.nodes():
+            node_data = kg._graph.nodes[node_id]
+            current_type = node_data.get('type', '')
+            if current_type in all_mappings:
+                node_data['type'] = all_mappings[current_type]
+                normalized_count += 1
+
+        # Rebuild indices after type changes
+        kg._rebuild_indices()
+
+        # Save the updated graph
+        kg.dump_to_json(graph_path)
+
+        # Get final stats
+        final_stats = kg.get_stats()
+        final_types = len(final_stats.get('entity_types', {}))
+
+        result = {
+            "success": True,
+            "dry_run": False,
+            "types_before": len(entity_types),
+            "types_after": final_types,
+            "types_reduced": len(entity_types) - final_types,
+            "entities_normalized": normalized_count,
+            "mappings_applied": len(all_mappings),
+            "llm_model": llm_model,
+            "message": f"Smart normalization complete: {len(entity_types)} → {final_types} types ({normalized_count} entities updated)"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        return result["message"]
+
+    @web.method()
+    def _tool_get_type_stats(self, params, graph_path, request_data):
+        """
+        Get detailed statistics about entity types in the graph.
+
+        Useful for identifying type fragmentation before normalization.
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+        show_all = params.get("show_all", False)
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured", "types": {}})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+        stats = kg.get_stats()
+
+        entity_types = stats.get('entity_types', {})
+
+        # Sort by count descending
+        sorted_types = sorted(entity_types.items(), key=lambda x: x[1], reverse=True)
+
+        # Identify potential duplicates (similar names)
+        potential_duplicates = []
+        type_names = list(entity_types.keys())
+        for i, t1 in enumerate(type_names):
+            for t2 in type_names[i+1:]:
+                # Check if one is plural of other or differs only by case/underscore
+                t1_norm = t1.lower().replace('_', '').replace('-', '')
+                t2_norm = t2.lower().replace('_', '').replace('-', '')
+                if t1_norm.rstrip('s') == t2_norm.rstrip('s') and t1 != t2:
+                    potential_duplicates.append((t1, entity_types[t1], t2, entity_types[t2]))
+
+        result = {
+            "total_types": len(entity_types),
+            "total_entities": sum(entity_types.values()),
+            "types": dict(sorted_types[:50]) if not show_all else dict(sorted_types),
+            "potential_duplicates": potential_duplicates[:20],
+            "top_10": dict(sorted_types[:10]),
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        output = f"Entity Type Statistics:\n"
+        output += f"- Total unique types: {result['total_types']}\n"
+        output += f"- Total entities: {result['total_entities']}\n\n"
+
+        output += "Top 10 types:\n"
+        for t, count in sorted_types[:10]:
+            output += f"  {t}: {count}\n"
+
+        if potential_duplicates:
+            output += f"\nPotential duplicates ({len(potential_duplicates)}):\n"
+            for t1, c1, t2, c2 in potential_duplicates[:10]:
+                output += f"  '{t1}' ({c1}) vs '{t2}' ({c2})\n"
+
+        return output
+
+    # ========== Graph Enrichment Tools ==========
+
+    @web.method()
+    def _tool_link_toolkits_to_tools(self, params, graph_path, request_data):
+        """
+        Create explicit links between toolkits and their tools.
+
+        Matches tools to toolkits based on:
+        - Same source file path
+        - Toolkit name appearing in tool name
+        - parent_toolkit property
+
+        Returns count of links created.
+        """
+        import json as json_module
+        import re
+        from collections import defaultdict
+
+        output_format = params.get("output_format", "json")
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured", "links_created": 0})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        links_created = 0
+        matches = []
+
+        # Get all entities
+        all_entities = []
+        for node_id in kg._graph.nodes():
+            node_data = kg._graph.nodes[node_id]
+            all_entities.append({
+                "id": node_id,
+                "name": node_data.get("name", ""),
+                "type": node_data.get("type", ""),
+                "file_path": node_data.get("file_path", ""),
+                "properties": node_data.get("properties", {}),
+            })
+
+        # Index toolkits and tools
+        toolkits = [e for e in all_entities if e["type"].lower() == "toolkit"]
+        tools = [e for e in all_entities if e["type"].lower() == "tool"]
+
+        # Index toolkits by file and name
+        toolkit_by_file = defaultdict(list)
+        toolkit_by_name = {}
+
+        for tk in toolkits:
+            if tk["file_path"]:
+                toolkit_by_file[tk["file_path"]].append(tk)
+            name = tk["name"].lower()
+            if name:
+                toolkit_by_name[name] = tk
+                # Also index by short name (without " toolkit" suffix)
+                short_name = re.sub(r'\s*toolkit$', '', name, flags=re.IGNORECASE)
+                toolkit_by_name[short_name] = tk
+
+        # Match tools to toolkits
+        for tool in tools:
+            tool_id = tool["id"]
+            tool_file = tool["file_path"]
+            tool_name = tool["name"].lower()
+            parent_toolkit = tool.get("properties", {}).get("parent_toolkit", "").lower()
+
+            matched_toolkit = None
+            match_reason = ""
+
+            # Strategy 1: Match by parent_toolkit property
+            if parent_toolkit:
+                for tk_name, tk in toolkit_by_name.items():
+                    if tk_name in parent_toolkit or parent_toolkit in tk_name:
+                        matched_toolkit = tk
+                        match_reason = f"parent_toolkit:{parent_toolkit}"
+                        break
+
+            # Strategy 2: Match by same file path
+            if not matched_toolkit and tool_file:
+                if tool_file in toolkit_by_file:
+                    matched_toolkit = toolkit_by_file[tool_file][0]
+                    match_reason = f"same_file"
+
+            # Strategy 3: Match by tool name containing toolkit name
+            if not matched_toolkit:
+                for tk_name, tk in toolkit_by_name.items():
+                    if len(tk_name) >= 3 and tk_name in tool_name:
+                        matched_toolkit = tk
+                        match_reason = f"name_match:{tk_name}"
+                        break
+
+            # Create link if matched and doesn't exist
+            if matched_toolkit:
+                # Check if edge already exists
+                if not kg._graph.has_edge(matched_toolkit["id"], tool_id):
+                    kg._graph.add_edge(
+                        matched_toolkit["id"],
+                        tool_id,
+                        relation_type="contains",
+                        enrichment_reason=f"toolkit_tool:{match_reason}"
+                    )
+                    links_created += 1
+                    matches.append({
+                        "toolkit": matched_toolkit["name"],
+                        "tool": tool["name"],
+                        "reason": match_reason
+                    })
+
+        # Save graph
+        kg.dump_to_json(graph_path)
+
+        result = {
+            "success": True,
+            "links_created": links_created,
+            "toolkits_found": len(toolkits),
+            "tools_found": len(tools),
+            "matches": matches[:20],  # First 20 matches
+            "message": f"Created {links_created} toolkit → tool links"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        output = f"Toolkit-Tool Linking:\n"
+        output += f"- Toolkits found: {len(toolkits)}\n"
+        output += f"- Tools found: {len(tools)}\n"
+        output += f"- Links created: {links_created}\n"
+        if matches:
+            output += "\nSample matches:\n"
+            for m in matches[:10]:
+                output += f"  {m['toolkit']} → {m['tool']} ({m['reason']})\n"
+
+        return output
+
+    @web.method()
+    def _tool_connect_orphan_nodes(self, params, graph_path, request_data):
+        """
+        Connect orphan nodes (nodes with no edges) to related entities.
+
+        Uses word overlap in entity names to find potential relationships.
+        Helps improve graph connectivity for isolated nodes.
+
+        Parameters:
+        - max_links_per_orphan: Maximum links to create per orphan (default: 3)
+        - min_word_overlap: Minimum word overlap ratio (default: 0.3)
+        """
+        import json as json_module
+        import re
+        from difflib import SequenceMatcher
+
+        output_format = params.get("output_format", "json")
+        max_links = params.get("max_links_per_orphan", 3)
+        min_overlap = params.get("min_word_overlap", 0.3)
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured", "links_created": 0})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        def normalize_name(name):
+            name = name.lower().strip()
+            name = re.sub(r'[_\-\.]+', ' ', name)
+            return re.sub(r'\s+', ' ', name)
+
+        def tokenize(name):
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'with', 'by', 'is', 'it'}
+            words = set(normalize_name(name).split())
+            return words - stop_words
+
+        def similarity(s1, s2):
+            return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+        # Find connected and orphan nodes
+        connected = set()
+        for u, v in kg._graph.edges():
+            connected.add(u)
+            connected.add(v)
+
+        orphans = []
+        non_orphans = []
+        for node_id in kg._graph.nodes():
+            node_data = kg._graph.nodes[node_id]
+            entity = {
+                "id": node_id,
+                "name": node_data.get("name", ""),
+                "type": node_data.get("type", ""),
+            }
+            if node_id in connected:
+                non_orphans.append(entity)
+            else:
+                orphans.append(entity)
+
+        links_created = 0
+        connections = []
+
+        # For each orphan, find potential connections
+        for orphan in orphans:
+            orphan_name = normalize_name(orphan["name"])
+            orphan_words = tokenize(orphan["name"])
+
+            if not orphan_words:
+                continue
+
+            candidates = []
+
+            for node in non_orphans:
+                node_name = normalize_name(node["name"])
+                node_words = tokenize(node["name"])
+
+                if not node_words:
+                    continue
+
+                # Calculate word overlap
+                overlap = len(orphan_words & node_words)
+                if overlap > 0:
+                    word_score = overlap / max(len(orphan_words), len(node_words))
+                    str_sim = similarity(orphan_name, node_name)
+                    score = (word_score + str_sim) / 2
+
+                    if score >= min_overlap:
+                        candidates.append((node, score))
+
+            # Sort and take top candidates
+            candidates.sort(key=lambda x: x[1], reverse=True)
+
+            for node, score in candidates[:max_links]:
+                if not kg._graph.has_edge(orphan["id"], node["id"]):
+                    kg._graph.add_edge(
+                        orphan["id"],
+                        node["id"],
+                        relation_type="related_to",
+                        enrichment_reason=f"orphan_link:score={score:.2f}"
+                    )
+                    links_created += 1
+                    connections.append({
+                        "orphan": orphan["name"],
+                        "connected_to": node["name"],
+                        "score": round(score, 2)
+                    })
+
+        # Save graph
+        kg.dump_to_json(graph_path)
+
+        result = {
+            "success": True,
+            "orphans_found": len(orphans),
+            "links_created": links_created,
+            "connections": connections[:20],
+            "message": f"Connected {links_created} orphan nodes"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        output = f"Orphan Node Connection:\n"
+        output += f"- Orphans found: {len(orphans)}\n"
+        output += f"- Links created: {links_created}\n"
+        if connections:
+            output += "\nSample connections:\n"
+            for c in connections[:10]:
+                output += f"  {c['orphan']} → {c['connected_to']} (score: {c['score']})\n"
+
+        return output
+
+    @web.method()
+    def _tool_validate_relationships(self, params, graph_path, request_data):
+        """
+        Validate relationships using heuristic rules.
+
+        Checks relationships for semantic validity based on entity types:
+        - 'imports' should only be between code entities
+        - 'implements' should have code as source
+        - 'tests' should have test_case as source
+        - 'contains' should have container types as source
+
+        Returns count of validated, upgraded, and removed relationships.
+        """
+        import json as json_module
+
+        output_format = params.get("output_format", "json")
+        confidence_threshold = params.get("confidence_threshold", 0.7)
+        remove_invalid = params.get("remove_invalid", False)  # Conservative: don't remove by default
+
+        if not graph_path:
+            if output_format == "json":
+                return json_module.dumps({"error": "No graph configured"})
+            return "No graph configured"
+
+        wrapper = self._get_or_create_wrapper(graph_path, request_data)
+        kg = wrapper._knowledge_graph
+
+        # Define validation rules
+        invalid_combinations = {
+            "imports": {
+                "invalid_source": {"feature", "concept", "documentation", "requirement"},
+                "invalid_target": {"feature", "concept", "documentation", "requirement"},
+            },
+            "implements": {
+                "invalid_source": {"documentation", "concept", "glossary_term"},
+            },
+            "contains": {
+                "invalid_source": {"constant", "variable", "field", "property"},
+            },
+            "tests": {
+                "invalid_source": {"class", "function", "method", "module"},
+            },
+        }
+
+        valid_combinations = {
+            ("class", "interface", "implements"): 0.9,
+            ("method", "function", "calls"): 0.85,
+            ("test", "function", "tests"): 0.9,
+            ("test", "class", "tests"): 0.9,
+            ("documentation", "class", "documents"): 0.85,
+            ("toolkit", "tool", "contains"): 0.95,
+            ("module", "class", "contains"): 0.9,
+            ("class", "method", "contains"): 0.95,
+        }
+
+        stats = {
+            "total_edges": 0,
+            "validated": 0,
+            "upgraded": 0,
+            "invalid": 0,
+            "removed": 0,
+        }
+
+        edges_to_remove = []
+        invalid_edges = []
+
+        for u, v, data in kg._graph.edges(data=True):
+            stats["total_edges"] += 1
+
+            source_data = kg._graph.nodes.get(u, {})
+            target_data = kg._graph.nodes.get(v, {})
+            source_type = source_data.get("type", "").lower()
+            target_type = target_data.get("type", "").lower()
+            relation_type = data.get("relation_type", "").lower()
+            confidence = data.get("confidence", 1.0)
+
+            # Check for invalid combinations
+            is_invalid = False
+            if relation_type in invalid_combinations:
+                rules = invalid_combinations[relation_type]
+                if source_type in rules.get("invalid_source", set()):
+                    is_invalid = True
+                if target_type in rules.get("invalid_target", set()):
+                    is_invalid = True
+
+            if is_invalid:
+                stats["invalid"] += 1
+                invalid_edges.append({
+                    "source": source_data.get("name", u),
+                    "target": target_data.get("name", v),
+                    "relation": relation_type,
+                    "reason": f"invalid_{source_type}→{target_type}"
+                })
+                if remove_invalid:
+                    edges_to_remove.append((u, v))
+                continue
+
+            # Check for valid combinations that should boost confidence
+            combo_key = (source_type, target_type, relation_type)
+            if combo_key in valid_combinations:
+                suggested_confidence = valid_combinations[combo_key]
+                if confidence < suggested_confidence:
+                    kg._graph.edges[u, v]["confidence"] = suggested_confidence
+                    stats["upgraded"] += 1
+
+            stats["validated"] += 1
+
+        # Remove invalid edges if requested
+        if remove_invalid:
+            for u, v in edges_to_remove:
+                kg._graph.remove_edge(u, v)
+                stats["removed"] += 1
+
+        # Save graph
+        kg.dump_to_json(graph_path)
+
+        result = {
+            "success": True,
+            "total_edges": stats["total_edges"],
+            "validated": stats["validated"],
+            "upgraded": stats["upgraded"],
+            "invalid_found": stats["invalid"],
+            "removed": stats["removed"],
+            "invalid_edges": invalid_edges[:20],
+            "message": f"Validated {stats['validated']} edges, found {stats['invalid']} invalid"
+        }
+
+        if output_format == "json":
+            return json_module.dumps(result)
+
+        output = f"Relationship Validation:\n"
+        output += f"- Total edges: {stats['total_edges']}\n"
+        output += f"- Validated: {stats['validated']}\n"
+        output += f"- Upgraded confidence: {stats['upgraded']}\n"
+        output += f"- Invalid found: {stats['invalid']}\n"
+        output += f"- Removed: {stats['removed']}\n"
+
+        if invalid_edges:
+            output += "\nInvalid relationships:\n"
+            for e in invalid_edges[:10]:
+                output += f"  {e['source']} --[{e['relation']}]--> {e['target']} ({e['reason']})\n"
 
         return output

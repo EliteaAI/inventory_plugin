@@ -186,6 +186,13 @@ export function useChatPredict({
         if (response_metadata?.finish_reason) {
           msg.isLoading = false;
           msg.isStreaming = false;
+          // Extract token usage from response metadata
+          if (response_metadata?.chat_history_tokens_input !== undefined) {
+            msg.tokens_in = response_metadata.chat_history_tokens_input;
+          }
+          if (response_metadata?.llm_response_tokens_output !== undefined) {
+            msg.tokens_out = response_metadata.llm_response_tokens_output;
+          }
           setIsStreaming(false);
         }
         break;

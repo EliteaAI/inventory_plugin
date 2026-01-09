@@ -1282,10 +1282,23 @@ function App() {
                               size="small"
                               checked={selectedNodeTypes.includes(type)}
                               onChange={() => handleNodeTypeToggle(type)}
-                              sx={{ py: 0.25, '& .MuiSvgIcon-root': { color: typeColors[type] } }}
+                              sx={{ py: 0.25, '& .MuiSvgIcon-root': { color: typeColors[type] || typeColors.default } }}
                             />
                           }
-                          label={<Typography variant="body2">{type}</Typography>}
+                          label={
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                              <Box
+                                sx={{
+                                  width: 10,
+                                  height: 10,
+                                  borderRadius: '50%',
+                                  backgroundColor: typeColors[type] || typeColors.default,
+                                  flexShrink: 0,
+                                }}
+                              />
+                              <Typography variant="body2">{type}</Typography>
+                            </Box>
+                          }
                           sx={{ ml: 0, '& .MuiFormControlLabel-label': { ml: 0.5 } }}
                         />
                       ))}
@@ -1334,7 +1347,24 @@ function App() {
 
               {/* Stats Tab */}
               {rightTab === 2 && (
-                <StatsPanel stats={stats} cacheStats={cacheStats} />
+                <StatsPanel
+                  stats={stats}
+                  cacheStats={cacheStats}
+                  onRefreshStats={async () => {
+                    // Refresh stats after maintenance operations
+                    if (config?.project_id && config?.toolkit_id) {
+                      const statsData = await getGraphStats(config.project_id, config.toolkit_id);
+                      if (statsData) {
+                        setStats(statsData);
+                        setNodeCount(statsData.node_count || 0);
+                        setEdgeCount(statsData.edge_count || 0);
+                        if (statsData.edge_types && statsData.edge_types.length > 0) {
+                          setAvailableEdgeTypes(statsData.edge_types);
+                        }
+                      }
+                    }
+                  }}
+                />
               )}
             </Box>
           </Paper>

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Box,
   Typography,
@@ -6,11 +7,19 @@ import {
   Chip,
   LinearProgress,
   Divider,
+  Button,
+  CircularProgress,
+  Alert,
+  Collapse,
 } from '@mui/material';
 import StorageIcon from '@mui/icons-material/Storage';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import DataObjectIcon from '@mui/icons-material/DataObject';
 import LayersIcon from '@mui/icons-material/Layers';
+import BuildIcon from '@mui/icons-material/Build';
+import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import { invokeProviderTool } from '../utils/api';
 
 function StatCard({ icon, label, value, color = 'primary' }) {
   return (
@@ -26,7 +35,52 @@ function StatCard({ icon, label, value, color = 'primary' }) {
   );
 }
 
-function StatsPanel({ stats, cacheStats, sources }) {
+function StatsPanel({ stats, cacheStats, sources, onRefreshStats }) {
+  const [normalizing, setNormalizing] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [maintenanceResult, setMaintenanceResult] = useState(null);
+  const [showMaintenance, setShowMaintenance] = useState(false);
+
+  const handleNormalizeTypes = async () => {
+    setNormalizing(true);
+    setMaintenanceResult(null);
+    try {
+      const result = await invokeProviderTool('normalize_types', { output_format: 'json' });
+      setMaintenanceResult({
+        type: 'success',
+        message: `Normalized types: ${result.types_before} → ${result.types_after} (reduced by ${result.types_reduced})`,
+      });
+      // Refresh stats after normalization
+      if (onRefreshStats) {
+        onRefreshStats();
+      }
+    } catch (err) {
+      setMaintenanceResult({ type: 'error', message: err.message });
+    } finally {
+      setNormalizing(false);
+    }
+  };
+
+  const handleRebuildIndices = async () => {
+    setRebuilding(true);
+    setMaintenanceResult(null);
+    try {
+      const result = await invokeProviderTool('rebuild_indices', { output_format: 'json' });
+      setMaintenanceResult({
+        type: 'success',
+        message: `Indices rebuilt: ${result.entity_count} entities, ${result.unique_types} types, ${result.indexed_files} files`,
+      });
+      // Refresh stats after rebuild
+      if (onRefreshStats) {
+        onRefreshStats();
+      }
+    } catch (err) {
+      setMaintenanceResult({ type: 'error', message: err.message });
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
   if (!stats) {
     return (
       <Paper sx={{ p: 2 }}>
@@ -41,6 +95,7 @@ function StatsPanel({ stats, cacheStats, sources }) {
   const edgeCount = stats.edge_count || 0;
   const typeBreakdown = stats.entity_types || {};
   const layerBreakdown = stats.layers || {};
+  const uniqueTypes = Object.keys(typeBreakdown).length;
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -127,6 +182,64 @@ function StatsPanel({ stats, cacheStats, sources }) {
           </Box>
         </Paper>
       )}
+
+      {/* Graph Maintenance */}
+      <Paper variant="outlined" sx={{ p: 1.5 }}>
+        <Box
+          sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', mb: showMaintenance ? 1 : 0 }}
+          onClick={() => setShowMaintenance(!showMaintenance)}
+        >
+          <BuildIcon fontSize="small" sx={{ mr: 0.5, color: 'text.secondary' }} />
+          <Typography variant="subtitle2" sx={{ flexGrow: 1 }}>
+            Maintenance
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {uniqueTypes} types
+          </Typography>
+        </Box>
+
+        <Collapse in={showMaintenance}>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            {maintenanceResult && (
+              <Alert
+                severity={maintenanceResult.type}
+                onClose={() => setMaintenanceResult(null)}
+                sx={{ py: 0 }}
+              >
+                <Typography variant="caption">{maintenanceResult.message}</Typography>
+              </Alert>
+            )}
+
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={normalizing ? <CircularProgress size={14} /> : <AutoFixHighIcon />}
+                onClick={handleNormalizeTypes}
+                disabled={normalizing || rebuilding}
+                sx={{ flex: 1, textTransform: 'none', fontSize: '0.75rem' }}
+              >
+                Normalize Types
+              </Button>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={rebuilding ? <CircularProgress size={14} /> : <RefreshIcon />}
+                onClick={handleRebuildIndices}
+                disabled={normalizing || rebuilding}
+                sx={{ flex: 1, textTransform: 'none', fontSize: '0.75rem' }}
+              >
+                Rebuild Indices
+              </Button>
+            </Box>
+
+            <Typography variant="caption" color="text.secondary">
+              Normalize consolidates type variations (Feature → feature).
+              Rebuild fixes index inconsistencies.
+            </Typography>
+          </Box>
+        </Collapse>
+      </Paper>
 
       {/* Cache stats */}
       {cacheStats && (

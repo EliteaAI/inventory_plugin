@@ -11,18 +11,86 @@ if (!cytoscape.prototype._coseBilkentRegistered) {
 }
 
 // Entity type colors - exported for use in filters
+// Comprehensive palette covering all normalized entity types
 export const typeColors = {
-  class: '#4CAF50',
-  function: '#2196F3',
-  method: '#03A9F4',
-  module: '#9C27B0',
-  file: '#FF9800',
-  package: '#795548',
-  service: '#E91E63',
-  api: '#00BCD4',
-  database: '#607D8B',
-  table: '#8BC34A',
-  default: '#9E9E9E',
+  // === Code Structure (Blues/Cyans) ===
+  class: '#2196F3',        // Blue
+  function: '#1976D2',     // Dark Blue
+  method: '#03A9F4',       // Light Blue
+  module: '#0288D1',       // Blue 700
+  interface: '#00ACC1',    // Cyan 600
+  component: '#0097A7',    // Cyan 700
+  field: '#4FC3F7',        // Light Blue 300
+  property: '#29B6F6',     // Light Blue 400
+  variable: '#81D4FA',     // Light Blue 200
+  constant: '#0D47A1',     // Blue 900
+  parameter: '#64B5F6',    // Blue 300
+  import: '#5C6BC0',       // Indigo 400
+  export: '#7986CB',       // Indigo 300
+  enum: '#3949AB',         // Indigo 600
+
+  // === Files & Packages (Oranges/Browns) ===
+  file: '#FF9800',         // Orange
+  source_file: '#F57C00',  // Orange 700
+  package: '#795548',      // Brown
+
+  // === Services & APIs (Pinks/Reds) ===
+  service: '#E91E63',      // Pink
+  api: '#AD1457',          // Pink 800
+  rest_api: '#C2185B',     // Pink 700
+  endpoint: '#D81B60',     // Pink 600
+  integration: '#EC407A',  // Pink 400
+
+  // === Data (Greens) ===
+  database: '#388E3C',     // Green 700
+  table: '#4CAF50',        // Green
+  schema: '#66BB6A',       // Green 400
+  data: '#81C784',         // Green 300
+
+  // === Features & Requirements (Purples) ===
+  feature: '#9C27B0',      // Purple
+  requirement: '#7B1FA2',  // Purple 700
+  user_story: '#8E24AA',   // Purple 600
+  epic: '#6A1B9A',         // Purple 800
+  capability: '#AB47BC',   // Purple 400
+
+  // === Tools & Toolkits (Teals) ===
+  tool: '#009688',         // Teal
+  toolkit: '#00796B',      // Teal 700
+  mcp_server: '#00695C',   // Teal 800
+  mcp_tool: '#26A69A',     // Teal 400
+
+  // === Knowledge & Facts (Ambers/Yellows) ===
+  fact: '#FFC107',         // Amber
+  concept: '#FFB300',      // Amber 600
+  rule: '#FF8F00',         // Amber 800
+  business_rule: '#FFA000', // Amber 700
+
+  // === Testing (Light Greens/Limes) ===
+  test: '#8BC34A',         // Light Green
+  test_case: '#7CB342',    // Light Green 600
+
+  // === Documentation & Config (Blue Grays) ===
+  configuration: '#607D8B', // Blue Gray
+  config: '#546E7A',       // Blue Gray 600
+  documentation: '#78909C', // Blue Gray 400
+
+  // === Process & Workflow (Deep Oranges) ===
+  process: '#FF5722',      // Deep Orange
+  workflow: '#E64A19',     // Deep Orange 700
+
+  // === UI & Interface (Light Blues) ===
+  ui_component: '#B3E5FC', // Light Blue 100
+  ui_element: '#E1F5FE',   // Light Blue 50
+
+  // === Issues & Todos (Reds) ===
+  todo: '#F44336',         // Red
+  error_handling: '#D32F2F', // Red 700
+  issue: '#E53935',        // Red 600
+
+  // === Misc ===
+  unknown: '#9E9E9E',      // Gray
+  default: '#9E9E9E',      // Gray (fallback)
 };
 
 // Layer colors

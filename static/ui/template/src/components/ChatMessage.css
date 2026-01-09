@@ -280,6 +280,38 @@
   color: #777A83;
 }
 
+/* Stats container (tokens + duration) */
+.chat-message-stats {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.chat-message-tokens {
+  cursor: help;
+}
+
+.chat-panel--dark .chat-message-tokens {
+  color: #8B8D95;
+}
+
+.chat-panel--light .chat-message-tokens {
+  color: #9A9DA6;
+}
+
+.chat-message-separator {
+  margin: 0 2px;
+}
+
+.chat-panel--dark .chat-message-separator {
+  color: #5A5C63;
+}
+
+.chat-panel--light .chat-message-separator {
+  color: #CBCED6;
+}
+
 /* Tool actions */
 .chat-message-tool-actions {
   margin-bottom: 12px;

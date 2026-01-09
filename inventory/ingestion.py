@@ -59,6 +59,13 @@ from pydantic import BaseModel, Field, PrivateAttr
 from langchain_core.documents import Document
 
 from .knowledge_graph import KnowledgeGraph, Citation
+
+# Import type normalization constants - handle both import contexts
+try:
+    from ..constants import TYPE_NORMALIZATION_MAP, SIGNIFICANT_ENTITY_TYPES
+except ImportError:
+    from plugins.inventory_plugin.constants import TYPE_NORMALIZATION_MAP, SIGNIFICANT_ENTITY_TYPES
+
 from .extractors import (
     DocumentClassifier,
     EntitySchemaDiscoverer, 
@@ -304,53 +311,6 @@ _CANONICAL_TYPES = set()
 for layer_data in ENTITY_TAXONOMY.values():
     for type_def in layer_data["types"]:
         _CANONICAL_TYPES.add(type_def["name"].lower())
-
-# Map common variations to canonical forms
-TYPE_NORMALIZATION_MAP = {
-    # Tool/Toolkit variations
-    "tools": "tool",
-    "Tool": "tool", 
-    "Tools": "tool",
-    "Toolkit": "toolkit",
-    "toolkits": "toolkit",
-    # MCP variations
-    "MCP Server": "mcp_server",
-    "MCP Tool": "mcp_tool",
-    "MCP Resource": "mcp_resource",
-    # Common variations  
-    "Feature": "feature",
-    "Features": "feature",
-    "API": "api",
-    "APIs": "api",
-    "Service": "service",
-    "Services": "service",
-    "Endpoint": "endpoint",
-    "Endpoints": "endpoint",
-    "Configuration": "configuration",
-    "Config": "configuration",
-    "Test Case": "test_case",
-    "Test Cases": "test_case",
-    "test case": "test_case",
-    "User Story": "user_story",
-    "User Stories": "user_story",
-    "user story": "user_story",
-    "Business Rule": "business_rule",
-    "business rule": "business_rule",
-    "UI Component": "ui_component",
-    "ui component": "ui_component",
-    "UI Field": "ui_field",
-    "ui field": "ui_field",
-    "Test Suite": "test_suite",
-    "test suite": "test_suite",
-    "Test Step": "test_step",
-    "test step": "test_step",
-    "Glossary Term": "glossary_term",
-    "glossary term": "glossary_term",
-    "Domain Entity": "domain_entity",
-    "domain entity": "domain_entity",
-    "Pull Request": "pull_request",
-    "pull request": "pull_request",
-}
 
 def normalize_entity_type(entity_type: str) -> str:
     """
@@ -781,7 +741,12 @@ class IngestionPipeline(BaseModel):
         if self.progress_callback:
             try:
                 self.progress_callback(message, phase)
-            except Exception as e:
+            except BaseException as e:
+                # Re-raise task interruption exceptions (e.g., InterruptTaskThread for stop requests)
+                # These should propagate up to stop the task, not be swallowed
+                if e.__class__.__name__ == 'InterruptTaskThread':
+                    logger.info(f"[{phase}] Task stop requested, interrupting...")
+                    raise
                 logger.debug(f"Progress callback failed: {e}")
     
     def _auto_save(self) -> None:
@@ -2065,16 +2030,36 @@ class IngestionPipeline(BaseModel):
         import re
         
         cross_relations = []
-        
+
         # Build lookup tables
         entity_by_name: Dict[str, Dict] = {}
         entity_by_id: Dict[str, Dict] = {}
         file_to_entities: Dict[str, List[Dict]] = {}
         module_to_file: Dict[str, str] = {}
-        
+
         # For entity mention matching
         significant_entities: List[Tuple[str, Dict]] = []
-        
+
+        # ==== CROSS-SOURCE SUPPORT ====
+        # Build entity_by_name and entity_by_id from ALL graph entities first
+        # This enables finding references to entities from other sources
+        for ent in all_entity_dicts:
+            name = ent.get('name', '')
+            ent_id = ent.get('id', '')
+
+            if name:
+                name_lower = name.lower()
+                # Don't overwrite if already present from current source
+                if name_lower not in entity_by_name:
+                    entity_by_name[name_lower] = ent
+                if name not in entity_by_name:
+                    entity_by_name[name] = ent
+
+            if ent_id:
+                entity_by_id[ent_id] = ent
+
+        # Now process current source entities (these take precedence in lookups
+        # and provide richer data like source_doc for content analysis)
         for ent in entities:
             name = ent.get('name', '')
             ent_id = ent.get('id', '')
@@ -2085,9 +2070,9 @@ class IngestionPipeline(BaseModel):
                 entity_by_name[name] = ent
                 
                 # Track significant entities for mention detection
+                # Uses SIGNIFICANT_ENTITY_TYPES from constants.py for cross-source linking
                 ent_type = ent.get('type', '').lower()
-                if ent_type in ('class', 'component', 'service', 'module', 'api', 'endpoint',
-                               'feature', 'epic', 'requirement', 'interface', 'schema', 'table'):
+                if ent_type in SIGNIFICANT_ENTITY_TYPES:
                     if len(name) >= 3:  # Min 3 chars to reduce noise
                         significant_entities.append((name_lower, ent))
                         
@@ -2109,9 +2094,23 @@ class IngestionPipeline(BaseModel):
                     if stem.lower() == 'index':
                         module_to_file[p.parent.name.lower()] = file_path
         
+        # Also add significant entities from other sources (for cross-source mention detection)
+        # Uses SIGNIFICANT_ENTITY_TYPES from constants.py for cross-source linking
+        seen_significant = {name_lower for name_lower, _ in significant_entities}
+        for ent in all_entity_dicts:
+            name = ent.get('name', '')
+            if name:
+                name_lower = name.lower()
+                if name_lower not in seen_significant:
+                    ent_type = ent.get('type', '').lower()
+                    if ent_type in SIGNIFICANT_ENTITY_TYPES:
+                        if len(name) >= 3:
+                            significant_entities.append((name_lower, ent))
+                            seen_significant.add(name_lower)
+
         # Sort significant entities by length for greedy matching
         significant_entities.sort(key=lambda x: len(x[0]), reverse=True)
-        
+
         # ========================================================================
         # PHASE 1: Pattern-based extraction from file content
         # ========================================================================
@@ -2971,25 +2970,35 @@ class IngestionPipeline(BaseModel):
             
             self._log_progress(completion_msg, "complete")
             
-        except Exception as e:
+        except BaseException as e:
+            # Re-raise task interruption exceptions - these should propagate to stop the task
+            if e.__class__.__name__ == 'InterruptTaskThread':
+                logger.info(f"[ingestion] Task stop requested during ingestion, interrupting...")
+                # Still save progress before stopping
+                checkpoint.documents_processed = result.documents_processed
+                checkpoint.entities_added = result.entities_added
+                self._save_checkpoint(checkpoint)
+                self._auto_save()
+                raise
+
             logger.exception(f"Ingestion failed: {e}")
             result.success = False
             result.errors.append(str(e))
             result.duration_seconds = time.time() - start_time
-            
+
             # Save checkpoint on failure for resume
             checkpoint.errors.append(str(e))
             checkpoint.documents_processed = result.documents_processed
             checkpoint.entities_added = result.entities_added
             self._save_checkpoint(checkpoint)
             self._auto_save()  # Save graph progress
-            
+
             self._log_progress(
                 f"❌ Ingestion failed. Checkpoint saved for resume. "
                 f"Processed {result.documents_processed} docs before failure.",
                 "error"
             )
-        
+
         return result
     
     def run_from_generator(
@@ -3087,15 +3096,20 @@ class IngestionPipeline(BaseModel):
             result.duration_seconds = time.time() - start_time
             
             self._log_progress(f"✅ Complete! {result}", "complete")
-            
-        except Exception as e:
+
+        except BaseException as e:
+            # Re-raise task interruption exceptions - these should propagate to stop the task
+            if e.__class__.__name__ == 'InterruptTaskThread':
+                logger.info(f"[ingestion] Task stop requested during generator ingestion, interrupting...")
+                raise
+
             logger.exception(f"Ingestion failed: {e}")
             result.success = False
             result.errors.append(str(e))
             result.duration_seconds = time.time() - start_time
-        
+
         return result
-    
+
     def delta_update(
         self,
         source: str,

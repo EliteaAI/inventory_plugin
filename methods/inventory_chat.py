@@ -85,6 +85,9 @@ class InventoryChatCallback:
         self.is_cancelled = is_cancelled or (lambda: False)
         self.tool_runs = {}  # Track active tool runs
         self.start_time = time.time()
+        # Token tracking - accumulate across all LLM calls
+        self.total_tokens_in = 0
+        self.total_tokens_out = 0
 
     def check_cancelled(self):
         """Check if cancelled and raise exception if so."""
@@ -218,11 +221,61 @@ class InventoryChatCallback:
                 "is_reasoning_token": True,
             })
 
+        # Extract token usage from response
+        tokens_in = 0
+        tokens_out = 0
+        if response:
+            # Method 1: Check llm_output (common format)
+            llm_output = getattr(response, 'llm_output', {}) or {}
+            token_usage = llm_output.get('token_usage', {}) or {}
+            if token_usage:
+                tokens_in = token_usage.get('prompt_tokens', 0) or token_usage.get('input_tokens', 0) or 0
+                tokens_out = token_usage.get('completion_tokens', 0) or token_usage.get('output_tokens', 0) or 0
+
+            # Method 2: Check response_metadata in generations
+            if tokens_in == 0 and tokens_out == 0:
+                if hasattr(response, 'generations') and response.generations:
+                    for gen_list in response.generations:
+                        for gen in gen_list:
+                            if hasattr(gen, 'message'):
+                                msg = gen.message
+                                # Check usage_metadata (LangChain standard)
+                                # Note: usage_metadata can be a dict or an object with attributes
+                                if hasattr(msg, 'usage_metadata') and msg.usage_metadata:
+                                    usage = msg.usage_metadata
+                                    # Handle dict format (common in LangChain)
+                                    if isinstance(usage, dict):
+                                        tokens_in += usage.get('input_tokens', 0) or 0
+                                        tokens_out += usage.get('output_tokens', 0) or 0
+                                    else:
+                                        # Handle object format
+                                        tokens_in += getattr(usage, 'input_tokens', 0) or 0
+                                        tokens_out += getattr(usage, 'output_tokens', 0) or 0
+                                # Check response_metadata
+                                if hasattr(msg, 'response_metadata') and msg.response_metadata:
+                                    metadata = msg.response_metadata
+                                    usage = metadata.get('usage', {}) or metadata.get('token_usage', {}) or {}
+                                    if usage:
+                                        tokens_in += usage.get('input_tokens', 0) or usage.get('prompt_tokens', 0) or 0
+                                        tokens_out += usage.get('output_tokens', 0) or usage.get('completion_tokens', 0) or 0
+
+        # Debug log token extraction
+        if tokens_in > 0 or tokens_out > 0:
+            log.debug(f"[on_llm_end] Extracted tokens: in={tokens_in}, out={tokens_out}")
+
+        # Accumulate tokens
+        self.total_tokens_in += tokens_in
+        self.total_tokens_out += tokens_out
+
+        log.debug(f"[on_llm_end] Total accumulated: in={self.total_tokens_in}, out={self.total_tokens_out}")
+
         self.emit("llm_end", {
             "run_id": run_id,
             "output": output_content[:1000] if output_content else "",  # Truncate output
             "duration_ms": int(duration * 1000),
             "has_thinking": bool(thinking_content),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
         })
 
     def on_llm_error(self, error: Exception, **kwargs):
@@ -318,6 +371,14 @@ class InventoryChatCallback:
                 "tool_name": data.get("tool_name", ""),
                 "toolkit": data.get("toolkit", ""),
             })
+
+    def get_token_usage(self) -> Dict[str, int]:
+        """Get accumulated token usage across all LLM calls."""
+        return {
+            "tokens_in": self.total_tokens_in,
+            "tokens_out": self.total_tokens_out,
+            "total_tokens": self.total_tokens_in + self.total_tokens_out,
+        }
 
 
 class Method:
@@ -557,17 +618,21 @@ class Method:
             # Add touched entities to result
             result["touched_entities"] = touched_entities
             log.info(f"[inventory_chat] Touched {len(touched_entities)} entities")
+            log.info(f"[inventory_chat] Token usage: in={result.get('tokens_in', 0)}, out={result.get('tokens_out', 0)}")
 
             callback.emit("chat_complete", {
                 "answer_length": len(result.get("answer", "")),
                 "citations_count": len(result.get("citations", [])),
                 "touched_entities_count": len(touched_entities),
+                "tokens_in": result.get("tokens_in", 0),
+                "tokens_out": result.get("tokens_out", 0),
             })
 
             return result
 
         except ChatCancelledException:
             log.info(f"[inventory_chat] Chat cancelled: session_id={session_id}")
+            token_usage = callback.get_token_usage()
 
             callback.emit("chat_cancelled", {"message": "Chat cancelled by user"})
 
@@ -578,11 +643,14 @@ class Method:
                 "touched_entities": touched_entities,
                 "error": None,
                 "cancelled": True,
+                "tokens_in": token_usage["tokens_in"],
+                "tokens_out": token_usage["tokens_out"],
             }
 
         except Exception as e:
             log.exception(f"[inventory_chat] Error: {e}")
             error_msg = str(e)
+            token_usage = callback.get_token_usage()
 
             callback.emit("chat_error", {"error": error_msg})
 
@@ -592,6 +660,8 @@ class Method:
                 "tool_calls": [],
                 "touched_entities": [],
                 "error": error_msg,
+                "tokens_in": token_usage["tokens_in"],
+                "tokens_out": token_usage["tokens_out"],
             }
         finally:
             # Flush Langfuse traces
@@ -621,7 +691,8 @@ class Method:
         Args:
             touched_entities: Shared list to collect entities accessed during execution
         """
-        from langchain.tools import Tool
+        from langchain.tools import Tool, StructuredTool
+        from pydantic import BaseModel, Field
         import os
 
         tools = []
@@ -671,24 +742,19 @@ class Method:
                     'layer': entity.get('layer'),
                 })
 
-        # 1. Graph Search Tool
-        def search_graph(tool_input: str) -> str:
+        # 1. Graph Search Tool - Args schema for StructuredTool
+        class SearchGraphInput(BaseModel):
+            """Input for search_knowledge_graph tool."""
+            query: str = Field(description="The search query to find entities in the knowledge graph")
+            top_k: int = Field(default=20, description="Maximum number of results to return (default: 20, max: 50)")
+
+        def search_graph(query: str, top_k: int = 20) -> str:
             """Search the knowledge graph for entities matching the query. Returns tree structure."""
             try:
-                # Parse input - can be JSON object or plain string query
-                query = tool_input
-                top_k = min(default_max_nodes, 20)  # Cap at 20 for tree display
+                # Apply limits
+                top_k = min(top_k, 50)  # Cap at 50
+                top_k = min(top_k, default_max_nodes)  # Also respect default_max_nodes
                 max_depth = default_depth
-
-                # Try to parse as JSON for structured input
-                if tool_input.strip().startswith('{'):
-                    try:
-                        parsed = json.loads(tool_input)
-                        query = parsed.get('query', tool_input)
-                        top_k = min(parsed.get('top_k', top_k), 50)  # Cap at 50
-                        max_depth = min(parsed.get('max_depth', max_depth), 3)  # Cap depth at 3
-                    except json.JSONDecodeError:
-                        pass  # Use as plain string query
 
                 log.info(f"[search_graph] query='{query}', top_k={top_k}, max_depth={max_depth}")
 
@@ -838,19 +904,72 @@ class Method:
                 log.exception(f"[search_graph] Error: {e}")
                 return f"Error searching graph: {e}"
 
-        tools.append(Tool(
+        tools.append(StructuredTool(
             name="search_knowledge_graph",
             func=search_graph,
             description=TOOL_DESCRIPTIONS["search_knowledge_graph"],
+            args_schema=SearchGraphInput,
         ))
+
+        # Helper to parse "Name (type)" format from search results
+        def parse_entity_reference(entity_ref: str):
+            """
+            Parse entity reference string.
+
+            Supports formats from search results:
+            - "Name" -> returns (name, None)
+            - "Name (type)" -> returns (name, type)
+            - "Name (type) @ source" -> returns (name, type)
+            - "Name (type) @ source - file_path" -> returns (name, type)
+
+            The parser strips everything after " @ " before parsing Name (type).
+            """
+            entity_ref = entity_ref.strip()
+
+            # Strip source and file path info: "Name (type) @ source - path" -> "Name (type)"
+            if ' @ ' in entity_ref:
+                entity_ref = entity_ref.split(' @ ')[0].strip()
+
+            # Check if ends with "(type)" pattern
+            if entity_ref.endswith(')'):
+                # Find the last opening parenthesis
+                paren_start = entity_ref.rfind('(')
+                if paren_start > 0:  # Must have something before the parenthesis
+                    name = entity_ref[:paren_start].strip()
+                    type_str = entity_ref[paren_start + 1:-1].strip()
+                    if name and type_str:
+                        return name, type_str
+
+            # Plain name without type
+            return entity_ref, None
 
         # 2. Get Entity Details Tool
         def get_entity_details(entity_name: str) -> str:
             """Get detailed information about a specific entity."""
             try:
-                entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-                if not entity:
-                    return f"Entity '{entity_name}' not found."
+                # Parse input: support both "Name" and "Name (type)" formats
+                parsed_name, parsed_type = parse_entity_reference(entity_name)
+
+                if parsed_type:
+                    # Input is in "Name (type)" format - find by name and filter by type
+                    all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
+                    entity = None
+                    for e in all_matches:
+                        if e.get('type', '').lower() == parsed_type.lower():
+                            entity = e
+                            break
+
+                    if not entity:
+                        # Type didn't match, show available types
+                        if all_matches:
+                            available_types = [e.get('type', 'unknown') for e in all_matches]
+                            return f"Entity '{parsed_name}' found but not with type '{parsed_type}'. Available types: {', '.join(available_types)}"
+                        return f"Entity '{parsed_name}' not found."
+                else:
+                    # Plain name - use original behavior
+                    entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
+                    if not entity:
+                        return f"Entity '{entity_name}' not found."
 
                 # Track this entity as touched
                 track_entity(entity)
@@ -900,9 +1019,27 @@ class Method:
         def get_related_entities(entity_name: str) -> str:
             """Get entities related to the specified entity."""
             try:
-                entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-                if not entity:
-                    return f"Entity '{entity_name}' not found."
+                # Parse input: support both "Name" and "Name (type)" formats
+                parsed_name, parsed_type = parse_entity_reference(entity_name)
+
+                if parsed_type:
+                    # Input is in "Name (type)" format - find by name and filter by type
+                    all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
+                    entity = None
+                    for e in all_matches:
+                        if e.get('type', '').lower() == parsed_type.lower():
+                            entity = e
+                            break
+
+                    if not entity:
+                        if all_matches:
+                            available_types = [e.get('type', 'unknown') for e in all_matches]
+                            return f"Entity '{parsed_name}' found but not with type '{parsed_type}'. Available types: {', '.join(available_types)}"
+                        return f"Entity '{parsed_name}' not found."
+                else:
+                    entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
+                    if not entity:
+                        return f"Entity '{entity_name}' not found."
 
                 # Track the main entity
                 track_entity(entity)
@@ -962,7 +1099,364 @@ class Method:
             description=TOOL_DESCRIPTIONS["get_related_entities"],
         ))
 
-        # 4. List Entity Types Tool
+        # Helper to parse JQL-like query syntax
+        def parse_graph_query(query_str: str) -> dict:
+            """
+            Parse JQL-like query string into parameters dict.
+
+            Syntax:
+                type:class,function    - Entity types (comma-separated)
+                layer:code,service     - Layers to filter
+                file:*.py,src/*.ts     - File patterns
+                name:UserService       - Name substring filter
+                name:"User Service"    - Quoted for spaces
+                related:EntityName     - Find entities related to this
+                related:"Name (type)"  - With type qualifier
+                related:"Name (type) @ source - path"  - Full search result format
+                rel:calls,imports      - Relation types filter
+                dir:in|out|both        - Relation direction
+                has_rel:true|false     - Has relations filter
+                limit:50               - Max results
+
+            Examples:
+                type:class layer:code
+                related:UserService type:function dir:out
+                related:"read_file (method) @ sdk - artifact.py" type:class
+                file:*.py name:test limit:100
+
+            Plain text without operators is treated as name filter.
+            Copy-paste from search results is supported for related: operator.
+            """
+            import shlex
+
+            params = {}
+            query_str = query_str.strip()
+
+            if not query_str:
+                return params
+
+            # Known operators
+            operators = {
+                'type': 'types',
+                'types': 'types',
+                'layer': 'layers',
+                'layers': 'layers',
+                'file': 'files',
+                'files': 'files',
+                'name': 'name',
+                'text': 'name',
+                'query': 'name',
+                'related': 'related_to',
+                'related_to': 'related_to',
+                'rel': 'relation_types',
+                'relation': 'relation_types',
+                'relation_types': 'relation_types',
+                'dir': 'direction',
+                'direction': 'direction',
+                'has_rel': 'has_relations',
+                'has_relations': 'has_relations',
+                'limit': 'limit',
+            }
+
+            # List-type parameters (comma-separated values)
+            list_params = {'types', 'layers', 'files', 'relation_types'}
+
+            # Try to parse with shlex for proper quote handling
+            try:
+                tokens = shlex.split(query_str)
+            except ValueError:
+                # Fallback to simple split if shlex fails
+                tokens = query_str.split()
+
+            unmatched_tokens = []
+
+            for token in tokens:
+                if ':' in token:
+                    # Split on first colon only
+                    key, value = token.split(':', 1)
+                    key = key.lower().strip()
+
+                    if key in operators:
+                        param_name = operators[key]
+
+                        if param_name in list_params:
+                            # Parse comma-separated values
+                            values = [v.strip() for v in value.split(',') if v.strip()]
+                            if param_name in params:
+                                params[param_name].extend(values)
+                            else:
+                                params[param_name] = values
+                        elif param_name == 'limit':
+                            try:
+                                params[param_name] = int(value)
+                            except ValueError:
+                                pass
+                        elif param_name == 'has_relations':
+                            params[param_name] = value.lower() in ('true', 'yes', '1')
+                        else:
+                            params[param_name] = value
+                    else:
+                        # Unknown operator - treat whole token as part of name
+                        unmatched_tokens.append(token)
+                else:
+                    # No operator - collect for name filter
+                    unmatched_tokens.append(token)
+
+            # If there are unmatched tokens and no name set, use them as name filter
+            if unmatched_tokens and 'name' not in params:
+                params['name'] = ' '.join(unmatched_tokens)
+
+            return params
+
+        # 4. Query Graph Tool - structured queries without similarity search
+        def query_graph(query_input: str) -> str:
+            """Query the knowledge graph with structured filters (no similarity search)."""
+            import json as json_module
+
+            try:
+                # Parse input - accept JSON, JQL-like syntax, or simple text
+                params = {}
+                query_input = query_input.strip()
+
+                if query_input.startswith('{'):
+                    # JSON input
+                    try:
+                        params = json_module.loads(query_input)
+                    except json_module.JSONDecodeError:
+                        return "Invalid JSON input. Use JQL syntax instead: type:class layer:code"
+                else:
+                    # JQL-like syntax
+                    params = parse_graph_query(query_input)
+
+                # Extract parameters
+                entity_types = params.get("types", params.get("entity_types", []))
+                layers = params.get("layers", [])
+                file_patterns = params.get("files", params.get("file_patterns", []))
+                text_filter = params.get("name", params.get("text", params.get("query", "")))
+                has_relations = params.get("has_relations")
+                limit = min(params.get("limit", 30), 100)
+
+                # Relationship-based query: find entities related to a specific entity
+                related_to = params.get("related_to")
+                relation_types = params.get("relation_types", [])
+                relation_direction = params.get("direction", "both")  # in, out, both
+
+                # Handle relationship-based query first
+                if related_to:
+                    # Parse entity reference (supports "Name (type)" format)
+                    parsed_name, parsed_type = parse_entity_reference(related_to)
+
+                    # Find all entities with this name to provide helpful feedback
+                    all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
+
+                    if parsed_type:
+                        # Filter by type
+                        base_entity = None
+                        for e in all_matches:
+                            if e.get('type', '').lower() == parsed_type.lower():
+                                base_entity = e
+                                break
+                        if not base_entity and all_matches:
+                            available = [f"{e.get('name')} ({e.get('type', 'unknown')})" for e in all_matches[:10]]
+                            return f"Entity '{parsed_name}' not found with type '{parsed_type}'.\n\nAvailable entities with this name:\n" + "\n".join(f"  - {a}" for a in available)
+                    else:
+                        # No type specified - check if multiple matches exist
+                        if len(all_matches) > 1:
+                            # Multiple matches - ask user to specify type
+                            options = [f"{e.get('name')} ({e.get('type', 'unknown')}) @ {e.get('source_toolkit', '?')} - {e.get('file_path', '?')}" for e in all_matches[:10]]
+                            return f"Multiple entities named '{parsed_name}' found. Please specify the type:\n\n" + "\n".join(f"  - {o}" for o in options) + "\n\nUse format: related:\"Name (type)\" or copy full reference from above."
+                        elif all_matches:
+                            base_entity = all_matches[0]
+                        else:
+                            base_entity = None
+
+                    if not base_entity:
+                        # Try a fuzzy search to suggest similar names
+                        return f"Entity '{parsed_name}' not found. Try search_knowledge_graph to find the correct entity name."
+
+                    entity_id = base_entity.get('id')
+                    if not entity_id:
+                        # This shouldn't happen, but provide helpful info if it does
+                        return f"Entity '{base_entity.get('name')}' ({base_entity.get('type')}) has no ID. This may be a graph integrity issue."
+
+                    # Get relations
+                    relations = wrapper._knowledge_graph.get_relations(entity_id, direction=relation_direction)
+
+                    # Filter by relation types if specified
+                    if relation_types:
+                        rel_types_lower = [rt.lower() for rt in relation_types]
+                        relations = [r for r in relations if r.get('relation_type', '').lower() in rel_types_lower]
+
+                    # Collect related entities
+                    results = []
+                    seen_ids = set()
+
+                    for rel in relations:
+                        # Get the related entity ID
+                        if rel['source'] == entity_id:
+                            related_id = rel['target']
+                            rel_dir = "outgoing"
+                        else:
+                            related_id = rel['source']
+                            rel_dir = "incoming"
+
+                        if related_id in seen_ids:
+                            continue
+                        seen_ids.add(related_id)
+
+                        related_entity = wrapper._knowledge_graph.get_entity(related_id)
+                        if not related_entity:
+                            continue
+
+                        # Apply additional filters
+                        etype = related_entity.get('type', '').lower()
+                        elayer = related_entity.get('layer', '') or wrapper._knowledge_graph.TYPE_TO_LAYER.get(etype, '')
+
+                        if entity_types:
+                            types_lower = [t.lower() for t in entity_types]
+                            # Also expand layer names to types
+                            expanded_types = set(types_lower)
+                            for t in types_lower:
+                                if t in wrapper._knowledge_graph.LAYER_TYPE_MAPPING:
+                                    expanded_types.update(wrapper._knowledge_graph.LAYER_TYPE_MAPPING[t])
+                            if etype not in expanded_types:
+                                continue
+
+                        if layers:
+                            layers_lower = [l.lower() for l in layers]
+                            if elayer.lower() not in layers_lower:
+                                continue
+
+                        if text_filter:
+                            name = related_entity.get('name', '').lower()
+                            if text_filter.lower() not in name:
+                                continue
+
+                        results.append({
+                            'entity': related_entity,
+                            'relation_type': rel.get('relation_type', 'RELATED'),
+                            'direction': rel_dir,
+                        })
+
+                        if len(results) >= limit:
+                            break
+
+                    # Format output
+                    if not results:
+                        return f"No related entities found for '{related_to}' matching filters."
+
+                    base_name = base_entity.get('name', 'Unknown')
+                    base_type = base_entity.get('type', '')
+                    output = f"# Entities related to {base_name} ({base_type})\n"
+                    output += f"Found {len(results)} results\n\n"
+
+                    for r in results:
+                        e = r['entity']
+                        name = e.get('name', 'Unknown')
+                        etype = e.get('type', '')
+                        rel_type = r['relation_type']
+                        direction = r['direction']
+                        arrow = "→" if direction == "outgoing" else "←"
+
+                        file_path = e.get('file_path', '')
+                        source = e.get('source_toolkit', '')
+
+                        output += f"- {arrow} [{rel_type}] **{name}** ({etype})"
+                        if source:
+                            output += f" @ {source}"
+                        if file_path:
+                            output += f" - {file_path}"
+                        output += "\n"
+
+                    return output
+
+                # Standard structured query (no relationship base)
+                results = wrapper._knowledge_graph.search_advanced(
+                    query=text_filter if text_filter else None,
+                    entity_types=entity_types if entity_types else None,
+                    layers=layers if layers else None,
+                    file_patterns=file_patterns if file_patterns else None,
+                    has_relations=has_relations,
+                    top_k=limit,
+                )
+
+                if not results:
+                    filters_desc = []
+                    if entity_types:
+                        filters_desc.append(f"types={entity_types}")
+                    if layers:
+                        filters_desc.append(f"layers={layers}")
+                    if file_patterns:
+                        filters_desc.append(f"files={file_patterns}")
+                    if text_filter:
+                        filters_desc.append(f"text='{text_filter}'")
+                    return f"No entities found matching filters: {', '.join(filters_desc) or 'none'}"
+
+                # Format output - group by layer for readability
+                by_layer = {}
+                for r in results:
+                    e = r['entity']
+                    etype = e.get('type', '').lower()
+                    layer = e.get('layer', '') or wrapper._knowledge_graph.TYPE_TO_LAYER.get(etype, 'other')
+                    if layer not in by_layer:
+                        by_layer[layer] = []
+                    by_layer[layer].append(r)
+
+                output = f"# Query Results | {len(results)} entities\n"
+
+                # Show active filters
+                filters = []
+                if entity_types:
+                    filters.append(f"types: {', '.join(entity_types)}")
+                if layers:
+                    filters.append(f"layers: {', '.join(layers)}")
+                if file_patterns:
+                    filters.append(f"files: {', '.join(file_patterns)}")
+                if text_filter:
+                    filters.append(f"text: '{text_filter}'")
+                if filters:
+                    output += f"Filters: {' | '.join(filters)}\n"
+                output += "\n"
+
+                # Output by layer
+                for layer in ['code', 'service', 'data', 'testing', 'configuration', 'documentation', 'domain', 'product', 'knowledge', 'structure', 'tooling', 'other']:
+                    if layer not in by_layer:
+                        continue
+                    entities = by_layer[layer]
+                    output += f"## {layer.title()} ({len(entities)})\n"
+
+                    for r in entities:
+                        e = r['entity']
+                        name = e.get('name', 'Unknown')
+                        etype = e.get('type', '')
+                        file_path = e.get('file_path', '')
+                        source = e.get('source_toolkit', '')
+
+                        output += f"- **{name}** ({etype})"
+                        if source:
+                            output += f" @ {source}"
+                        if file_path:
+                            output += f" - {file_path}"
+                        output += "\n"
+
+                        # Track entity
+                        track_entity(e)
+
+                    output += "\n"
+
+                return output
+
+            except Exception as ex:
+                log.exception(f"[query_graph] Error: {ex}")
+                return f"Error querying graph: {ex}"
+
+        tools.append(Tool(
+            name="query_graph",
+            func=query_graph,
+            description=TOOL_DESCRIPTIONS.get("query_graph", "Query the knowledge graph with structured filters. No similarity search - exact type/layer/file filtering. Input JSON: {\"types\": [\"class\", \"function\"], \"layers\": [\"code\"], \"files\": [\"*.py\"], \"name\": \"User\", \"related_to\": \"EntityName (type)\", \"relation_types\": [\"calls\", \"imports\"], \"direction\": \"out\", \"limit\": 30}"),
+        ))
+
+        # 5. List Entity Types Tool
         def list_entity_types(tool_input: str = "") -> str:
             """List all entity types in the knowledge graph."""
             # Note: tool_input is ignored, this tool takes no parameters
@@ -1242,20 +1736,29 @@ class Method:
             # Extract citations from the answer
             citations = self._extract_citations_from_answer(answer)
 
+            # Get token usage from callback
+            token_usage = callback.get_token_usage()
+
             return {
                 "answer": answer,
                 "citations": citations,
                 "tool_calls": tool_calls,
                 "error": None,
+                "tokens_in": token_usage["tokens_in"],
+                "tokens_out": token_usage["tokens_out"],
             }
 
         except Exception as e:
             log.exception(f"[_execute_chat_agent] Error: {e}")
+            # Get token usage even on error (partial execution may have used tokens)
+            token_usage = callback.get_token_usage()
             return {
                 "answer": "",
                 "citations": [],
                 "tool_calls": [],
                 "error": str(e),
+                "tokens_in": token_usage["tokens_in"],
+                "tokens_out": token_usage["tokens_out"],
             }
 
     @web.method()
@@ -1368,8 +1871,8 @@ class Method:
                 continue
 
             try:
-                # Fetch toolkit configuration from platform
-                toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}"
+                # Fetch toolkit configuration from platform with expand=true to get expanded credentials
+                toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}?expand=true"
                 resp = http_requests.get(toolkit_url, headers=alita_client.headers, verify=False)
 
                 if not resp.ok:
