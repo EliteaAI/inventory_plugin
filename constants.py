@@ -14,17 +14,17 @@ INVENTORY_CHAT_SYSTEM_PROMPT = """You are an assistant that explores a KNOWLEDGE
 
 ### Rule 1: ALWAYS use get_related_entities after search_knowledge_graph
 When you find an entity, you MUST call get_related_entities on it to understand how it works.
-The relationships (CALLS, CONTAINS, IMPLEMENTS) reveal the actual behavior.
+The relationships (CALLS, CONTAINS, IMPLEMENTS, EXTENDS) reveal the actual behavior.
 
 ### Rule 2: Graph tools BEFORE code search
 Priority order:
 1. search_knowledge_graph → find entities
 2. get_related_entities → explore connections (REQUIRED STEP)
 3. query_graph → filter by type/layer
-4. lyracode tools → ONLY if graph tools fail
+4. Source toolkit tools (search_code, search_index) → ONLY if graph tools fail
 
 ### Rule 3: Code search is a LAST RESORT
-Use lyracode_search_code/lyracode_search_index ONLY when:
+Use source toolkit code search tools ONLY when:
 - Graph search returns nothing relevant
 - You need exact syntax not in the graph
 Do NOT use code search as your primary tool.
@@ -33,25 +33,25 @@ Do NOT use code search as your primary tool.
 
 **search_knowledge_graph(query)** - Find entities
 - First step for any question
-- Returns classes, functions, facts matching query
+- Returns classes, functions, concepts, facts matching query
 
 **get_related_entities(entity_name)** - Explore relationships (USE THIS!)
 - Call this on EVERY interesting entity from search
 - Shows: what CALLS this, what this CALLS, what CONTAINS this
-- Format: "EntityName (type)" e.g., "RifleWeapon (class)"
+- Format: "EntityName (type)" e.g., "UserService (class)", "authenticate (function)"
 
 **query_graph(filter)** - Structured queries
 - Filter by type: `type:class`, `type:function`
 - Find related: `related:"Entity (type)"`
 
-## Example Workflow for "how does rifle shoot?"
+## Example Workflow for "how does authentication work?"
 
 CORRECT:
-1. search_knowledge_graph("rifle shoot") → finds RifleWeapon, Fire, etc.
-2. get_related_entities("RifleWeapon (class)") → shows Fire(), Reload(), damage logic
-3. get_related_entities("Fire (method)") → shows what Fire calls, its implementation
+1. search_knowledge_graph("authentication") → finds AuthService, login, etc.
+2. get_related_entities("AuthService (class)") → shows login(), validate(), dependencies
+3. get_related_entities("login (method)") → shows what login calls, its implementation
 4. Answer from relationships
-5. code searches ...
+5. Code search only if more detail needed
 
 ## Current Settings
 {filters}"""
@@ -137,6 +137,163 @@ DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_LLM_TEMPERATURE = 0.1
 DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_TOOL_LLM_MAX_TOKENS = 1024
+
+
+# =============================================================================
+# ENTITY LOOKUP CONSTANTS
+# Used by smart_find_entity for flexible entity matching
+# =============================================================================
+
+# Cross-type compatibility for entity lookup
+# Maps canonical types to other canonical types they should match
+# This is used TOGETHER with TYPE_NORMALIZATION_MAP (which handles synonyms)
+# Example: when searching for "class", also accept "concept" (semantic extraction)
+CROSS_TYPE_COMPATIBILITY = {
+    'class': ['concept', 'entity', 'component', 'module', 'interface'],
+    'function': ['method', 'action', 'process'],
+    'method': ['function', 'action'],
+    'struct': ['entity', 'data_model', 'schema'],
+    'enum': ['constant'],
+    'variable': ['property', 'constant', 'parameter'],
+    'interface': ['class', 'concept', 'component'],
+    'component': ['class', 'concept', 'module'],
+    'module': ['class', 'concept', 'component'],
+    'concept': ['class', 'entity'],
+    'entity': ['class', 'concept', 'struct'],
+}
+
+
+def get_compatible_types(requested_type: str) -> set:
+    """
+    Get all types compatible with the requested type.
+
+    Combines:
+    1. The type itself
+    2. Types from CROSS_TYPE_COMPATIBILITY
+    3. All types that normalize to the same canonical type (from TYPE_NORMALIZATION_MAP)
+
+    Returns a set of compatible type strings (lowercase).
+    """
+    if not requested_type:
+        return set()
+
+    req = requested_type.lower()
+    compatible = {req}
+
+    # Add cross-type compatible types
+    compatible.update(CROSS_TYPE_COMPATIBILITY.get(req, []))
+
+    # Add all types that normalize to the same canonical type
+    # (reverse lookup in TYPE_NORMALIZATION_MAP)
+    canonical = TYPE_NORMALIZATION_MAP.get(req, req)
+    for input_type, output_type in TYPE_NORMALIZATION_MAP.items():
+        if output_type == canonical or output_type == req:
+            compatible.add(input_type)
+        if input_type == req:
+            compatible.add(output_type)
+
+    return compatible
+
+# Comprehensive source file extensions for entity name matching
+# Covers all major programming languages and document formats
+SOURCE_EXTENSIONS = [
+    # C/C++/Objective-C
+    '.h', '.hpp', '.hxx', '.h++', '.hh',
+    '.c', '.cpp', '.cc', '.cxx', '.c++',
+    '.m', '.mm',  # Objective-C
+    # Python
+    '.py', '.pyi', '.pyw', '.pyx',
+    # JavaScript/TypeScript
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    # Java/Kotlin/Scala
+    '.java', '.kt', '.kts', '.scala', '.sc',
+    # C#/F#/VB.NET
+    '.cs', '.fs', '.fsx', '.vb',
+    # Go
+    '.go',
+    # Rust
+    '.rs',
+    # Ruby
+    '.rb', '.rake', '.gemspec',
+    # PHP
+    '.php', '.phtml', '.php3', '.php4', '.php5',
+    # Swift
+    '.swift',
+    # COBOL
+    '.cob', '.cbl', '.cpy', '.cobol',
+    # Fortran
+    '.f', '.for', '.f90', '.f95', '.f03', '.f08',
+    # Ada
+    '.adb', '.ads', '.ada',
+    # Pascal/Delphi
+    '.pas', '.pp', '.dpr', '.dpk',
+    # BASIC/VBA
+    '.bas', '.vbs', '.cls', '.frm',
+    # PL/SQL, SQL
+    '.sql', '.pls', '.plb', '.pck', '.pkb', '.pks',
+    # Shell/Scripting
+    '.sh', '.bash', '.zsh', '.ksh', '.csh',
+    '.ps1', '.psm1', '.psd1',  # PowerShell
+    '.bat', '.cmd',  # Windows batch
+    # Perl
+    '.pl', '.pm', '.pod', '.t',
+    # Lua
+    '.lua',
+    # R
+    '.r', '.R', '.rmd',
+    # Julia
+    '.jl',
+    # Haskell
+    '.hs', '.lhs',
+    # Erlang/Elixir
+    '.erl', '.hrl', '.ex', '.exs',
+    # Clojure
+    '.clj', '.cljs', '.cljc', '.edn',
+    # Lisp/Scheme
+    '.lisp', '.lsp', '.cl', '.scm', '.ss', '.rkt',
+    # Groovy
+    '.groovy', '.gvy', '.gy', '.gsh',
+    # D
+    '.d',
+    # Nim
+    '.nim',
+    # OCaml
+    '.ml', '.mli',
+    # Prolog
+    '.pro', '.P',
+    # Assembly
+    '.asm', '.s', '.S',
+    # ABAP (SAP)
+    '.abap',
+    # RPG (IBM)
+    '.rpg', '.rpgle', '.sqlrpgle',
+    # JCL (Mainframe)
+    '.jcl',
+    # REXX
+    '.rexx', '.rex',
+    # Terraform/IaC
+    '.tf', '.tfvars',
+    # YAML/Config
+    '.yaml', '.yml',
+    # Web
+    '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.vue', '.svelte',
+    # Markup/Docs
+    '.md', '.rst', '.txt', '.adoc', '.tex', '.latex',
+    # Data
+    '.json', '.xml', '.toml', '.ini', '.cfg', '.conf',
+    # Office Documents
+    '.pdf',
+    '.doc', '.docx', '.docm',  # Word
+    '.xls', '.xlsx', '.xlsm', '.xlsb',  # Excel
+    '.ppt', '.pptx', '.pptm',  # PowerPoint
+    '.odt', '.ods', '.odp', '.odg',  # OpenDocument
+    '.rtf',
+    # Other document formats
+    '.epub', '.mobi',  # eBooks
+    '.pages', '.numbers', '.key',  # Apple iWork
+    '.csv', '.tsv',  # Tabular data
+]
 
 
 # =============================================================================

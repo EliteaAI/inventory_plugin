@@ -38,6 +38,8 @@ from ..constants import (
     DEFAULT_LLM_TEMPERATURE,
     DEFAULT_LLM_MAX_TOKENS,
     DEFAULT_TOOL_LLM_MAX_TOKENS,
+    SOURCE_EXTENSIONS,
+    get_compatible_types,
 )
 from ..utils.langfuse_callback import (
     fetch_langfuse_config,
@@ -947,6 +949,123 @@ class Method:
             # Plain name without type
             return entity_ref, None
 
+        def smart_find_entity(name: str, entity_type: str = None):
+            """
+            Smart entity lookup with fallbacks for common naming variations.
+
+            Generic approach that works across any codebase:
+            1. Exact name match (case-sensitive)
+            2. Case-insensitive name match
+            3. Name as file with common extensions
+            4. Semantic search fallback
+
+            Type matching uses TYPE_COMPATIBILITY from constants since LLM-extracted
+            entities may use semantic types (concept, fact) instead of code types.
+
+            Returns: (best_match_entity, all_alternatives)
+            """
+            kg = wrapper._knowledge_graph
+
+            def type_matches(requested: str, actual: str) -> bool:
+                """Check if types match, considering compatibility."""
+                if not requested:
+                    return True
+                act = actual.lower() if actual else ''
+                if not act:
+                    return False
+                compatible = get_compatible_types(requested)
+                return act in compatible
+
+            def find_best_match(entities, requested_type):
+                """Find best match from entities, preferring exact type match."""
+                if not entities:
+                    return None
+                if not requested_type:
+                    return entities[0]
+
+                # Pass 1: exact type match
+                for e in entities:
+                    if e.get('type', '').lower() == requested_type.lower():
+                        return e
+
+                # Pass 2: compatible type match
+                for e in entities:
+                    if type_matches(requested_type, e.get('type', '')):
+                        return e
+
+                # Pass 3: prefer semantic entities over source files
+                file_types = {'source_file', 'document_file', 'config_file', 'web_file', 'file'}
+                for e in entities:
+                    if e.get('type', '').lower() not in file_types:
+                        return e
+
+                return entities[0] if entities else None
+
+            all_matches = []
+
+            # 1. Try exact name match
+            matches = kg.find_all_entities_by_name(name)
+            all_matches.extend(matches)
+            result = find_best_match(matches, entity_type)
+            if result:
+                return result, all_matches
+
+            # 2. Try case-insensitive search via semantic search
+            # This handles naming variations across languages
+            search_results = kg.search(name, top_k=15)
+            if search_results:
+                # Filter to entities whose name closely matches (contains the search term)
+                name_lower = name.lower()
+                for sr in search_results:
+                    entity = sr['entity']
+                    entity_name = entity.get('name', '').lower()
+                    # Check if names are similar (contains or close match)
+                    if name_lower in entity_name or entity_name in name_lower:
+                        if entity not in all_matches:
+                            all_matches.append(entity)
+
+                result = find_best_match(all_matches, entity_type)
+                if result:
+                    return result, all_matches
+
+            # 3. Try as source file with common extensions
+            # Strip existing extension first if present
+            base_name = name
+            for ext in SOURCE_EXTENSIONS:
+                if name.lower().endswith(ext):
+                    base_name = name[:-len(ext)]
+                    break
+
+            for ext in SOURCE_EXTENSIONS:
+                try_name = f"{base_name}{ext}"
+                if try_name.lower() != name.lower():  # Don't retry the same name
+                    matches = kg.find_all_entities_by_name(try_name)
+                    for m in matches:
+                        if m not in all_matches:
+                            all_matches.append(m)
+                    if matches:
+                        result = find_best_match(matches, entity_type)
+                        if result:
+                            return result, all_matches
+
+            # 4. Broader semantic search as final fallback
+            if not all_matches and search_results:
+                all_matches = [sr['entity'] for sr in search_results]
+                result = find_best_match(all_matches, entity_type)
+                if result:
+                    return result, all_matches
+
+            # Deduplicate by entity ID
+            seen_ids = set()
+            unique_matches = []
+            for e in all_matches:
+                eid = e.get('id')
+                if eid and eid not in seen_ids:
+                    seen_ids.add(eid)
+                    unique_matches.append(e)
+
+            return None, unique_matches
+
         # 2. Get Entity Details Tool
         def get_entity_details(entity_name: str) -> str:
             """Get detailed information about a specific entity."""
@@ -954,32 +1073,27 @@ class Method:
                 # Parse input: support both "Name" and "Name (type)" formats
                 parsed_name, parsed_type = parse_entity_reference(entity_name)
 
-                if parsed_type:
-                    # Input is in "Name (type)" format - find by name and filter by type
-                    all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
-                    entity = None
-                    for e in all_matches:
-                        if e.get('type', '').lower() == parsed_type.lower():
-                            entity = e
-                            break
+                # Use smart lookup with fallbacks
+                entity, alternatives = smart_find_entity(parsed_name, parsed_type)
 
-                    if not entity:
-                        # Type didn't match, show available types
-                        if all_matches:
-                            available_types = [e.get('type', 'unknown') for e in all_matches]
-                            return f"Entity '{parsed_name}' found but not with type '{parsed_type}'. Available types: {', '.join(available_types)}"
-                        return f"Entity '{parsed_name}' not found."
-                else:
-                    # Plain name - use original behavior
-                    entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-                    if not entity:
-                        return f"Entity '{entity_name}' not found."
+                if not entity:
+                    # Show helpful message with suggestions
+                    if alternatives:
+                        suggestions = [f"  - {e.get('name')} ({e.get('type')})" for e in alternatives[:5]]
+                        return f"Entity '{parsed_name}' not found. Did you mean:\n" + "\n".join(suggestions)
+                    return f"Entity '{parsed_name}' not found. Try search_knowledge_graph to find the correct name."
 
                 # Track this entity as touched
                 track_entity(entity)
 
                 output = f"# {entity.get('name')}\n\n"
-                output += f"**Type:** {entity.get('type', 'unknown')}\n"
+
+                # Note if type differs from requested
+                actual_type = entity.get('type', 'unknown')
+                if parsed_type and parsed_type.lower() != actual_type.lower():
+                    output += f"**Note:** Requested type '{parsed_type}' not found. Showing '{actual_type}' instead.\n\n"
+
+                output += f"**Type:** {actual_type}\n"
                 output += f"**Layer:** {entity.get('layer', 'unknown')}\n\n"
 
                 if entity.get('description'):
@@ -1026,24 +1140,15 @@ class Method:
                 # Parse input: support both "Name" and "Name (type)" formats
                 parsed_name, parsed_type = parse_entity_reference(entity_name)
 
-                if parsed_type:
-                    # Input is in "Name (type)" format - find by name and filter by type
-                    all_matches = wrapper._knowledge_graph.find_all_entities_by_name(parsed_name)
-                    entity = None
-                    for e in all_matches:
-                        if e.get('type', '').lower() == parsed_type.lower():
-                            entity = e
-                            break
+                # Use smart lookup with fallbacks
+                entity, alternatives = smart_find_entity(parsed_name, parsed_type)
 
-                    if not entity:
-                        if all_matches:
-                            available_types = [e.get('type', 'unknown') for e in all_matches]
-                            return f"Entity '{parsed_name}' found but not with type '{parsed_type}'. Available types: {', '.join(available_types)}"
-                        return f"Entity '{parsed_name}' not found."
-                else:
-                    entity = wrapper._knowledge_graph.find_entity_by_name(entity_name)
-                    if not entity:
-                        return f"Entity '{entity_name}' not found."
+                if not entity:
+                    # Show helpful message with suggestions
+                    if alternatives:
+                        suggestions = [f"  - {e.get('name')} ({e.get('type')})" for e in alternatives[:5]]
+                        return f"Entity '{parsed_name}' not found. Did you mean:\n" + "\n".join(suggestions)
+                    return f"Entity '{parsed_name}' not found. Try search_knowledge_graph to find the correct name."
 
                 # Track the main entity
                 track_entity(entity)
@@ -1054,10 +1159,18 @@ class Method:
 
                 relations = wrapper._knowledge_graph.get_relations(entity_id, direction="both")
 
-                if not relations:
-                    return f"No relations found for '{entity_name}'."
+                # Build header with actual entity info
+                actual_name = entity.get('name', parsed_name)
+                actual_type = entity.get('type', 'unknown')
+                output = f"# Relations for {actual_name} ({actual_type})\n\n"
 
-                output = f"# Relations for {entity_name}\n\n"
+                # Note if we found a different entity than requested
+                if parsed_type and parsed_type.lower() != actual_type.lower():
+                    output += f"_Note: Found '{actual_type}' instead of requested '{parsed_type}'_\n\n"
+
+                if not relations:
+                    output += "No relations found."
+                    return output
 
                 # Group by relation type
                 by_type = {}
@@ -2046,7 +2159,7 @@ class Method:
             List of tools with prefixed names
         """
         import re
-        from langchain.tools import Tool
+        from langchain.tools import Tool, StructuredTool
 
         prefixed_tools = []
 
@@ -2070,16 +2183,29 @@ class Method:
             original_desc = tool.description if hasattr(tool, 'description') else ''
             prefixed_desc = f"[Source: {toolkit_name}] {original_desc}"
 
-            # Create new Tool with prefixed name but same functionality
-            prefixed_tool = Tool(
-                name=prefixed_name,
-                func=tool.func if hasattr(tool, 'func') else tool._run,
-                description=prefixed_desc,
-                args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None,
-            )
+            # Get the function to call
+            func = tool.func if hasattr(tool, 'func') else tool._run
+            args_schema = tool.args_schema if hasattr(tool, 'args_schema') else None
+
+            # Preserve StructuredTool type if original tool has args_schema
+            # This is critical - using simple Tool for multi-arg tools causes
+            # "Too many arguments to single-input tool" errors
+            if args_schema is not None:
+                prefixed_tool = StructuredTool(
+                    name=prefixed_name,
+                    func=func,
+                    description=prefixed_desc,
+                    args_schema=args_schema,
+                )
+            else:
+                prefixed_tool = Tool(
+                    name=prefixed_name,
+                    func=func,
+                    description=prefixed_desc,
+                )
 
             prefixed_tools.append(prefixed_tool)
-            log.debug(f"[_prefix_tool_names] Renamed '{original_name}' -> '{prefixed_name}'")
+            log.debug(f"[_prefix_tool_names] Renamed '{original_name}' -> '{prefixed_name}' (structured={args_schema is not None})")
 
         log.info(f"[_prefix_tool_names] Prefixed {len(prefixed_tools)} tools from {toolkit_name} with '{safe_prefix}_'")
         return prefixed_tools
