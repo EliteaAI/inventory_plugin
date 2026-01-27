@@ -1197,12 +1197,22 @@ class Method:
                             related_name = related_entity.get('name', related_id)
                             related_type = related_entity.get('type', 'unknown')
                             file_path = related_entity.get('file_path', '')
+                            description = related_entity.get('description', '')
 
                             # Format: → EntityName (type) - file_path
                             output += f"- {direction} **{related_name}** ({related_type})"
                             if file_path:
                                 output += f" - `{file_path}`"
                             output += "\n"
+
+                            # Add description/brief if available (truncate to keep output readable)
+                            if description:
+                                # Truncate long descriptions
+                                brief = description[:150].strip()
+                                if len(description) > 150:
+                                    brief += "..."
+                                # Indent description under the entity
+                                output += f"  _{brief}_\n"
 
                             # Track the related entity
                             track_entity(related_entity)
