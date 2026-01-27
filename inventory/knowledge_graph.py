@@ -455,7 +455,9 @@ class KnowledgeGraph:
     def get_entity(self, entity_id: str) -> Optional[Dict[str, Any]]:
         """Get entity by ID."""
         if self._graph.has_node(entity_id):
-            return dict(self._graph.nodes[entity_id])
+            data = dict(self._graph.nodes[entity_id])
+            data['id'] = entity_id  # NetworkX uses ID as node key, add it to data
+            return data
         return None
     
     def find_entity_by_name(self, name: str) -> Optional[Dict[str, Any]]:

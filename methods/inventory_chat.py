@@ -898,6 +898,10 @@ class Method:
                             for rel_type, sources in node['referenced_by'].items():
                                 output += f"   <- {rel_type}: {', '.join(sources)}\n"
 
+                # Add graph traversal hint
+                if results:
+                    output += f"\n💡 Use get_related_entities(\"Name (type)\") to explore relationships for any result above."
+
                 return output
 
             except Exception as e:
@@ -1064,27 +1068,36 @@ class Method:
                     by_type[rel_type].append(rel)
 
                 for rel_type, rels in by_type.items():
-                    output += f"## {rel_type}\n"
-                    for rel in rels[:10]:
-                        # Track related entities
+                    output += f"## {rel_type} ({len(rels)})\n"
+                    for rel in rels[:15]:
+                        # Get the related entity's full info
                         if rel['source'] == entity_id:
                             related_id = rel['target']
-                            related_name = rel.get('target_name', rel['target'])
-                            output += f"- → {related_name}\n"
+                            direction = "→"
                         else:
                             related_id = rel['source']
-                            related_name = rel.get('source_name', rel['source'])
-                            output += f"- ← {related_name}\n"
-                        # Track the related entity (minimal info from relation)
-                        if related_id and not any(e.get('id') == related_id for e in touched_entities):
-                            touched_entities.append({
-                                'id': related_id,
-                                'name': related_name,
-                                'type': None,  # Not available in relation data
-                                'layer': None,
-                            })
-                    if len(rels) > 10:
-                        output += f"  ...and {len(rels) - 10} more\n"
+                            direction = "←"
+
+                        # Look up the related entity to get name and type
+                        related_entity = wrapper._knowledge_graph.get_entity(related_id)
+                        if related_entity:
+                            related_name = related_entity.get('name', related_id)
+                            related_type = related_entity.get('type', 'unknown')
+                            file_path = related_entity.get('file_path', '')
+
+                            # Format: → EntityName (type) - file_path
+                            output += f"- {direction} **{related_name}** ({related_type})"
+                            if file_path:
+                                output += f" - `{file_path}`"
+                            output += "\n"
+
+                            # Track the related entity
+                            track_entity(related_entity)
+                        else:
+                            output += f"- {direction} {related_id} (not found)\n"
+
+                    if len(rels) > 15:
+                        output += f"  ...and {len(rels) - 15} more\n"
                     output += "\n"
 
                 return output

@@ -8,24 +8,53 @@ Contains system prompts and other constant values used by the inventory chat age
 """
 
 # System prompt for the inventory knowledge graph assistant
-INVENTORY_CHAT_SYSTEM_PROMPT = """You are an intelligent assistant that helps users explore and understand a knowledge graph of code, documentation, and other software artifacts.
+INVENTORY_CHAT_SYSTEM_PROMPT = """You are an assistant that explores a KNOWLEDGE GRAPH containing pre-extracted code entities and their relationships.
 
-You have access to tools that let you search the knowledge graph, get entity details, and explore relationships.
+## CRITICAL RULES - READ CAREFULLY
 
-When answering questions:
-1. First search the knowledge graph to find relevant entities using search_knowledge_graph
-2. Get details for the most relevant entities using get_entity_details
-3. Explore relationships using get_related_entities if needed to understand connections
-4. Synthesize the information into a clear, helpful answer
-5. Always cite your sources by mentioning the entity names and their source locations
+### Rule 1: ALWAYS use get_related_entities after search_knowledge_graph
+When you find an entity, you MUST call get_related_entities on it to understand how it works.
+The relationships (CALLS, CONTAINS, IMPLEMENTS) reveal the actual behavior.
 
-Current search settings:
-{filters}
+### Rule 2: Graph tools BEFORE code search
+Priority order:
+1. search_knowledge_graph → find entities
+2. get_related_entities → explore connections (REQUIRED STEP)
+3. query_graph → filter by type/layer
+4. lyracode tools → ONLY if graph tools fail
 
-IMPORTANT: When using search_knowledge_graph, pass the input as JSON with 'query' and optionally 'top_k' to limit results. Example: {{"query": "authentication", "top_k": 20}}
-The depth setting indicates how deeply to explore relationships - use get_related_entities multiple times (up to the depth level) to traverse the graph.
+### Rule 3: Code search is a LAST RESORT
+Use lyracode_search_code/lyracode_search_index ONLY when:
+- Graph search returns nothing relevant
+- You need exact syntax not in the graph
+Do NOT use code search as your primary tool.
 
-Answer the user's question using the tools available. Be thorough but concise."""
+## Tool Usage
+
+**search_knowledge_graph(query)** - Find entities
+- First step for any question
+- Returns classes, functions, facts matching query
+
+**get_related_entities(entity_name)** - Explore relationships (USE THIS!)
+- Call this on EVERY interesting entity from search
+- Shows: what CALLS this, what this CALLS, what CONTAINS this
+- Format: "EntityName (type)" e.g., "RifleWeapon (class)"
+
+**query_graph(filter)** - Structured queries
+- Filter by type: `type:class`, `type:function`
+- Find related: `related:"Entity (type)"`
+
+## Example Workflow for "how does rifle shoot?"
+
+CORRECT:
+1. search_knowledge_graph("rifle shoot") → finds RifleWeapon, Fire, etc.
+2. get_related_entities("RifleWeapon (class)") → shows Fire(), Reload(), damage logic
+3. get_related_entities("Fire (method)") → shows what Fire calls, its implementation
+4. Answer from relationships
+5. code searches ...
+
+## Current Settings
+{filters}"""
 
 # ReAct agent format template
 REACT_FORMAT_TEMPLATE = """
@@ -50,30 +79,42 @@ Thought:{agent_scratchpad}"""
 
 # Tool descriptions
 TOOL_DESCRIPTIONS = {
-    "search_knowledge_graph": "Search the knowledge graph for entities (code, documentation, etc.) matching a query. Parameters: 'query' (required) - the search text, 'top_k' (optional, default 20, max 50) - maximum results to return. Example: query='authentication', top_k=30.",
-    "get_entity_details": "Get detailed information about a specific entity. Copy directly from search results - supports 'Name', 'Name (type)', or full 'Name (type) @ source - path' format. Example: 'UserService' or 'read_file (method) @ sdk - artifact.py'. When multiple entities share the same name, use the (type) suffix.",
-    "get_related_entities": "Get entities related to a specific entity (dependencies, callers, etc.). Copy directly from search results - supports 'Name', 'Name (type)', or full 'Name (type) @ source - path' format. Use this to understand how components are connected.",
-    "query_graph": """Query graph with JQL-like syntax (no similarity search).
+    "search_knowledge_graph": "FIND entities by semantic similarity. Use to discover starting points for exploration. Parameters: 'query' (required), 'top_k' (optional, default 20). Returns entities matching your query by name/description. After finding entities, use get_related_entities to explore their connections.",
 
-SYNTAX:
-  type:class,function    - Filter by entity types
-  layer:code,service     - Filter by layers (code, service, data, documentation, domain, product, configuration, testing)
-  file:*.py              - Filter by file patterns
-  name:User              - Filter by name substring
-  related:"Name (type)"  - Find entities related to this (copy from search results)
-  rel:calls,imports      - Filter relation types
-  dir:in|out|both        - Relation direction
-  limit:50               - Max results
+    "get_related_entities": """TRAVERSE the graph from an entity - THE KEY TO UNDERSTANDING RELATIONSHIPS.
+
+Shows:
+- INCOMING: What CALLS/USES/EXTENDS this entity (callers, users, subclasses)
+- OUTGOING: What this entity CALLS/USES/EXTENDS (dependencies, base classes)
+
+Use liberally after search_knowledge_graph to understand:
+- What types/subclasses exist (via EXTENDS/IMPLEMENTS incoming)
+- What depends on this (via CALLS/IMPORTS incoming)
+- What this depends on (via CALLS/IMPORTS outgoing)
+
+Supports: 'Name', 'Name (type)', or full 'Name (type) @ source - path' format.""",
+
+    "get_entity_details": "GET full details about a specific entity: all properties, citations, and relationship summary. Use when you need complete information about one entity. Supports 'Name', 'Name (type)', or full format from search results.",
+
+    "query_graph": """FILTER entities or traverse with precision. Two modes:
+
+1. FILTER MODE - Find entities by criteria:
+   type:class,function    - Filter by entity types
+   layer:code,service     - Filter by layers
+   file:*.py              - Filter by file patterns
+   name:User              - Filter by name substring
+
+2. TRAVERSE MODE - Find related entities with filters:
+   related:"Entity (type)"           - All entities related to this
+   related:"Entity" type:class       - Only classes related to this
+   related:"Entity" dir:in           - Only incoming relationships
 
 EXAMPLES:
-  type:class                           - All classes
-  type:class layer:code                - Code classes only
-  related:"UserService (class)"        - Entities related to UserService
-  related:UserService type:function    - Functions related to UserService
-  file:*.py name:test                  - Python files with 'test' in name
+  type:class layer:code              - All code classes
+  related:"WeaponBase (class)"       - Everything related to WeaponBase
+  related:"WeaponBase" type:class    - Classes that extend/use WeaponBase""",
 
-TIP: If multiple entities share the same name, you'll be shown options to choose from.""",
-    "list_entity_types": "List all entity types (class, function, module, etc.) and their counts in the knowledge graph. Use this to understand what's available.",
+    "list_entity_types": "LIST all entity types and counts. Use first to understand what's in the graph (classes, functions, facts, etc.).",
 }
 
 # Read-only tool patterns for filtering source toolkit tools
