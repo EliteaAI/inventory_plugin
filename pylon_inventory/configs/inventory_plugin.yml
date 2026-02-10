@@ -1,0 +1,5 @@
+service_location_url: ${APP_URL}
+base_path: /data/inventory
+
+# ai_run_platform_url: ${AI_RUN_PLATFORM_URL}
+# ai_run_platform_token: ${AI_RUN_PLATFORM_TOKEN}

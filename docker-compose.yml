@@ -1,0 +1,21 @@
+services:
+  pylon_deepwiki:
+    image: getcarrier/pylon:1.2.22
+    user: "33:33"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "10m"
+    env_file:
+      - ./envs/default.env
+      - ./envs/override.env
+    environment:
+      - NAME=pylon-inventory
+      - PYLON_WEB_RUNTIME=gevent
+      - PYLON_CONFIG_SEED=file:/data/pylon.yml
+    volumes:
+      - ./pylon_inventory:/data
+    ports:
+      - 8095:8080

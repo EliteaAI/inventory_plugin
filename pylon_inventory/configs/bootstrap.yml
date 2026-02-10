@@ -1,0 +1,11 @@
+plugin_repo:
+- type: elitea_github
+  release: ${ALITA_RELEASE}
+  license_username: ${LICENSE_USERNAME}
+  license_password: ${LICENSE_PASSWORD}
+  add_source_data: false
+  add_head_data: false
+
+
+preordered_plugins:
+- inventory_plugin
