@@ -1,5 +1,5 @@
 services:
-  pylon_deepwiki:
+  pylon_inventory:
     image: getcarrier/pylon:1.2.22
     user: "33:33"
     restart: unless-stopped
