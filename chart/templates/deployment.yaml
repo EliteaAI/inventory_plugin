@@ -80,7 +80,7 @@ spec:
             # K8s Jobs configuration
             - name: INVENTORY_JOBS_ENABLED
               value: {{ .Values.jobs.enabled | quote }}
-            - name: POD_SERVICE_ACCOUNT
+            - name: INVENTORY_SERVICE_ACCOUNT
               value: {{ include "inventory.serviceAccountName" . }}
             - name: INVENTORY_MAX_CONCURRENT_JOBS
               value: {{ .Values.jobs.maxConcurrentJobs | quote }}
