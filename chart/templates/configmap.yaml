@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "inventory.fullname" . }}-config
+  labels:
+    {{- include "inventory.labels" . | nindent 4 }}
+data:
+  pylon.yml: |
+    #
+    # General server config
+    #
+    server:
+      name: pylon-inventory
+      path: /
+      proxy:
+        x_for: 1
+        x_proto: 1
+        x_host: 1
+      host: "0.0.0.0"
+      port: 8080
+      health:
+        healthz: true
+        livez: true
+        readyz: true
+
+    #
+    # Logging
+    #
+    log:
+      level: info
+
+    #
+    # Pylon DB
+    #
+    pylon_db:
+      engine_url: sqlite:////data/pylon.db
+
+    #
+    # Local paths to modules and config
+    #
+    modules:
+      plugins:
+        provider:
+          type: folder
+          path: /data/plugins
+      #
+      requirements:
+        mode: relaxed
+        activation: bulk
+        cache: /data/cache/pip
+        provider:
+          type: folder
+          path: /data/requirements
+      #
+      config:
+        provider:
+          type: folder
+          path: /data/configs
+      #
+      preload:
+        bootstrap:
+          provider:
+            type: git
+            delete_git_dir: false
+            depth: null
+          source: https://github.com/centry-core/bootstrap.git
+          branch: {{ .Values.config.alitaRelease }}
+
+  inventory_plugin.yml: |
+    # Inventory Plugin Configuration
+    service_location_url: {{ include "inventory.serviceLocationUrl" . }}
+    base_path: {{ .Values.config.basePath }}
+    {{- if .Values.config.aiRunPlatformUrl }}
+    platform_api_url: {{ .Values.config.aiRunPlatformUrl }}
+    {{- end }}
+    {{- if .Values.config.aiRunPlatformToken }}
+    ai_run_platform_token: {{ .Values.config.aiRunPlatformToken }}
+    {{- end }}
+
+  bootstrap.yml: |
+    # Bootstrap plugin configuration
+    plugin_repo:
+    - type: elitea_github
+      release: {{ .Values.config.pluginBranch | default .Values.config.alitaRelease }}
+      {{- if .Values.config.licenseUsername }}
+      license_username: {{ .Values.config.licenseUsername }}
+      {{- end }}
+      {{- if .Values.config.licensePassword }}
+      license_password: {{ .Values.config.licensePassword }}
+      {{- end }}
+      add_source_data: false
+      add_head_data: false
+
+    preordered_plugins:
+    - inventory_plugin
+
+  env.yml: |
+    # Environment configuration for Inventory Plugin
+    APP_URL: {{ include "inventory.serviceLocationUrl" . }}
+    ALITA_RELEASE: {{ .Values.config.alitaRelease }}
+    {{- if .Values.config.licenseUsername }}
+    LICENSE_USERNAME: {{ .Values.config.licenseUsername }}
+    {{- end }}
+    {{- if .Values.config.licensePassword }}
+    LICENSE_PASSWORD: {{ .Values.config.licensePassword }}
+    {{- end }}
+    {{- if .Values.config.aiRunPlatformUrl }}
+    AI_RUN_PLATFORM_URL: {{ .Values.config.aiRunPlatformUrl }}
+    {{- end }}
+    {{- if .Values.config.aiRunPlatformToken }}
+    AI_RUN_PLATFORM_TOKEN: {{ .Values.config.aiRunPlatformToken }}
+    {{- end }}

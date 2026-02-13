@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "inventory.fullname" . }}
+  labels:
+    {{- include "inventory.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "inventory.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "inventory.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "inventory.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds }}
+      {{- if .Values.config.forcePluginUpdate }}
+      initContainers:
+        - name: refresh-plugins
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Preparing for fresh plugin clone..."
+              mkdir -p /data/inventory/jobs 2>/dev/null || true
+              rm -rf /data/plugins/inventory_plugin /data/plugins/bootstrap 2>/dev/null || true
+              echo "Ready for fresh plugin clone on container start."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- end }}
+      containers:
+        - name: inventory
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: NAME
+              value: pylon-inventory
+            - name: PYLON_WEB_RUNTIME
+              value: {{ .Values.controller.pylonRuntime }}
+            - name: PYLON_CONFIG_SEED
+              value: file:/data/pylon.yml
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            # K8s Jobs configuration
+            - name: INVENTORY_JOBS_ENABLED
+              value: {{ .Values.jobs.enabled | quote }}
+            - name: POD_SERVICE_ACCOUNT
+              value: {{ include "inventory.serviceAccountName" . }}
+            - name: INVENTORY_MAX_CONCURRENT_JOBS
+              value: {{ .Values.jobs.maxConcurrentJobs | quote }}
+            - name: INVENTORY_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: INVENTORY_JOB_TTL_SECONDS
+              value: {{ .Values.jobs.ttlSecondsAfterFinished | quote }}
+            - name: INVENTORY_PVC_NAME
+              value: {{ include "inventory.pvcName" . }}
+            - name: INVENTORY_WORKER_IMAGE
+              value: {{ .Values.jobs.workerImage | default (printf "%s:%s" .Values.image.repository .Values.image.tag) | quote }}
+            - name: INVENTORY_JOB_MEMORY_REQUEST
+              value: {{ .Values.jobs.resources.requests.memory | quote }}
+            - name: INVENTORY_JOB_CPU_REQUEST
+              value: {{ .Values.jobs.resources.requests.cpu | quote }}
+            - name: INVENTORY_JOB_MEMORY_LIMIT
+              value: {{ .Values.jobs.resources.limits.memory | quote }}
+            - name: INVENTORY_JOB_CPU_LIMIT
+              value: {{ .Values.jobs.resources.limits.cpu | quote }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.healthCheck.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.healthCheck.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: pylon-config
+              mountPath: /data/pylon.yml
+              subPath: pylon.yml
+            - name: plugin-config
+              mountPath: /data/configs/inventory_plugin.yml
+              subPath: inventory_plugin.yml
+            - name: bootstrap-config
+              mountPath: /data/configs/bootstrap.yml
+              subPath: bootstrap.yml
+            - name: env-config
+              mountPath: /data/configs/env.yml
+              subPath: env.yml
+      volumes:
+        - name: data
+          {{- if .Values.storage.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "inventory.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: pylon-config
+          configMap:
+            name: {{ include "inventory.fullname" . }}-config
+            items:
+              - key: pylon.yml
+                path: pylon.yml
+        - name: plugin-config
+          configMap:
+            name: {{ include "inventory.fullname" . }}-config
+            items:
+              - key: inventory_plugin.yml
+                path: inventory_plugin.yml
+        - name: bootstrap-config
+          configMap:
+            name: {{ include "inventory.fullname" . }}-config
+            items:
+              - key: bootstrap.yml
+                path: bootstrap.yml
+        - name: env-config
+          configMap:
+            name: {{ include "inventory.fullname" . }}-config
+            items:
+              - key: env.yml
+                path: env.yml
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

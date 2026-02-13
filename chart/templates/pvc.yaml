@@ -1,0 +1,19 @@
+{{- if and .Values.storage.persistence.enabled (not .Values.storage.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "inventory.fullname" . }}-data
+  labels:
+    {{- include "inventory.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.storage.persistence.accessModes | nindent 4 }}
+  {{- if .Values.storage.persistence.storageClass }}
+  storageClassName: {{ .Values.storage.persistence.storageClass }}
+  {{- else }}
+  storageClassName: ""
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.persistence.size }}
+{{- end }}

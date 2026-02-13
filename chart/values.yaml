@@ -1,0 +1,202 @@
+# Inventory Plugin Helm Chart Values
+# =============================================================================
+# Controller pod + K8s Jobs architecture
+# The controller handles API requests and creates K8s Jobs for ingestion work.
+# See PLANNING_K8S_SCALING.md for architecture details
+# =============================================================================
+
+# =============================================================================
+# Global Settings
+# =============================================================================
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Image Configuration
+# =============================================================================
+image:
+  repository: getcarrier/pylon
+  tag: "1.2.22"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# =============================================================================
+# Controller Deployment
+# =============================================================================
+# The controller pod serves the plugin API and handles two types of work:
+#   1. Agent tool invocations (ask, search, etc.) — executed in-process
+#   2. Ingestion orchestration — delegated to K8s Jobs
+# Resources must account for LLM-backed tool calls running in the pod.
+# =============================================================================
+controller:
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1536Mi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+  # Pylon runtime (gevent for async I/O)
+  pylonRuntime: gevent
+
+  # Long grace period to allow in-flight tool invocations to complete
+  # Agent tool calls (ask, search) can take several minutes for large contexts
+  terminationGracePeriodSeconds: 600
+
+# =============================================================================
+# Service Configuration
+# =============================================================================
+service:
+  type: ClusterIP
+  port: 8080
+
+# =============================================================================
+# Inventory Plugin Configuration
+# =============================================================================
+config:
+  # Platform integration URL
+  # This must be accessible from elitea_core for provider registration
+  # Example: http://inventory.inventory.svc.cluster.local:8080
+  # Leave empty to auto-generate based on release name
+  serviceLocationUrl: ""
+
+  # Base path for inventory files (inside container)
+  basePath: /data/inventory
+
+  # Alita release branch for bootstrap plugin
+  alitaRelease: main
+
+  # Inventory plugin branch (defaults to main)
+  # Set to feature branch name for testing
+  pluginBranch: "main"
+
+  # Platform API connection (required for AlitaClient — used by agent tool calls)
+  # AI_RUN_PLATFORM_URL: base URL of the ELITEA platform (e.g. http://elitea-core:80)
+  # AI_RUN_PLATFORM_TOKEN: JWT token for platform authentication
+  aiRunPlatformUrl: ""
+  aiRunPlatformToken: ""
+
+  # GitHub credentials for cloning private repos (optional)
+  # These are defaults - actual credentials come from toolkit config at runtime
+  licenseUsername: ""
+  licensePassword: ""
+
+  # Force plugin update on pod restart
+  # When enabled, an initContainer removes the plugins folder before starting
+  # This forces a fresh git clone from GitHub on every pod restart
+  forcePluginUpdate: false
+
+# =============================================================================
+# Inventory Feature Flags (Environment Variables)
+# =============================================================================
+env: {}
+  # INVENTORY_CUSTOM_FLAG: "value"
+
+# =============================================================================
+# K8s Jobs-Based Scaling
+# =============================================================================
+# Ingestion work is executed as K8s Jobs (one Job per ingestion request).
+# The controller creates, monitors, and cleans up Jobs automatically.
+# Set enabled: false to fall back to in-process thread-based ingestion.
+# =============================================================================
+jobs:
+  enabled: true
+
+  # Maximum concurrent ingestion Jobs cluster-wide
+  maxConcurrentJobs: 3
+
+  # TTL for completed Jobs (seconds)
+  ttlSecondsAfterFinished: 300
+
+  # Worker image (defaults to same as controller image if empty)
+  workerImage: ""
+
+  # Job resource configuration
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: "1"
+    limits:
+      memory: 8Gi
+      cpu: "4"
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+storage:
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 50Gi
+    accessModes:
+      - ReadWriteMany  # Required for controller + Job pods shared access
+
+  existingClaim: ""
+
+# =============================================================================
+# Ingress Configuration
+# =============================================================================
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: inventory.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# =============================================================================
+# Security Configuration
+# =============================================================================
+securityContext:
+  runAsUser: 33
+  runAsGroup: 33
+  fsGroup: 33
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 33  # www-data group
+
+# =============================================================================
+# Service Account
+# =============================================================================
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# =============================================================================
+# Pod Settings
+# =============================================================================
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# =============================================================================
+# Health Check Configuration
+# =============================================================================
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: inventory-plugin
+description: ELITEA Inventory Plugin - AI-powered code graph indexing and analysis
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+home: https://github.com/ProjectAlita/inventory_plugin
+maintainers:
+  - name: ProjectAlita
+    email: alita@epam.com
+
+keywords:
+  - inventory
+  - code-graph
+  - indexing
+  - code-analysis
+  - ai
+
+# No dependencies - standalone plugin deployment
+# Each pod manages its own worker limits via K8s Jobs
