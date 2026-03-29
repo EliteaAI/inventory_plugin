@@ -139,6 +139,12 @@ class IngestionConfig(BaseModel):
     graph_path: str = Field(default="./knowledge_graph.json", description="Path to persist graph")
     auto_save: bool = Field(default=True, description="Auto-save after mutations")
     
+    # Embedding settings
+    generate_embeddings: bool = Field(
+        default=True,
+        description="Generate entity embeddings for semantic search after ingestion"
+    )
+    
     # Extraction settings
     extract_relations: bool = Field(default=True, description="Extract relations between entities")
     chunk_size: int = Field(default=4000, description="Document chunk size for processing")
@@ -184,6 +190,7 @@ class IngestionConfig(BaseModel):
             MAX_ENTITIES_PER_DOC: Max entities per doc (default: 50)
             CONTENT_FILTER_ENABLED: true/false (default: true)
             EXTRACT_RELATIONS: true/false (default: true)
+            GENERATE_EMBEDDINGS: true/false (default: true)
         """
         guardrails = GuardrailsConfig(
             max_tokens_per_doc=int(os.environ.get('MAX_TOKENS_PER_DOC', '8000')),
@@ -199,6 +206,7 @@ class IngestionConfig(BaseModel):
             guardrails=guardrails,
             graph_path=os.environ.get('GRAPH_PATH', './knowledge_graph.json'),
             extract_relations=os.environ.get('EXTRACT_RELATIONS', 'true').lower() == 'true',
+            generate_embeddings=os.environ.get('GENERATE_EMBEDDINGS', 'true').lower() == 'true',
         )
     
     def to_yaml(self, path: str) -> None:
@@ -247,6 +255,9 @@ extract_relations: true
 chunk_size: 4000
 chunk_overlap: 200
 max_concurrent_extractions: 1
+
+# Embedding settings
+generate_embeddings: true  # Generate entity embeddings for semantic search
 """
 
 

@@ -356,6 +356,7 @@ class IngestionResult(BaseModel):
     entities_added: int = 0
     entities_removed: int = 0
     relations_added: int = 0
+    embeddings_generated: int = 0
     duration_seconds: float = 0.0
     errors: List[str] = Field(default_factory=list)
     failed_documents: List[str] = Field(default_factory=list)
@@ -561,6 +562,12 @@ class IngestionPipeline(BaseModel):
     embedding: Optional[Any] = Field(default=None, description="Embedding model instance")
     embedding_model: Optional[str] = Field(default=None, description="Embedding model name (for Alita)")
     
+    # Control automatic embedding generation during ingestion
+    auto_generate_embeddings: bool = Field(
+        default=True,
+        description="If True and an embedding model is available, generate entity embeddings after extraction"
+    )
+    
     # Guardrails configuration
     guardrails: Optional[Any] = Field(
         default=None, 
@@ -648,14 +655,33 @@ class IngestionPipeline(BaseModel):
             logger.warning("LLM not configured - extraction will fail")
             return False
         
-        # Initialize embedding if configured (either directly or via Alita)
+        # Initialize embedding model for entity embeddings.
+        # Always use a deterministic local model (all-MiniLM-L6-v2) to avoid
+        # configuration drift: platform embedding models can change/be removed,
+        # but the local model is pinned — ensuring ingestion and retrieval
+        # always produce vectors in the same space.
         if self.embedding:
+            # Allow direct injection (e.g. testing)
             self._embedding = self.embedding
-        elif self.alita and self.embedding_model:
+        elif self.auto_generate_embeddings:
             try:
-                self._embedding = self.alita.get_embeddings(self.embedding_model)
+                import os
+                # Writable cache for container environments (HOME may be read-only)
+                cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/data/embeddings")
+                os.environ["SENTENCE_TRANSFORMERS_HOME"] = cache_dir
+                os.environ["HF_HOME"] = cache_dir
+                # Prevent tokenizer fork warnings in multi-process environments
+                os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+                os.makedirs(cache_dir, exist_ok=True)
+
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                self._embedding = HuggingFaceEmbeddings(
+                    model_name="all-MiniLM-L6-v2",
+                    cache_folder=cache_dir,
+                )
+                logger.info("Initialized local HuggingFaceEmbeddings (all-MiniLM-L6-v2) for entity embeddings")
             except Exception as e:
-                logger.warning(f"Could not initialize embeddings: {e}")
+                logger.warning(f"Could not initialize local HuggingFaceEmbeddings: {e}")
         
         # Initialize extractors
         self._document_classifier = DocumentClassifier(llm=self.llm)
@@ -757,6 +783,36 @@ class IngestionPipeline(BaseModel):
                 logger.debug(f"Auto-saved graph to {self.graph_path}")
             except Exception as e:
                 logger.warning(f"Failed to auto-save: {e}")
+
+    def regenerate_embeddings(self, embedding_model: Any = None, force: bool = False) -> int:
+        """
+        Generate or regenerate entity embeddings on the current graph.
+
+        This is a standalone method that can be called without a full
+        re-ingestion, useful for adding embeddings to legacy graphs
+        or switching embedding models.
+
+        Args:
+            embedding_model: LangChain Embeddings instance. If None,
+                uses the pipeline's configured embedding.
+            force: If True, regenerate even for entities that already have embeddings.
+
+        Returns:
+            Number of entities that received embeddings.
+
+        Raises:
+            ValueError: If no embedding model is available.
+        """
+        model = embedding_model or self._embedding
+        if model is None:
+            raise ValueError(
+                "No embedding model available. Pass embedding_model parameter or "
+                "configure embedding/embedding_model on the pipeline."
+            )
+
+        count = self._knowledge_graph.generate_embeddings(model, force=force)
+        self._auto_save()
+        return count
     
     def _get_checkpoint_path(self, source: str) -> str:
         """Get checkpoint file path for a source."""
@@ -2938,6 +2994,29 @@ class IngestionPipeline(BaseModel):
                 relations_phase_duration = time.time() - relations_phase_start
                 logger.info(f"⏱️ [TIMING] LLM relations: {llm_rel_duration:.3f}s")
                 logger.info(f"⏱️ [TIMING] Relations phase total: {relations_phase_duration:.3f}s")
+            
+            # Generate embeddings if configured
+            if self.auto_generate_embeddings and self._embedding:
+                try:
+                    self._log_progress(
+                        "🧮 Generating entity embeddings...",
+                        "embeddings"
+                    )
+                    emb_start = time.time()
+                    emb_count = self._knowledge_graph.generate_embeddings(self._embedding)
+                    emb_duration = time.time() - emb_start
+                    result.embeddings_generated = emb_count
+                    logger.info(f"⏱️ [TIMING] Embedding generation: {emb_duration:.3f}s for {emb_count} entities")
+                    self._log_progress(
+                        f"✅ Generated embeddings for {emb_count} entities in {emb_duration:.1f}s",
+                        "embeddings"
+                    )
+                except Exception as e:
+                    logger.warning(f"Embedding generation failed (non-fatal): {e}")
+                    self._log_progress(
+                        f"⚠️ Embedding generation skipped: {e}",
+                        "warning"
+                    )
             
             # Save final graph
             self._auto_save()

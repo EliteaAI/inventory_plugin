@@ -693,7 +693,8 @@ class Method:
         Args:
             touched_entities: Shared list to collect entities accessed during execution
         """
-        from langchain.tools import Tool, StructuredTool
+        from langchain_core.tools.structured import StructuredTool
+        from langchain_core.tools.simple import Tool
         from pydantic import BaseModel, Field
         import os
 
@@ -716,7 +717,7 @@ class Method:
             tools.extend(source_tools)
             log.info(f"[_build_chat_tools] Added {len(source_tools)} source toolkit tools")
 
-        # Get the retrieval wrapper
+        # Get the retrieval wrapper (embedding model is local, initialized lazily)
         wrapper = self._get_or_create_wrapper(graph_path, {
             "configuration": {
                 "project_id": project_id,
@@ -916,6 +917,53 @@ class Method:
             description=TOOL_DESCRIPTIONS["search_knowledge_graph"],
             args_schema=SearchGraphInput,
         ))
+
+        # 1b. Semantic Search Tool — conditionally added when embeddings are available
+        stats = wrapper._knowledge_graph.get_stats()
+        if stats.get('has_embeddings'):
+            class SemanticSearchInput(BaseModel):
+                """Input for semantic_search tool."""
+                query: str = Field(description="Natural language query for semantic similarity search (e.g., 'authentication logic', 'payment processing')")
+                top_k: int = Field(default=10, description="Maximum number of results (default: 10)")
+
+            def semantic_search_func(query: str, top_k: int = 10) -> str:
+                """Search entities by semantic similarity using embeddings."""
+                try:
+                    top_k = min(top_k, 50)
+                    result = wrapper.semantic_search(
+                        query=query,
+                        top_k=top_k,
+                        entity_type=filter_entity_types[0] if len(filter_entity_types) == 1 else None,
+                        layer=filter_layers[0] if len(filter_layers) == 1 else None,
+                    )
+
+                    # Track entities from results for graph context
+                    if result and not result.startswith("No ") and not result.startswith("Semantic search"):
+                        for line in result.split('\n'):
+                            if line.strip().startswith(('1.', '2.', '3.', '4.', '5.')):
+                                # Parse entity name from result line
+                                if '**' in line:
+                                    parts = line.split('**')
+                                    if len(parts) >= 2:
+                                        ename = parts[1].strip()
+                                        if ename:
+                                            track_entity({'name': ename, 'type': 'unknown'})
+
+                    return result
+                except Exception as e:
+                    log.exception(f"[semantic_search] Error: {e}")
+                    return f"Error in semantic search: {e}"
+
+            tools.append(StructuredTool(
+                name="semantic_search",
+                func=semantic_search_func,
+                description=TOOL_DESCRIPTIONS.get(
+                    "semantic_search",
+                    "Search entities by semantic similarity. Use for concept-level queries like 'authentication logic' or 'error handling patterns'."
+                ),
+                args_schema=SemanticSearchInput,
+            ))
+            log.info(f"[_build_chat_tools] Semantic search tool enabled ({stats.get('embeddings_count', 0)} entities with embeddings)")
 
         # Helper to parse "Name (type)" format from search results
         def parse_entity_reference(entity_ref: str):
@@ -2169,7 +2217,8 @@ class Method:
             List of tools with prefixed names
         """
         import re
-        from langchain.tools import Tool, StructuredTool
+        from langchain_core.tools.simple import Tool
+        from langchain_core.tools.structured import StructuredTool
 
         prefixed_tools = []
 

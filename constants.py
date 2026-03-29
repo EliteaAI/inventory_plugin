@@ -31,9 +31,15 @@ Do NOT use code search as your primary tool.
 
 ## Tool Usage
 
-**search_knowledge_graph(query)** - Find entities
-- First step for any question
-- Returns classes, functions, concepts, facts matching query
+**search_knowledge_graph(query)** - Find entities by name/token matching
+- First step for any question when you know specific names or keywords
+- Returns classes, functions, concepts, facts matching query tokens
+
+**semantic_search(query)** - Find entities by concept similarity
+- Use when searching by meaning rather than exact names
+- Best for: "authentication logic", "error handling", "data validation patterns"
+- Returns results ranked by embedding similarity score
+- Available only when the graph has embeddings
 
 **get_related_entities(entity_name)** - Explore relationships (USE THIS!)
 - Call this on EVERY interesting entity from search
@@ -115,6 +121,12 @@ EXAMPLES:
   related:"WeaponBase" type:class    - Classes that extend/use WeaponBase""",
 
     "list_entity_types": "LIST all entity types and counts. Use first to understand what's in the graph (classes, functions, facts, etc.).",
+
+    "semantic_search": "FIND entities by CONCEPT, not just name. Use when looking for functionality by meaning "
+    "(e.g., 'authentication logic', 'payment processing', 'error handling patterns'). "
+    "Uses embedding similarity — finds related entities even without shared keywords. "
+    "Parameters: 'query' (required), 'top_k' (optional, default 10). "
+    "Use search_knowledge_graph for exact name/type lookups; use semantic_search for concept-level exploration.",
 }
 
 # Read-only tool patterns for filtering source toolkit tools

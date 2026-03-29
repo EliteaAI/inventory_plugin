@@ -98,6 +98,16 @@ GetCitationsParams = create_model(
     file_path=(Optional[str], Field(default=None, description="Filter by file path")),
 )
 
+SemanticSearchParams = create_model(
+    "SemanticSearchParams",
+    query=(str, Field(description="Natural language search query for semantic similarity matching (e.g., 'authentication logic', 'database connection handling', 'payment processing')")),
+    top_k=(Optional[int], Field(default=10, description="Maximum number of results to return")),
+    entity_type=(Optional[str], Field(default=None, description="Filter by entity type (e.g., 'class', 'function'). Case-insensitive.")),
+    layer=(Optional[str], Field(default=None, description="Filter by layer: 'code', 'service', 'data', 'product', 'domain', 'knowledge', etc.")),
+    file_pattern=(Optional[str], Field(default=None, description="Filter by file path pattern (glob-like)")),
+    min_score=(Optional[float], Field(default=0.3, description="Minimum cosine similarity score (0.0-1.0). Higher = stricter matching.")),
+)
+
 ListEntitiesByTypeParams = create_model(
     "ListEntitiesByTypeParams",
     entity_type=(str, Field(description="Type of entities to list (e.g., 'class', 'function', 'api_endpoint')")),
@@ -163,6 +173,7 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
     
     # Private attributes
     _knowledge_graph: Optional[KnowledgeGraph] = PrivateAttr(default=None)
+    _embedding: Optional[Any] = PrivateAttr(default=None)
     
     class Config:
         arbitrary_types_allowed = True
@@ -170,6 +181,7 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
     def model_post_init(self, __context) -> None:
         """Initialize after model construction."""
         self._knowledge_graph = KnowledgeGraph()
+        self._embedding = None
         
         # Load graph (handle model_construct case where graph_path may not be set)
         graph_path = getattr(self, 'graph_path', None)
@@ -181,6 +193,11 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
                     f"Loaded graph: {stats['node_count']} entities, "
                     f"{stats['edge_count']} relations"
                 )
+                if stats.get('has_embeddings'):
+                    logger.info(
+                        f"Semantic search available: {stats['embeddings_count']} entities "
+                        f"with embeddings (model: {stats.get('embeddings_model', 'unknown')})"
+                    )
             except FileNotFoundError:
                 logger.warning(f"Graph not found at {graph_path}")
             except Exception as e:
@@ -364,7 +381,129 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
             output += "\n"
         
         return output
-    
+
+    def _get_embedding_model(self) -> Any:
+        """Get or lazy-initialize the local embedding model for semantic search.
+
+        Always uses a deterministic local model (all-MiniLM-L6-v2) to ensure
+        query-time vectors match ingestion-time vectors regardless of platform
+        configuration changes.  This eliminates configuration-drift issues
+        where a platform embedding model is renamed, removed, or swapped.
+        """
+        if self._embedding is not None:
+            return self._embedding
+
+        try:
+            import os
+            # Writable cache for container environments (HOME may be read-only)
+            cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/data/embeddings")
+            os.environ["SENTENCE_TRANSFORMERS_HOME"] = cache_dir
+            os.environ["HF_HOME"] = cache_dir
+            # Prevent tokenizer fork warnings in multi-process environments
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            os.makedirs(cache_dir, exist_ok=True)
+
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            self._embedding = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                cache_folder=cache_dir,
+            )
+            logger.info("Initialized local embedding model (all-MiniLM-L6-v2) for semantic search")
+            return self._embedding
+        except Exception as e:
+            logger.warning(f"Could not initialize HuggingFaceEmbeddings: {e}")
+            return None
+
+    def semantic_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        entity_type: Optional[str] = None,
+        layer: Optional[str] = None,
+        file_pattern: Optional[str] = None,
+        min_score: float = 0.3,
+    ) -> str:
+        """
+        Search entities by semantic similarity using embeddings.
+
+        Uses vector similarity to find conceptually related entities,
+        even when they don't share exact keywords.
+        """
+        self._log_tool_event(f"Semantic search: {query}", "semantic_search")
+
+        stats = self._knowledge_graph.get_stats()
+        if not stats.get('has_embeddings'):
+            return (
+                "Semantic search unavailable — no entity embeddings found.\n"
+                "Re-run ingestion with an embedding model configured to enable semantic search."
+            )
+
+        model = self._get_embedding_model()
+        if model is None:
+            return "Semantic search unavailable — could not initialize embedding model."
+
+        try:
+            results = self._knowledge_graph.semantic_search(
+                query=query,
+                embedding_model=model,
+                top_k=top_k,
+                entity_type=entity_type,
+                layer=layer,
+                file_pattern=file_pattern,
+                min_score=min_score,
+            )
+        except Exception as e:
+            return f"Semantic search failed: {e}"
+
+        if not results:
+            return f"No semantically similar entities found for '{query}' (min_score={min_score})"
+
+        output = f"# Semantic Search Results for '{query}'\n\n"
+        output += f"Found {len(results)} similar entities:\n\n"
+
+        for i, result in enumerate(results, 1):
+            entity = result['entity']
+            score = result.get('score', 0)
+
+            citations = entity.get('citations', [])
+            if not citations and 'citation' in entity:
+                citations = [entity['citation']]
+
+            entity_type_str = entity.get('type', 'unknown')
+            layer_str = entity.get('layer', '')
+            if not layer_str:
+                layer_str = self._knowledge_graph.TYPE_TO_LAYER.get(entity_type_str.lower(), '')
+            if layer_str:
+                entity_type_str = f"{layer_str}/{entity_type_str}"
+
+            output += f"{i:2}. **{entity.get('name')}** ({entity_type_str}) — similarity: {score:.3f}\n"
+
+            if citations:
+                citation = citations[0]
+                file_path = citation.get('file_path', 'unknown')
+                line_info = ""
+                if citation.get('line_start'):
+                    if citation.get('line_end'):
+                        line_info = f":{citation['line_start']}-{citation['line_end']}"
+                    else:
+                        line_info = f":{citation['line_start']}"
+                output += f"    📍 `{file_path}{line_info}`\n"
+            elif entity.get('file_path'):
+                output += f"    📍 `{entity['file_path']}`\n"
+
+            description = entity.get('description', '')
+            if not description and isinstance(entity.get('properties'), dict):
+                description = entity['properties'].get('description', '')
+            if description:
+                desc = description[:120]
+                if len(description) > 120:
+                    desc += "..."
+                output += f"    {desc}\n"
+
+            output += "\n"
+
+        return output
+
     def get_entity(self, entity_name: str, include_relations: bool = True) -> str:
         """
         Get detailed information about a specific entity.
@@ -1321,6 +1460,12 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
                 "ref": self.search_graph,
                 "description": "Search for entities with enhanced token matching. Supports 'chat message' finding 'ChatMessageHandler', file patterns like '**/chat*.py', and layer filtering (code, service, data, product, knowledge).",
                 "args_schema": SearchGraphParams,
+            },
+            {
+                "name": "semantic_search",
+                "ref": self.semantic_search,
+                "description": "Search entities by semantic similarity using embeddings. Use for concept-level queries like 'authentication logic', 'error handling patterns', 'payment processing'. Returns results ranked by cosine similarity.",
+                "args_schema": SemanticSearchParams,
             },
             {
                 "name": "search_facts",

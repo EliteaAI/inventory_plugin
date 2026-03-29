@@ -347,6 +347,7 @@ class KnowledgeGraph:
         self._source_doc_index: Dict[str, Set[str]] = defaultdict(set)  # source_doc_id -> node_ids
         self._metadata: Dict[str, Any] = {}  # Graph metadata (sources, timestamps)
         self._schema: Optional[Dict[str, Any]] = None  # Discovered entity schema
+        self._embedding_model: Any = None  # LangChain Embeddings instance (set by generate_embeddings)
     
     # ========== Entity Operations ==========
     
@@ -1405,11 +1406,18 @@ class KnowledgeGraph:
             'relations_by_source': dict(relations_by_source),
             'cross_source_relations': len(self.get_cross_source_relations()),
             'last_saved': self._metadata.get('last_saved'),
+            'has_embeddings': any(
+                data.get('embedding') for _, data in self._graph.nodes(data=True)
+            ),
+            'embeddings_count': sum(
+                1 for _, data in self._graph.nodes(data=True) if data.get('embedding')
+            ),
+            'embeddings_model': self._metadata.get('embeddings_model'),
         }
     
     # ========== Persistence ==========
     
-    def dump_to_json(self, path: str) -> None:
+    def dump_to_json(self, path: str, exclude_embeddings: bool = False) -> None:
         """
         Export graph to JSON file using node_link format.
         
@@ -1420,10 +1428,16 @@ class KnowledgeGraph:
         
         Args:
             path: File path to write JSON
+            exclude_embeddings: If True, strip embedding vectors from output
+                for lightweight exports (e.g. visualization).
         """
         # Use edges="links" explicitly for NetworkX 3.5+ compatibility
         # This ensures consistent format that load_from_json expects
         data = nx.node_link_data(self._graph, edges="links")
+        
+        if exclude_embeddings:
+            for node in data.get('nodes', []):
+                node.pop('embedding', None)
         
         # Add index data for persistence
         data['_indices'] = {
@@ -1437,10 +1451,16 @@ class KnowledgeGraph:
         if self._schema:
             data['_schema'] = self._schema
         
-        # Add metadata
-        self._metadata['last_saved'] = datetime.now().isoformat()
-        self._metadata['version'] = '2.1'  # Enhanced indices version
-        data['_metadata'] = self._metadata
+        # Add metadata (use a copy so we don't mutate the live object)
+        metadata = dict(self._metadata)
+        metadata['last_saved'] = datetime.now().isoformat()
+        metadata['version'] = '2.1'  # Enhanced indices version
+        if exclude_embeddings:
+            # Clear embedding metadata to avoid stale stats after reload
+            metadata.pop('embeddings_model', None)
+            metadata.pop('embeddings_count', None)
+            metadata.pop('embeddings_generated_at', None)
+        data['_metadata'] = metadata
         
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, default=str)
@@ -1724,6 +1744,210 @@ class KnowledgeGraph:
             'bridging_edges': bridging_edges,
             'clusters': len(components)
         }
+
+    # ========== Embedding Operations ==========
+
+    def generate_embeddings(
+        self,
+        embedding_model: Any,
+        force: bool = False,
+        batch_size: int = 256,
+    ) -> int:
+        """
+        Generate embeddings for all entities using a LangChain Embeddings instance.
+
+        Composes text from entity name, type, description, and properties,
+        then calls embedding_model.embed_documents() in batches.
+
+        Args:
+            embedding_model: A LangChain Embeddings instance
+                (e.g. HuggingFaceEmbeddings or OpenAIEmbeddings).
+            force: If True, regenerate embeddings even for entities that already have them.
+            batch_size: Number of texts to embed per batch call.
+
+        Returns:
+            Number of entities that received embeddings.
+        """
+        self._embedding_model = embedding_model
+
+        # Collect nodes that need embedding
+        node_ids = []
+        texts = []
+
+        for node_id, data in self._graph.nodes(data=True):
+            if not force and data.get('embedding'):
+                continue
+
+            text = self._compose_embedding_text(data)
+            if not text:
+                continue
+
+            node_ids.append(node_id)
+            texts.append(text)
+
+        if not texts:
+            logger.info("No entities need embedding generation")
+            return 0
+
+        # Embed in batches
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_embeddings = embedding_model.embed_documents(batch)
+            all_embeddings.extend(batch_embeddings)
+
+        # Store embeddings on nodes
+        for node_id, emb in zip(node_ids, all_embeddings):
+            self._graph.nodes[node_id]['embedding'] = emb
+
+        # Track metadata
+        model_info = type(embedding_model).__name__
+        if hasattr(embedding_model, 'model_name'):
+            model_info += f":{embedding_model.model_name}"
+        self._metadata['embeddings_model'] = model_info
+        self._metadata['embeddings_generated_at'] = datetime.now().isoformat()
+        self._metadata['embeddings_count'] = len(all_embeddings)
+
+        logger.info(f"Generated embeddings for {len(all_embeddings)} entities using {model_info}")
+        return len(all_embeddings)
+
+    def semantic_search(
+        self,
+        query: str,
+        embedding_model: Any = None,
+        top_k: int = 10,
+        entity_type: Optional[str] = None,
+        layer: Optional[str] = None,
+        file_pattern: Optional[str] = None,
+        min_score: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search entities by semantic similarity using embeddings.
+
+        Args:
+            query: Natural language search query.
+            embedding_model: LangChain Embeddings instance for encoding the query.
+                Falls back to the model used in generate_embeddings().
+            top_k: Maximum number of results to return.
+            entity_type: Filter by entity type (case-insensitive).
+            layer: Filter by layer (code, service, data, etc.).
+            file_pattern: Filter by file path pattern (glob-like).
+            min_score: Minimum cosine similarity threshold.
+
+        Returns:
+            List of dicts with 'entity', 'score', and 'match_field' keys,
+            sorted by descending similarity score.
+
+        Raises:
+            ValueError: If no embedding model is available.
+        """
+        import numpy as np
+
+        model = embedding_model or getattr(self, '_embedding_model', None)
+        if model is None:
+            raise ValueError(
+                "No embedding model available. Pass embedding_model parameter "
+                "or call generate_embeddings() first."
+            )
+
+        query_embedding = np.array(model.embed_query(query), dtype=np.float32)
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm == 0:
+            return []
+
+        import re as _re
+
+        # Compile file pattern once
+        file_regex = None
+        if file_pattern:
+            pattern = file_pattern.replace('.', r'\.').replace('*', '.*').replace('?', '.')
+            try:
+                file_regex = _re.compile(pattern, _re.IGNORECASE)
+            except _re.error:
+                pass
+
+        # Layer types for filtering
+        layer_types = set()
+        if layer:
+            layer_types = self.LAYER_TYPE_MAPPING.get(layer.lower(), set())
+
+        results = []
+        for node_id, data in self._graph.nodes(data=True):
+            emb = data.get('embedding')
+            if not emb:
+                continue
+
+            # Type filter
+            data_type = data.get('type', '').lower()
+            if entity_type and data_type != entity_type.lower():
+                continue
+
+            # Layer filter
+            if layer:
+                entity_layer = data.get('layer', '').lower()
+                if entity_layer != layer.lower() and data_type not in layer_types:
+                    continue
+
+            # File pattern filter
+            if file_regex:
+                citations = data.get('citations', [])
+                if not citations and 'citation' in data:
+                    citations = [data['citation']]
+                file_paths = [c.get('file_path', '') for c in citations if isinstance(c, dict)]
+                primary_file = file_paths[0] if file_paths else data.get('file_path', '')
+                if primary_file and not file_regex.search(primary_file):
+                    continue
+
+            # Cosine similarity
+            node_emb = np.array(emb, dtype=np.float32)
+            node_norm = np.linalg.norm(node_emb)
+            if node_norm == 0:
+                continue
+            score = float(np.dot(query_embedding, node_emb) / (query_norm * node_norm))
+
+            if score < min_score:
+                continue
+
+            entity_data = dict(data)
+            entity_data['id'] = node_id
+            # Exclude embedding vector from results — it's large and not useful for display
+            entity_data.pop('embedding', None)
+            results.append({
+                'entity': entity_data,
+                'score': round(score, 4),
+                'match_field': 'semantic',
+            })
+
+        results.sort(key=lambda x: (-x['score'], x['entity'].get('name', '').lower()))
+        return results[:top_k]
+
+    @staticmethod
+    def _compose_embedding_text(node_data: Dict[str, Any]) -> str:
+        """Compose text for embedding from entity attributes."""
+        parts = []
+        name = node_data.get('name', '')
+        if name:
+            parts.append(name)
+
+        entity_type = node_data.get('type', '')
+        if entity_type:
+            parts.append(entity_type.replace('_', ' '))
+
+        description = node_data.get('description', '')
+        if not description and isinstance(node_data.get('properties'), dict):
+            description = node_data['properties'].get('description', '')
+        if description:
+            parts.append(description)
+
+        # Include select properties that add semantic value
+        props = node_data.get('properties', {})
+        if isinstance(props, dict):
+            for key in ('purpose', 'summary', 'signature', 'docstring'):
+                val = props.get(key, '')
+                if val and isinstance(val, str):
+                    parts.append(val)
+
+        return ' '.join(parts).strip()
 
     # ========== Citation Helpers ==========
     

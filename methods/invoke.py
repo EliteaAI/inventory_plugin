@@ -786,7 +786,9 @@ class Method:
     def _get_or_create_wrapper(self, graph_path, request_data=None):
         """Get or create a retrieval wrapper for the given graph path
 
-        If graph doesn't exist locally, tries to download from artifact bucket
+        If graph doesn't exist locally, tries to download from artifact bucket.
+        Embedding model is always local (all-MiniLM-L6-v2) — initialized lazily
+        by the wrapper on first semantic_search call.
         """
         import os
         from inventory import InventoryRetrievalApiWrapper
@@ -986,6 +988,11 @@ class Method:
             if not llm_model:
                 return "Error: No LLM model configured. Please set 'llm_model' in the inventory toolkit configuration."
 
+            # Get embedding model for semantic search (optional — falls back to local HuggingFace)
+            # Note: Entity embeddings always use the local all-MiniLM-L6-v2 model
+            # to avoid configuration drift. The embedding_model setting is reserved
+            # for future platform-level embedding features (e.g. vector store indexing).
+
             log.info(f"Using LLM model: {llm_model}")
             log.info(f"Inventory settings: {inventory_settings}")
 
@@ -1062,6 +1069,7 @@ class Method:
                 llm=llm,
                 alita=alita_client,
                 graph_path=graph_path,
+                auto_generate_embeddings=ingestion_config.get("generate_embeddings", True),
                 progress_callback=progress_callback,
                 # Parallelization settings from config
                 max_parallel_extractions=ingestion_config.get("max_parallel_extractions", 10),
