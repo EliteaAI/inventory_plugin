@@ -381,9 +381,19 @@ class TestRelationSynonyms:
         assert len(results) == 1
         assert results[0]['edges'] == ['related_to']
     
-    def test_references_maps_to_related_to(self, graph):
-        """'references' → 'related_to'."""
+    def test_references_is_first_class_relation(self, graph):
+        """'references' is a first-class relation type, not a synonym for 'related_to'.
+        
+        Cross-file extraction can produce REFERENCES edges, so 'references'
+        must query for 'references' edges specifically — not 'related_to'.
+        """
+        # The test graph has no 'references' edges, so querying with
+        # [:references] should return no results (correct behavior)
         results = graph.query_pattern("(OAuthSupported)-[:references]->(AuthService)")
+        assert len(results) == 0
+        
+        # But querying with [:related_to] should find the RELATED_TO edge
+        results = graph.query_pattern("(OAuthSupported)-[:related_to]->(AuthService)")
         assert len(results) == 1
     
     def test_describes_maps_to_related_to(self, graph):

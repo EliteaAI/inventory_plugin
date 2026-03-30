@@ -665,7 +665,7 @@ class KnowledgeGraph:
             logger.warning(f"Target entity {target_id} not found")
             return False
         
-        edge_data = {'relation_type': relation_type}
+        edge_data = {'relation_type': relation_type.lower()}
         if properties:
             edge_data.update(properties)
         
@@ -1520,6 +1520,11 @@ class KnowledgeGraph:
         
         self._graph = nx.node_link_graph(data, edges="links")
         
+        # Normalize edge relation types to lowercase for consistent querying
+        for u, v, edge_data in self._graph.edges(data=True):
+            if 'relation_type' in edge_data:
+                edge_data['relation_type'] = edge_data['relation_type'].lower()
+        
         # Rebuild missing indices if needed (for legacy graphs)
         if not self._type_index or not self._file_index:
             self._rebuild_indices()
@@ -1964,11 +1969,14 @@ class KnowledgeGraph:
         'has_child': 'contains', 'defines': 'contains',
         # → related_to (the primary doc↔code and doc↔doc connector)
         'related': 'related_to', 'relates': 'related_to',
-        'references': 'related_to', 'reference': 'related_to', 'refers_to': 'related_to',
+        'reference': 'related_to', 'refers_to': 'related_to',
         'associated': 'related_to', 'associated_with': 'related_to',
         'linked': 'related_to', 'linked_to': 'related_to',
         'describes': 'related_to', 'documents': 'related_to',
-        'mentions': 'related_to', 'about': 'related_to',
+        'about': 'related_to',
+        # NOTE: 'mentions' and 'references' are first-class relation types
+        # in the graph (cross-file content mentions / LLM-extracted references),
+        # so they must NOT be synonyms for 'related_to'.
         # → calls
         'invoke': 'calls', 'invokes': 'calls', 'call': 'calls',
         'triggers': 'calls', 'trigger': 'calls', 'uses': 'calls',

@@ -140,6 +140,151 @@ PARSER_REL_TYPE_TO_STRING = {
     ParserRelationshipType.USES: "uses",
 }
 
+# Entity type priority for name-based resolution.
+# When multiple entities share the same name (e.g., AgentPage exists as class,
+# import, and fact), prefer structural types that represent the real definition.
+_ENTITY_TYPE_PRIORITY = {
+    'class': 10, 'interface': 10, 'struct': 10, 'enum': 10, 'trait': 10,
+    'function': 9, 'method': 9,
+    'module': 8, 'component': 8, 'service': 8,
+    'constant': 7, 'variable': 6, 'property': 6,
+    'feature': 5, 'requirement': 5, 'test': 5, 'rule': 5, 'workflow': 5,
+    'source_file': 4, 'document_file': 4, 'config_file': 4,
+    'fact': 2,
+    'import': 1,  # imports are references, not definitions
+}
+
+
+# Quality-pass tuning constants for _run_graph_quality_pass().
+# A node with more than this many incoming RELATED_TO edges is treated as a hub.
+GRAPH_QUALITY_HUB_THRESHOLD = 50
+# Single-word entity names that are almost always noise when targeted by RELATED_TO.
+GRAPH_QUALITY_GENERIC_NAMES = frozenset({
+    'get', 'set', 'context', 'page', 'api', 'data', 'test', 'name',
+    'url', 'login', 'user', 'response', 'request', 'result', 'value',
+    'config', 'error', 'status', 'type', 'id', 'key', 'list', 'item',
+    'index', 'base', 'default', 'main', 'run', 'init', 'setup', 'start',
+})
+# Max target-name length (single-word) before the edge is considered noisy.
+GRAPH_QUALITY_SHORT_NAME_MAX_LEN = 10
+
+
+def _entity_type_priority(entity_type: str) -> int:
+    """Return priority for entity type (higher = preferred in name resolution)."""
+    return _ENTITY_TYPE_PRIORITY.get(entity_type.lower(), 3)
+
+
+def _build_entity_by_name(entities, existing_map=None):
+    """
+    Build a name→entity lookup that prefers structural types over imports/facts.
+    
+    When multiple entities share the same name, the one with the highest
+    type priority wins (class > function > module > variable > fact > import).
+    
+    Also builds type-qualified keys like 'class:agentpage' for precise matching.
+    
+    Args:
+        entities: Iterable of entity dicts with 'name', 'type', 'id' keys
+        existing_map: Optional existing dict to update (mutated in place).
+            Priority info is recovered from existing entries so that a
+            low-priority entity won't overwrite a high-priority one added
+            by a prior call.
+        
+    Returns:
+        Dict mapping lowercase name (and type:name) to entity dict.
+    """
+    result = existing_map if existing_map is not None else {}
+    # Track priorities to avoid overwriting higher-priority entries.
+    # Recover priorities from existing entries so chained calls are safe.
+    name_priority: Dict[str, int] = {}
+    if existing_map:
+        for key, ent in existing_map.items():
+            if ':' in key:
+                continue  # skip type-qualified keys
+            if isinstance(ent, dict):
+                ent_type = ent.get('type', '').lower()
+                name_priority[key.lower()] = _entity_type_priority(ent_type)
+    
+    for ent in entities:
+        name = ent.get('name', '')
+        if not name:
+            continue
+        name_lower = name.lower()
+        ent_type = ent.get('type', '').lower()
+        priority = _entity_type_priority(ent_type)
+        
+        # Type-qualified key always gets set (no collision)
+        type_key = f"{ent_type}:{name_lower}"
+        result[type_key] = ent
+        
+        # For unqualified name, only set if higher or equal priority
+        current_priority = name_priority.get(name_lower, -1)
+        if priority >= current_priority:
+            result[name_lower] = ent
+            result[name] = ent
+            name_priority[name_lower] = priority
+            
+        # Also index by full_name if available
+        full_name = ''
+        props = ent.get('properties', {})
+        if isinstance(props, dict):
+            full_name = props.get('full_name', '')
+        if not full_name:
+            full_name = ent.get('full_name', '')
+        if full_name and full_name != name:
+            fn_lower = full_name.lower()
+            fn_priority = name_priority.get(fn_lower, -1)
+            if priority >= fn_priority:
+                result[fn_lower] = ent
+                name_priority[fn_lower] = priority
+    
+    return result
+
+
+def _build_entity_by_name_ids(entities):
+    """
+    Build a name→entity_id lookup that prefers structural types.
+    
+    Same priority logic as _build_entity_by_name but returns IDs instead of dicts.
+    Used by parser relationship resolution.
+    """
+    result = {}
+    name_priority = {}
+    
+    for ent in entities:
+        name = ent.get('name', '')
+        if not name:
+            continue
+        name_lower = name.lower()
+        ent_type = ent.get('type', '').lower()
+        ent_id = ent.get('id', '')
+        if not ent_id:
+            continue
+        priority = _entity_type_priority(ent_type)
+        
+        # Type-qualified key
+        type_key = f"{ent_type}:{name_lower}"
+        result[type_key] = ent_id
+        
+        # Unqualified name — prefer higher priority
+        current_priority = name_priority.get(name_lower, -1)
+        if priority >= current_priority:
+            result[name_lower] = ent_id
+            name_priority[name_lower] = priority
+        
+        # Full qualified name
+        full_name = ent.get('properties', {}).get('full_name', '') if isinstance(ent.get('properties'), dict) else ''
+        if not full_name:
+            full_name = ent.get('full_name', '')
+        if full_name and full_name != name:
+            fn_lower = full_name.lower()
+            fn_priority = name_priority.get(fn_lower, -1)
+            if priority >= fn_priority:
+                result[fn_lower] = ent_id
+                name_priority[fn_lower] = priority
+    
+    return result
+
 
 def _is_code_file(file_path: str) -> bool:
     """Check if file is a code file that parsers can handle."""
@@ -784,6 +929,83 @@ class IngestionPipeline(BaseModel):
             except Exception as e:
                 logger.warning(f"Failed to auto-save: {e}")
 
+    def _run_graph_quality_pass(self) -> int:
+        """
+        Post-ingestion quality pass that prunes low-quality graph elements.
+        
+        Targets three problems:
+        1. Hub nodes with excessive in-degree from RELATED_TO edges
+           (e.g., "unknown fact" nodes, single-word generic entities)
+        2. Low-confidence RELATED_TO edges to short-named entities
+        3. Self-loops
+        
+        Returns:
+            Number of edges pruned
+        """
+        graph = self._knowledge_graph._graph  # NetworkX DiGraph
+        pruned = 0
+        
+        # --- Pass 1: Remove self-loops ---
+        self_loops = [(u, v) for u, v in graph.edges() if u == v]
+        if self_loops:
+            graph.remove_edges_from(self_loops)
+            pruned += len(self_loops)
+            logger.debug(f"Quality pass: removed {len(self_loops)} self-loops")
+        
+        # --- Pass 2: Prune RELATED_TO edges targeting hub nodes ---
+        # Hub threshold: if a node has many RELATED_TO in-edges, the edges are noise
+        HUB_THRESHOLD = GRAPH_QUALITY_HUB_THRESHOLD
+        
+        # Count related_to in-edges per node
+        related_to_in = {}
+        for u, v, data in graph.edges(data=True):
+            rel_type = data.get('relation_type', data.get('type', '')).lower()
+            if rel_type == 'related_to':
+                related_to_in[v] = related_to_in.get(v, 0) + 1
+        
+        # Identify hub nodes and prune their RELATED_TO in-edges
+        for node_id, rt_count in related_to_in.items():
+            if rt_count > HUB_THRESHOLD:
+                node_data = graph.nodes.get(node_id, {})
+                node_name = node_data.get('name', '')
+                logger.info(
+                    f"Quality pass: hub node '{node_name}' (type={node_data.get('type', '?')}) "
+                    f"has {rt_count} RELATED_TO in-edges — pruning"
+                )
+                # Remove all related_to edges pointing TO this hub
+                edges_to_remove = [
+                    (u, v) for u, v, d in graph.in_edges(node_id, data=True)
+                    if d.get('relation_type', d.get('type', '')).lower() == 'related_to'
+                ]
+                graph.remove_edges_from(edges_to_remove)
+                pruned += len(edges_to_remove)
+        
+        # --- Pass 3: Prune low-quality RELATED_TO edges to short-named entities ---
+        # Single-word entities receiving RELATED_TO edges are almost always noise
+        GENERIC_NAMES = GRAPH_QUALITY_GENERIC_NAMES
+        
+        edges_to_remove = []
+        for u, v, data in graph.edges(data=True):
+            rel_type = data.get('relation_type', data.get('type', '')).lower()
+            if rel_type != 'related_to':
+                continue
+            
+            target_data = graph.nodes.get(v, {})
+            target_name = target_data.get('name', '').lower().strip()
+            target_type = target_data.get('type', '').lower()
+            
+            # Remove RELATED_TO edges to generic single-word code entities
+            if target_type in ('function', 'variable', 'constant', 'import', 'class', 'method'):
+                if target_name in GENERIC_NAMES or (len(target_name.split()) <= 1 and len(target_name) <= GRAPH_QUALITY_SHORT_NAME_MAX_LEN):
+                    edges_to_remove.append((u, v))
+        
+        if edges_to_remove:
+            graph.remove_edges_from(edges_to_remove)
+            pruned += len(edges_to_remove)
+            logger.debug(f"Quality pass: removed {len(edges_to_remove)} RELATED_TO edges to generic entities")
+        
+        return pruned
+
     def regenerate_embeddings(self, embedding_model: Any = None, force: bool = False) -> int:
         """
         Generate or regenerate entity embeddings on the current graph.
@@ -901,35 +1123,51 @@ class IngestionPipeline(BaseModel):
         """
         Generate unique entity ID.
         
-        For most entity types, IDs are based on (type, name) only - NOT file_path.
-        This enables same-named entities from different files to be merged,
-        creating a unified knowledge graph with multiple citations per entity.
+        Entity ID strategy uses three tiers:
         
-        HOWEVER, for context-dependent types (tools, properties, etc.), the file_path
-        IS included because the same name in different files means different things:
-        - "Get Tests" tool in Xray toolkit != "Get Tests" tool in Zephyr toolkit
-        - "name" property in User entity != "name" property in Project entity
+        1. ALWAYS context-dependent: types where the same name across files means
+           fundamentally different things (tools, properties, fields, etc.)
+        
+        2. Short-name guard: entities with generic single-word or very short names
+           (e.g., "get", "context", "page", "api") are made context-dependent
+           regardless of type to prevent hub-node collapse.
+        
+        3. Standard merge: longer, descriptive names are merged across files to
+           create unified knowledge graph nodes with multiple citations.
         """
-        # Types that are context-dependent - same name in different files = different entities
-        CONTEXT_DEPENDENT_TYPES = {
-            "tool", "property", "properties", "parameter", "argument",
-            "field", "column", "attribute", "option", "setting",
-            "step", "test_step", "ui_field", "endpoint", "method",
-            # File-level nodes are unique per file path
-            "file", "source_file", "document_file", "config_file", "web_file",
-        }
-        
         # Normalize name for consistent hashing
         normalized_name = name.lower().strip()
         normalized_type = entity_type.lower().strip()
         
-        # Include file_path for context-dependent types
-        if normalized_type in CONTEXT_DEPENDENT_TYPES and file_path:
-            # Use file path to differentiate same-named entities from different contexts
-            content = f"{entity_type}:{normalized_name}:{file_path}"
+        # For word-count heuristic, split on CamelCase BEFORE lowering
+        # to correctly count "UserAuthenticationService" as 3 words
+        _semantic_words = [w for w in re.split(r'[\s_]+|(?<=[a-z])(?=[A-Z])', name.strip()) if w]
+        
+        # Tier 1: Types that are ALWAYS context-dependent
+        always_context_dependent = CONTEXT_DEPENDENT_TYPES  # Module-level set
+        
+        # Tier 2: Code-structural types where short names cause hub collapse
+        # These get context-dependent treatment ONLY when the name is short/generic
+        CODE_STRUCTURAL_TYPES = {
+            "function", "variable", "constant", "class", "import",
+            "module", "interface", "enum", "struct", "trait",
+        }
+        
+        use_file_scope = False
+        
+        if normalized_type in always_context_dependent:
+            use_file_scope = True
+        elif normalized_type in CODE_STRUCTURAL_TYPES:
+            # Short names (≤2 semantic words or ≤15 chars) are generic and should be file-scoped
+            # Long, descriptive names can safely merge across files
+            # Split on whitespace, underscores, and CamelCase boundaries for accurate word count
+            if len(_semantic_words) <= 2 or len(normalized_name) <= 15:
+                use_file_scope = True
+        
+        if use_file_scope and file_path:
+            content = f"{normalized_type}:{normalized_name}:{file_path}"
         else:
-            # Standard: merge same-named entities across files
-            content = f"{entity_type}:{normalized_name}"
+            content = f"{normalized_type}:{normalized_name}"
         
         return hashlib.md5(content.encode()).hexdigest()[:12]
     
@@ -1177,9 +1415,15 @@ class IngestionPipeline(BaseModel):
                     facts = fact_extractor.extract(doc)
                 
                 for fact in facts:
+                    # Skip facts with missing or generic subjects
+                    subject = (fact.get('subject') or '').strip()
+                    if not subject or subject.lower() in ('unknown', 'unknown fact', 'n/a', 'none', ''):
+                        logger.debug(f"Skipping fact with empty/generic subject in {file_path}")
+                        continue
+                    
                     fact_id = self._generate_entity_id(
                         'fact',
-                        f"{fact.get('fact_type', 'unknown')}_{fact.get('subject', 'unknown')[:30]}",
+                        f"{fact.get('fact_type', 'unknown')}_{subject[:30]}",
                         file_path
                     )
                     
@@ -1195,12 +1439,12 @@ class IngestionPipeline(BaseModel):
                     
                     entities.append({
                         'id': fact_id,
-                        'name': fact.get('subject', 'unknown fact'),
+                        'name': subject,
                         'type': 'fact',
                         'citation': citation,
                         'properties': {
                             'fact_type': fact.get('fact_type'),
-                            'subject': fact.get('subject'),
+                            'subject': subject,
                             'predicate': fact.get('predicate'),
                             'object': fact.get('object'),
                             'confidence': fact.get('confidence', 0.8),
@@ -1654,9 +1898,15 @@ class IngestionPipeline(BaseModel):
                     all_facts = fact_extractor.extract_batch(chunks)
                 
                 for fact in all_facts:
+                    # Skip facts with missing or generic subjects
+                    subject = (fact.get('subject') or '').strip()
+                    if not subject or subject.lower() in ('unknown', 'unknown fact', 'n/a', 'none', ''):
+                        logger.debug(f"Skipping fact with empty/generic subject in {file_path}")
+                        continue
+                    
                     fact_id = self._generate_entity_id(
                         'fact',
-                        f"{fact.get('fact_type', 'unknown')}_{fact.get('subject', 'unknown')[:30]}",
+                        f"{fact.get('fact_type', 'unknown')}_{subject[:30]}",
                         file_path
                     )
                     
@@ -1671,12 +1921,12 @@ class IngestionPipeline(BaseModel):
                     
                     facts.append({
                         'id': fact_id,
-                        'name': fact.get('subject', 'unknown fact'),
+                        'name': subject,
                         'type': 'fact',
                         'citation': citation,
                         'properties': {
                             'fact_type': fact.get('fact_type'),
-                            'subject': fact.get('subject'),
+                            'subject': subject,
                             'predicate': fact.get('predicate'),
                             'object': fact.get('object'),
                             'confidence': fact.get('confidence', 0.8),
@@ -1868,10 +2118,19 @@ class IngestionPipeline(BaseModel):
                 return [], None  # Return empty but not an error
         
         # Convert to format expected by relation extractor
-        entity_dicts = [
-            {'id': e['id'], 'name': e['name'], 'type': e['type'], **e.get('properties', {})}
-            for e in file_entities
-        ]
+        # Filter out generic single-word code entities that create noise in relation extraction
+        entity_dicts = []
+        for e in file_entities:
+            name = e.get('name', '').strip()
+            etype = e.get('type', '').lower()
+            # Skip single-word code entities (context, get, page, etc.)
+            # These produce spurious RELATED_TO edges when sent to the LLM
+            if etype in ('function', 'variable', 'constant', 'import', 'class', 'method'):
+                if len(name.split()) <= 1 and len(name) <= 15:
+                    continue
+            entity_dicts.append(
+                {'id': e['id'], 'name': name, 'type': e['type'], **e.get('properties', {})}
+            )
         
         # Retry logic with exponential backoff
         last_error = None
@@ -2087,8 +2346,14 @@ class IngestionPipeline(BaseModel):
         
         cross_relations = []
 
-        # Build lookup tables
-        entity_by_name: Dict[str, Dict] = {}
+        # Build lookup tables using priority-aware resolution
+        # This ensures class/function entities win over import/fact nodes
+        # when multiple entities share the same name
+        entity_by_name: Dict[str, Dict] = _build_entity_by_name(all_entity_dicts)
+        # Current source entities get higher effective precedence
+        # (processed second, same-priority overwrites allowed)
+        _build_entity_by_name(entities, existing_map=entity_by_name)
+
         entity_by_id: Dict[str, Dict] = {}
         file_to_entities: Dict[str, List[Dict]] = {}
         module_to_file: Dict[str, str] = {}
@@ -2096,45 +2361,29 @@ class IngestionPipeline(BaseModel):
         # For entity mention matching
         significant_entities: List[Tuple[str, Dict]] = []
 
-        # ==== CROSS-SOURCE SUPPORT ====
-        # Build entity_by_name and entity_by_id from ALL graph entities first
-        # This enables finding references to entities from other sources
+        # Build entity_by_id from ALL entities
         for ent in all_entity_dicts:
-            name = ent.get('name', '')
             ent_id = ent.get('id', '')
+            if ent_id:
+                entity_by_id[ent_id] = ent
 
-            if name:
-                name_lower = name.lower()
-                # Don't overwrite if already present from current source
-                if name_lower not in entity_by_name:
-                    entity_by_name[name_lower] = ent
-                if name not in entity_by_name:
-                    entity_by_name[name] = ent
+        # Process current source entities for ID lookup, significant tracking,
+        # and file/module mappings
+        for ent in entities:
+            ent_id = ent.get('id', '')
+            name = ent.get('name', '')
 
             if ent_id:
                 entity_by_id[ent_id] = ent
 
-        # Now process current source entities (these take precedence in lookups
-        # and provide richer data like source_doc for content analysis)
-        for ent in entities:
-            name = ent.get('name', '')
-            ent_id = ent.get('id', '')
-            
+            # Track significant entities for mention detection
             if name:
                 name_lower = name.lower()
-                entity_by_name[name_lower] = ent
-                entity_by_name[name] = ent
-                
-                # Track significant entities for mention detection
-                # Uses SIGNIFICANT_ENTITY_TYPES from constants.py for cross-source linking
                 ent_type = ent.get('type', '').lower()
                 if ent_type in SIGNIFICANT_ENTITY_TYPES:
                     if len(name) >= 3:  # Min 3 chars to reduce noise
                         significant_entities.append((name_lower, ent))
-                        
-            if ent_id:
-                entity_by_id[ent_id] = ent
-            
+
             # Build file -> entities and module -> file mappings
             citation = ent.get('citation')
             if citation:
@@ -2259,7 +2508,7 @@ class IngestionPipeline(BaseModel):
                             cross_relations.append({
                                 'source_id': source_id,
                                 'target_id': target_ent.get('id'),
-                                'type': pattern.relation_type.value,
+                                'relation_type': pattern.relation_type.value,
                                 'properties': {
                                     'source_file': file_path,
                                     'target_file': target_file,
@@ -2289,7 +2538,7 @@ class IngestionPipeline(BaseModel):
                             cross_relations.append({
                                 'source_id': source_id,
                                 'target_id': target_ent.get('id'),
-                                'type': 'MENTIONS',
+                                'relation_type': 'MENTIONS',
                                 'properties': {
                                     'source_file': file_path,
                                     'target_file': target_file,
@@ -2356,7 +2605,7 @@ class IngestionPipeline(BaseModel):
                             cross_relations.append({
                                 'source_id': source_ent.get('id'),
                                 'target_id': target_ent.get('id'),
-                                'type': ast_rel.get('relationship_type', 'REFERENCES').upper(),
+                                'relation_type': ast_rel.get('relationship_type', 'REFERENCES').upper(),
                                 'properties': {
                                     'source_file': ast_rel.get('metadata', {}).get('source_file', ''),
                                     'target_file': ast_rel.get('metadata', {}).get('target_file', ''),
@@ -2433,7 +2682,7 @@ class IngestionPipeline(BaseModel):
                             cross_relations.append({
                                 'source_id': ent_id,
                                 'target_id': target_ent.get('id'),
-                                'type': rel_type,
+                                'relation_type': rel_type,
                                 'properties': {
                                     'source_file': source_file,
                                     'target_file': target_file,
@@ -2506,7 +2755,7 @@ class IngestionPipeline(BaseModel):
                                 cross_relations.append({
                                     'source_id': ent1.get('id'),
                                     'target_id': ent2.get('id'),
-                                    'type': 'RELATED_TO',
+                                    'relation_type': 'RELATED_TO',
                                     'properties': {
                                         'discovered_by': 'semantic_domain_match',
                                         'common_domain': domain,
@@ -2523,7 +2772,7 @@ class IngestionPipeline(BaseModel):
                                 cross_relations.append({
                                     'source_id': ent1.get('id'),
                                     'target_id': ent2.get('id'),
-                                    'type': 'RELATED_TO',
+                                    'relation_type': 'RELATED_TO',
                                     'properties': {
                                         'discovered_by': 'semantic_capability_match',
                                         'common_capability': capability,
@@ -2545,7 +2794,7 @@ class IngestionPipeline(BaseModel):
                         cross_relations.append({
                             'source_id': id1,
                             'target_id': id2,
-                            'type': 'RELATED_TO',
+                            'relation_type': 'RELATED_TO',
                             'properties': {
                                 'discovered_by': 'semantic_name_similarity',
                                 'common_words': list(common_words),
@@ -2566,7 +2815,7 @@ class IngestionPipeline(BaseModel):
         seen = set()
         unique_relations = []
         for rel in cross_relations:
-            key = (rel['source_id'], rel['target_id'], rel['type'])
+            key = (rel['source_id'], rel['target_id'], rel['relation_type'])
             if key not in seen:
                 seen.add(key)
                 unique_relations.append(rel)
@@ -2912,14 +3161,8 @@ class IngestionPipeline(BaseModel):
                     )
                     
                     # Build entity lookup for ID resolution
-                    entity_by_name = {}
-                    for e in graph_entities:
-                        name_lower = e.get('name', '').lower()
-                        entity_by_name[name_lower] = e.get('id')
-                        # Also map full qualified names
-                        full_name = e.get('properties', {}).get('full_name', '')
-                        if full_name:
-                            entity_by_name[full_name.lower()] = e.get('id')
+                    # Uses priority-aware resolution: class/function > import/fact
+                    entity_by_name = _build_entity_by_name_ids(graph_entities)
                     
                     for rel in all_parser_relationships:
                         # Check for direct IDs (used for file<->entity relationships)
@@ -2936,9 +3179,16 @@ class IngestionPipeline(BaseModel):
                         if not source_id or not target_id:
                             source_name = rel.get('source_symbol', '').lower()
                             target_name = rel.get('target_symbol', '').lower()
-
-                            source_id = source_id or entity_by_name.get(source_name)
-                            target_id = target_id or entity_by_name.get(target_name)
+                            rel_type = rel.get('relation_type', '').lower()
+                            
+                            # For extends/implements, use type-qualified lookup
+                            # to ensure we link class→class, not import→import
+                            if rel_type in ('extends', 'implements'):
+                                source_id = source_id or entity_by_name.get(f"class:{source_name}") or entity_by_name.get(source_name)
+                                target_id = target_id or entity_by_name.get(f"class:{target_name}") or entity_by_name.get(f"interface:{target_name}") or entity_by_name.get(target_name)
+                            else:
+                                source_id = source_id or entity_by_name.get(source_name)
+                                target_id = target_id or entity_by_name.get(target_name)
                         
                         if source_id and target_id:
                             properties = {
@@ -2994,6 +3244,14 @@ class IngestionPipeline(BaseModel):
                 relations_phase_duration = time.time() - relations_phase_start
                 logger.info(f"⏱️ [TIMING] LLM relations: {llm_rel_duration:.3f}s")
                 logger.info(f"⏱️ [TIMING] Relations phase total: {relations_phase_duration:.3f}s")
+            
+            # ========== POST-INGESTION QUALITY PASS ==========
+            quality_start = time.time()
+            pruned = self._run_graph_quality_pass()
+            quality_duration = time.time() - quality_start
+            if pruned > 0:
+                logger.info(f"⏱️ [TIMING] Graph quality pass: {quality_duration:.3f}s, pruned {pruned} low-quality edges")
+                self._log_progress(f"🧹 Quality pass: pruned {pruned} low-quality edges", "quality")
             
             # Generate embeddings if configured
             if self.auto_generate_embeddings and self._embedding:
@@ -3169,6 +3427,11 @@ class IngestionPipeline(BaseModel):
                         properties=properties
                     ):
                         result.relations_added += 1
+            
+            # Post-ingestion quality pass
+            pruned = self._run_graph_quality_pass()
+            if pruned > 0:
+                logger.info(f"🧹 Quality pass: pruned {pruned} low-quality edges")
             
             self._auto_save()
             result.graph_stats = self._knowledge_graph.get_stats()

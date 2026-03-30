@@ -395,28 +395,39 @@ Focus on extracting SEMANTIC relationships that represent business logic and dom
 ## Instructions:
 1. Look for semantic relationships mentioned or implied in the document
 2. For source_id and target_id, you MUST use EXACTLY the ID shown before the arrow (->)
+3. QUALITY RULES - skip relationships that:
+   - Link to generic/short entities (single common words like "get", "page", "context", "data", "api", "url", "name")
+   - Are vague/speculative — only extract relationships with clear evidence in the document
+   - Connect entities that merely share a keyword but have no meaningful semantic connection
+   - Would create "everything connects to everything" patterns — be selective
+4. Prefer SPECIFIC relationship types over generic "related_to". Use "related_to" ONLY when no more specific type applies.
+5. Each relationship MUST be supported by explicit or strongly implied evidence in the document content.
 
 ## Relationship Types to Extract:
 For CODE files: Focus on semantic relationships like:
 - tests (test_case tests feature)
 - validates (test validates business_rule)
 - documents (code documents requirement)
-- related_to (feature related_to feature)
 - depends_on (business dependency, not code import)
 
 For DOCUMENTATION files: Extract all relationship types:
 - tests, validates, covers (testing relationships)
 - owned_by, maintained_by, assigned_to (ownership)
 - introduced_in, modified_in, removed_in (temporal)
-- related_to, references, duplicates (semantic)
+- references, duplicates (semantic — prefer over "related_to")
 - navigates_to, shown_on (UI relationships)
-- triggers, depends_on (behavioral - for business logic)
+- triggers, depends_on (behavioral — for business logic)
+
+AVOID:
+- "related_to" when a more specific type fits
+- Relationships to single-word or generic entities
+- Relationships based only on co-occurrence (both mentioned in same document)
 
 DO NOT extract for code files:
 - imports (handled by parser)
 - extends/implements (handled by parser)
 - calls (handled by parser)
-- contains (for code structure - handled by parser)
+- contains (for code structure — handled by parser)
 
 ## Output Format:
 Respond with ONLY a JSON array. Use the EXACT entity IDs from the list above:
@@ -768,7 +779,96 @@ class RelationExtractor:
         self.parser = JsonOutputParser()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-    
+
+    @staticmethod
+    def build_entity_id_lookup(
+        entities: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, str], Dict[str, Tuple[str, set]]]:
+        """Build lookup tables for entity ID resolution.
+
+        Args:
+            entities: Entity dicts with 'id', 'name', 'type' keys.
+
+        Returns:
+            (id_lookup, name_to_id) where id_lookup maps various name
+            forms to entity IDs and name_to_id maps snake-case names to
+            (entity_id, word_set) for fuzzy matching.
+        """
+        id_lookup: Dict[str, str] = {}
+        name_to_id: Dict[str, Tuple[str, set]] = {}
+
+        for e in entities:
+            entity_id = e.get('id', '')
+            entity_name = e.get('name', '')
+            entity_type = e.get('type', '')
+
+            if not entity_id:
+                continue
+
+            id_lookup[entity_id] = entity_id
+            id_lookup[entity_id.lower()] = entity_id
+
+            if entity_name:
+                id_lookup[entity_name] = entity_id
+                id_lookup[entity_name.lower()] = entity_id
+                snake_name = entity_name.lower().replace(' ', '_').replace('-', '_').replace(':', '_')
+                id_lookup[snake_name] = entity_id
+                short_snake = snake_name.replace('_a_', '_').replace('_an_', '_').replace('_the_', '_').replace('_your_', '_').replace('_my_', '_')
+                id_lookup[short_snake] = entity_id
+                type_name = f"{entity_type}:{snake_name}"
+                id_lookup[type_name] = entity_id
+                id_lookup[type_name.lower()] = entity_id
+                words = set(snake_name.split('_'))
+                name_to_id[snake_name] = (entity_id, words)
+
+        return id_lookup, name_to_id
+
+    @staticmethod
+    def resolve_entity_id(
+        ref: str,
+        id_lookup: Dict[str, str],
+        name_to_id: Dict[str, Tuple[str, set]]
+    ) -> Optional[str]:
+        """Resolve an entity reference to its actual ID.
+
+        Uses strict matching: direct ID, exact name, or snake_case.
+        Fuzzy matching requires high word overlap ratio to prevent
+        spurious connections to generic entities.
+        """
+        if not ref:
+            return None
+        if ref in id_lookup:
+            return id_lookup[ref]
+        ref_lower = ref.lower()
+        if ref_lower in id_lookup:
+            return id_lookup[ref_lower]
+        ref_snake = ref_lower.replace(' ', '_').replace('-', '_').replace(':', '_')
+        if ref_snake in id_lookup:
+            return id_lookup[ref_snake]
+
+        # Fuzzy matching: require high word overlap ratio
+        ref_words = set(w for w in ref_snake.split('_') if len(w) >= 3)
+        if not ref_words:
+            return None
+
+        best_match = None
+        best_score = 0
+
+        for name, (eid, name_words) in name_to_id.items():
+            if len(ref_snake) >= 10 and (ref_snake in name or name in ref_snake):
+                return eid
+
+            significant_name_words = set(w for w in name_words if len(w) >= 3)
+            if not significant_name_words:
+                continue
+            overlap = len(ref_words & significant_name_words)
+            min_words = min(len(ref_words), len(significant_name_words))
+            if overlap >= 2 and overlap > best_score and overlap >= min_words * 0.5:
+                best_score = overlap
+                best_match = eid
+
+        return best_match
+
     def extract(
         self,
         document: Document,
@@ -837,74 +937,8 @@ class RelationExtractor:
                     result = [result] if result else []
                 
                 # Build lookup tables from ALL entities (enables cross-source resolution)
-                # LLMs often use names instead of hex IDs, so we map both
-                id_lookup = {}
-                name_to_id = {}  # For fuzzy matching fallback
-                
-                for e in entities_for_lookup:
-                    entity_id = e.get('id', '')
-                    entity_name = e.get('name', '')
-                    entity_type = e.get('type', '')
-                    
-                    if not entity_id:
-                        continue
-                    
-                    # Direct ID match
-                    id_lookup[entity_id] = entity_id
-                    id_lookup[entity_id.lower()] = entity_id
-                    
-                    # Name-based lookups (what LLM often returns)
-                    if entity_name:
-                        # Exact name
-                        id_lookup[entity_name] = entity_id
-                        id_lookup[entity_name.lower()] = entity_id
-                        # snake_case version
-                        snake_name = entity_name.lower().replace(' ', '_').replace('-', '_').replace(':', '_')
-                        id_lookup[snake_name] = entity_id
-                        # Remove articles/filler words for matching
-                        short_snake = snake_name.replace('_a_', '_').replace('_an_', '_').replace('_the_', '_').replace('_your_', '_').replace('_my_', '_')
-                        id_lookup[short_snake] = entity_id
-                        # type:name format
-                        type_name = f"{entity_type}:{snake_name}"
-                        id_lookup[type_name] = entity_id
-                        id_lookup[type_name.lower()] = entity_id
-                        # Store for fuzzy matching with word sets
-                        words = set(snake_name.split('_'))
-                        name_to_id[snake_name] = (entity_id, words)
-                
-                def resolve_id(ref: str) -> Optional[str]:
-                    """Resolve an entity reference to its actual ID."""
-                    if not ref:
-                        return None
-                    # Direct lookup
-                    if ref in id_lookup:
-                        return id_lookup[ref]
-                    ref_lower = ref.lower()
-                    if ref_lower in id_lookup:
-                        return id_lookup[ref_lower]
-                    # Snake case the reference
-                    ref_snake = ref_lower.replace(' ', '_').replace('-', '_').replace(':', '_')
-                    if ref_snake in id_lookup:
-                        return id_lookup[ref_snake]
-                    
-                    # Fuzzy matching: substring or word overlap
-                    ref_words = set(ref_snake.split('_'))
-                    best_match = None
-                    best_score = 0
-                    
-                    for name, (eid, name_words) in name_to_id.items():
-                        # Substring match
-                        if ref_snake in name or name in ref_snake:
-                            return eid
-                        
-                        # Word overlap score
-                        overlap = len(ref_words & name_words)
-                        if overlap >= 2 and overlap > best_score:
-                            # At least 2 words must match
-                            best_score = overlap
-                            best_match = eid
-                    
-                    return best_match
+                id_lookup, name_to_id = RelationExtractor.build_entity_id_lookup(entities_for_lookup)
+                resolve_id = lambda ref: RelationExtractor.resolve_entity_id(ref, id_lookup, name_to_id)
                 
                 # Resolve relations to actual entity IDs
                 resolved = []
