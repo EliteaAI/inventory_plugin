@@ -148,6 +148,18 @@ AdvancedSearchParams = create_model(
     top_k=(Optional[int], Field(default=20, description="Maximum number of results")),
 )
 
+QueryPatternParams = create_model(
+    "QueryPatternParams",
+    pattern=(str, Field(description=(
+        "Cypher-like graph pattern. Syntax: (source)-[:relation*min..max]->(target)\n"
+        "Nodes: (?) = any, (?:class) = typed wildcard, (Name) = named, (Name:type) = named+typed\n"
+        "Relations: [:calls] = 1 hop, [:calls*1..3] = 1-3 hops, [:*1..3] = any type, [:] = any 1 hop\n"
+        "Direction: -> = forward, <- = backward\n"
+        "Examples: (UserService)-[:calls*1..3]->(?), (?:class)-[:extends]->(BaseModel), (Controller)<-[:calls*1..2]-(?)"
+    ))),
+    max_results=(Optional[int], Field(default=50, description="Maximum paths to return (hard cap: 100)")),
+)
+
 
 class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
     """
@@ -1452,6 +1464,92 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
         
         return output
     
+    def query_pattern(self, pattern: str, max_results: int = 50) -> str:
+        """
+        Execute a Cypher-like graph pattern query for multi-hop traversal.
+        
+        Finds paths matching the pattern through the knowledge graph.
+        Supports single-segment and multi-segment chain patterns.
+        
+        Args:
+            pattern: Cypher-like pattern. Single: "(A)-[:calls*1..3]->(B)"
+                     Chain: "(A)-[:rel1]->(B)-[:rel2]->(C)" (up to 4 segments)
+            max_results: Maximum paths to return (default 50, hard cap 100)
+        """
+        self._log_tool_event(f"Pattern query: {pattern}", "query_pattern")
+        
+        if max_results is None:
+            max_results = 50
+        
+        try:
+            results = self._knowledge_graph.query_pattern(pattern, max_results=max_results)
+        except ValueError as e:
+            return str(e)
+        
+        if not results:
+            return f"No paths found matching pattern: {pattern}"
+        
+        output = f"# Pattern: {pattern}\n"
+        output += f"Found {len(results)} path{'s' if len(results) != 1 else ''}\n\n"
+        
+        for i, result in enumerate(results, 1):
+            path = result['path']
+            edges = result['edges']
+            length = result['length']
+            
+            # Build connector-separated path string (direction-neutral to avoid misleading arrows)
+            parts = []
+            for j, node in enumerate(path):
+                parts.append(f"**{node['name']}** ({node['type']})")
+                if j < len(edges):
+                    parts.append(f"=[{edges[j]}]=")
+            
+            output += f"{i:2}. {' '.join(parts)} ({length} hop{'s' if length != 1 else ''})\n"
+        
+        effective_max = min(max_results, self._knowledge_graph.MAX_PATTERN_RESULTS)
+        if len(results) >= effective_max:
+            output += f"\n_Showing first {effective_max} results. Narrow your pattern for more specific results._\n"
+        
+        return output
+    
+    def get_pattern_vocabulary(self) -> str:
+        """Return graph vocabulary (entity types, relation types) for composing pattern queries.
+        
+        Call this before query_pattern when you don't know the exact entity types
+        or relation names in the graph.
+        """
+        self._log_tool_event("Getting pattern vocabulary", "get_pattern_vocabulary")
+        
+        vocab = self._knowledge_graph.get_pattern_vocabulary()
+        etypes = vocab['entity_types']
+        rtypes = vocab['relation_types']
+        examples = vocab['example_patterns']
+        
+        output = "# Graph Vocabulary for Pattern Queries\n\n"
+        
+        output += "## Entity Types\n"
+        for etype, count in etypes.items():
+            output += f"- **{etype}**: {count}\n"
+        
+        output += "\n## Relation Types\n"
+        for rtype, count in rtypes.items():
+            output += f"- **{rtype}**: {count}\n"
+        
+        if examples:
+            output += "\n## Example Patterns\n"
+            for ex in examples:
+                output += f"- `{ex}`\n"
+        
+        output += (
+            "\n## Syntax Reference\n"
+            "- `(Name)` = named entity, `(?:type)` = typed wildcard, `(?)` = any\n"
+            "- `[:relation]` = 1 hop, `[:relation*1..3]` = 1-3 hops\n"
+            "- `->` = forward, `<-` = backward\n"
+            "- Chain: `(A)-[:rel1]->(B)-[:rel2]->(C)` = different relation per hop (up to 4 segments)\n"
+        )
+        
+        return output
+    
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Return list of available retrieval tools."""
         return [
@@ -1496,6 +1594,27 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
                 "ref": self.advanced_search,
                 "description": "Advanced multi-criteria search. Combine text query with type/layer/file filters. Types: class,function,method. Layers: code,service,data,product,knowledge.",
                 "args_schema": AdvancedSearchParams,
+            },
+            {
+                "name": "get_pattern_vocabulary",
+                "ref": self.get_pattern_vocabulary,
+                "description": (
+                    "List all entity types and relation types in the graph with counts. "
+                    "Call BEFORE query_pattern when you don't know exact type or relation names. "
+                    "Returns vocabulary and example patterns for composing valid pattern queries."
+                ),
+            },
+            {
+                "name": "query_pattern",
+                "ref": self.query_pattern,
+                "description": (
+                    "Execute Cypher-like graph pattern query for MULTI-HOP traversal. "
+                    "Use when you need to trace dependency chains, call paths, or inheritance hierarchies across multiple steps. "
+                    "Syntax: (source)-[:relation*min..max]->(target). "
+                    "Nodes: (?) = any, (?:class) = typed, (Name) = named. "
+                    "Examples: (UserService)-[:calls*1..3]->(?), (?:class)-[:extends]->(BaseModel), (?)<-[:contains*1..2]-(?)."
+                ),
+                "args_schema": QueryPatternParams,
             },
             {
                 "name": "impact_analysis",

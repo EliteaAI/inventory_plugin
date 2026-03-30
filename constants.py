@@ -29,6 +29,16 @@ Use source toolkit code search tools ONLY when:
 - You need exact syntax not in the graph
 Do NOT use code search as your primary tool.
 
+### Rule 4: Use query_pattern for multi-hop tracing
+When tracing call chains, dependency paths, or inheritance hierarchies across multiple steps:
+1. If you don't know the graph's entity types or relation names, call `get_pattern_vocabulary` first
+2. Use query_pattern with Cypher-like syntax: `(Source)-[:calls*1..3]->(?)`
+3. Supports typed wildcards: `(?:class)`, named entities: `(UserService)`, both directions: `->` and `<-`
+4. Prefer query_pattern over repeated get_related_entities calls for multi-hop exploration
+5. Use CHAIN patterns when different relation types are needed per hop:
+   `(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)` traces feature→requirement→class
+6. Chain patterns avoid multiple separate queries — combine when the path crosses different relation types
+
 ## Tool Usage
 
 **search_knowledge_graph(query)** - Find entities by name/token matching
@@ -50,6 +60,18 @@ Do NOT use code search as your primary tool.
 - Filter by type: `type:class`, `type:function`
 - Find related: `related:"Entity (type)"`
 
+**query_pattern(pattern)** - Multi-hop traversal (single or chain)
+- Trace call chains: `(Service)-[:calls*1..3]->(?)`
+- Find inheritance: `(?:class)-[:extends]->(Base)`
+- Reverse lookup: `(Target)<-[:calls*1..2]-(?)`
+- Chain patterns: `(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)` (up to 4 segments)
+- If unsure about types/relations, call get_pattern_vocabulary first
+- Use chains instead of multiple queries when each hop needs a different relation type
+
+**get_pattern_vocabulary()** - Discover graph schema
+- Lists entity types and relation types with counts
+- Call before query_pattern if you don't know the vocabulary
+
 ## Example Workflow for "how does authentication work?"
 
 CORRECT:
@@ -58,6 +80,26 @@ CORRECT:
 3. get_related_entities("login (method)") → shows what login calls, its implementation
 4. Answer from relationships
 5. Code search only if more detail needed
+
+## Example Workflow for "trace the call chain from Controller to Database"
+
+CORRECT:
+1. get_pattern_vocabulary() → learn types: class, function... relations: calls, imports, contains...
+2. query_pattern("(Controller)-[:calls*1..4]->(?:class)") → get multi-hop call paths
+3. Answer from structured paths
+
+## Example Workflow for "which requirements trace through features to code?"
+
+CORRECT (use chain pattern — different relation per hop):
+1. get_pattern_vocabulary() → learn types and relations
+2. query_pattern("(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)") → chain: feature→requirement→code
+3. Answer from stitched paths
+
+## When to use CHAIN patterns vs SINGLE-segment:
+- **Single**: Same relation type across hops → `(A)-[:calls*1..4]->(B)` (one relation, multiple hops)
+- **Chain**: Different relation types per hop → `(A)-[:rel1]->(B)-[:rel2]->(C)` (each hop has its own relation)
+- **Chain**: Mixed entity types along the path → trace from docs to code via intermediaries
+- **Avoid chains** when a single multi-hop pattern suffices — chains are slower due to per-segment execution
 
 ## Current Settings
 {filters}"""
@@ -127,6 +169,44 @@ EXAMPLES:
     "Uses embedding similarity — finds related entities even without shared keywords. "
     "Parameters: 'query' (required), 'top_k' (optional, default 10). "
     "Use search_knowledge_graph for exact name/type lookups; use semantic_search for concept-level exploration.",
+
+    "query_pattern": """MULTI-HOP graph traversal with Cypher-like pattern syntax. Supports single-segment and multi-segment CHAIN patterns.
+
+SINGLE-SEGMENT SYNTAX: (source)-[:relation*min..max]->(target)
+CHAIN SYNTAX: (A)-[:rel1]->(B)-[:rel2]->(C)  (up to 4 segments)
+
+NODES:
+  (?)           - Any entity (wildcard)
+  (?:class)     - Any entity of type 'class'
+  (UserService) - Entity named 'UserService'
+  (User:class)  - Entity 'User' of type 'class'
+
+RELATIONS:
+  [:calls]       - Exactly 1 hop of type 'calls'
+  [:calls*1..3]  - 1 to 3 hops of type 'calls'
+  [:*1..3]       - 1 to 3 hops of any relation type
+  [:]            - 1 hop of any type
+
+DIRECTION (per segment):
+  ->  Forward (outgoing edges)
+  <-  Backward (incoming edges)
+
+SINGLE-SEGMENT EXAMPLES:
+  (UserService)-[:calls*1..3]->(?)             - What does UserService call within 3 hops?
+  (?:class)-[:extends]->(BaseModel)            - What classes extend BaseModel?
+  (Controller)<-[:calls*1..3]-(?)              - What calls Controller (up to 3 levels)?
+
+CHAIN EXAMPLES (different relation per hop):
+  (?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)  - Trace feature → requirement → code
+  (?:user_story)-[:related_to]->(?:feature)-[:related_to]->(?:class)   - Trace user story → feature → code
+  (Controller)-[:calls]->(?:class)-[:extends]->(BaseService)           - Controller calls what extends BaseService?
+
+WHEN TO USE CHAINS vs SINGLE:
+  Single: same relation type across hops → (A)-[:calls*1..4]->(B)
+  Chain:  different relation types per hop → (A)-[:rel1]->(B)-[:rel2]->(C)
+  Chain:  tracing across mixed entity domains (docs → code)""",
+
+    "get_pattern_vocabulary": "List all entity types and relation types in the graph with counts. Call BEFORE query_pattern when you don't know exact type or relation names. Returns vocabulary and example patterns you can use.",
 }
 
 # Read-only tool patterns for filtering source toolkit tools

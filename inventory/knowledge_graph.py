@@ -1949,6 +1949,614 @@ class KnowledgeGraph:
 
         return ' '.join(parts).strip()
 
+    # ========== Pattern Query Engine ==========
+    
+    MAX_PATTERN_HOPS = 5
+    MAX_PATTERN_RESULTS = 100
+    
+    # Synonym map: common LLM-generated names → canonical graph relation types (lowercase)
+    # Based on actual graph schema: contains, related_to, calls, implements, extends, imports, decorates
+    # All values are lowercase because edge matching uses .lower() comparison
+    RELATION_SYNONYMS = {
+        # → contains
+        'contain': 'contains', 'has': 'contains', 'includes': 'contains',
+        'include': 'contains', 'owns': 'contains', 'parent': 'contains',
+        'has_child': 'contains', 'defines': 'contains',
+        # → related_to (the primary doc↔code and doc↔doc connector)
+        'related': 'related_to', 'relates': 'related_to',
+        'references': 'related_to', 'reference': 'related_to', 'refers_to': 'related_to',
+        'associated': 'related_to', 'associated_with': 'related_to',
+        'linked': 'related_to', 'linked_to': 'related_to',
+        'describes': 'related_to', 'documents': 'related_to',
+        'mentions': 'related_to', 'about': 'related_to',
+        # → calls
+        'invoke': 'calls', 'invokes': 'calls', 'call': 'calls',
+        'triggers': 'calls', 'trigger': 'calls', 'uses': 'calls',
+        # → implements
+        'implement': 'implements', 'realizes': 'implements', 'fulfills': 'implements',
+        'satisfies': 'implements',
+        # → extends
+        'inherit': 'extends', 'inherits': 'extends', 'inheritance': 'extends',
+        'extend': 'extends', 'derives': 'extends', 'subclass': 'extends',
+        # → imports
+        'require': 'imports', 'requires': 'imports', 'import': 'imports',
+        'depends': 'imports', 'depends_on': 'imports', 'dependency': 'imports',
+        # → decorates
+        'decorate': 'decorates', 'wraps': 'decorates', 'annotates': 'decorates',
+    }
+    
+    PATTERN_SYNTAX_HELP = (
+        "Pattern syntax:\n"
+        "  Single:  (source)-[:relation*min..max]->(target)\n"
+        "  Chain:   (A)-[:rel1]->(B)-[:rel2]->(C)  (up to 4 segments)\n"
+        "  Nodes:   (?) = any, (?:class) = typed wildcard, (Name) = named, (Name:type) = named+typed\n"
+        "  Rels:    [:calls] = 1 hop, [:calls*1..3] = 1-3 hops, [:*1..3] = any type, [:]= any 1 hop\n"
+        "  Dir:     -> = forward, <- = backward (per segment)\n"
+        "  Examples:\n"
+        "    (UserService)-[:calls*1..3]->(?)\n"
+        "    (?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)\n"
+        "    (?:user_story)-[:related_to]->(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)"
+    )
+    
+    MAX_CHAIN_SEGMENTS = 4
+    
+    @staticmethod
+    def _parse_node_spec(spec: str) -> Dict[str, Any]:
+        """Parse node specifier from pattern syntax.
+        
+        Formats:
+            ?             -> wildcard (any node)
+            ?:class       -> typed wildcard (any node of type 'class')
+            ?:class,func  -> multi-typed wildcard
+            Name          -> named node (case-insensitive)
+            Name:class    -> named node with type constraint
+        """
+        spec = spec.strip()
+        if not spec or spec == '?':
+            return {'name': None, 'types': None}
+        
+        if spec.startswith('?:'):
+            types_str = spec[2:]
+            types = [t.strip().lower() for t in types_str.split(',') if t.strip()]
+            return {'name': None, 'types': types or None}
+        
+        if ':' in spec:
+            name, types_str = spec.split(':', 1)
+            types = [t.strip().lower() for t in types_str.split(',') if t.strip()]
+            return {'name': name.strip() or None, 'types': types or None}
+        
+        return {'name': spec, 'types': None}
+    
+    def _parse_pattern(self, pattern: str) -> List[Dict[str, Any]]:
+        """Parse graph pattern query string into a list of segment dicts.
+        
+        Supports both single-segment and multi-segment (chain) patterns:
+            Single:  (source)-[:rel*min..max]->(target)
+            Chain:   (A)-[:rel1]->(B)-[:rel2]->(C)-[:rel3]->(D)
+        
+        Each segment in the chain can have its own relation types, hop range,
+        and direction. Up to MAX_CHAIN_SEGMENTS segments allowed.
+        
+        Returns:
+            List of segment dicts, each with keys:
+                source, target, rel_types, min_hops, max_hops, direction
+        """
+        import re
+        
+        pattern = pattern.strip()
+        
+        # Regex for one segment: (node)<arrow+relation>(next_node)
+        # We tokenize segments by finding all (node)-[:rel]->(node) blocks,
+        # where intermediate nodes are shared between adjacent segments.
+        segment_re = re.compile(
+            r'\(([^)]*)\)\s*'            # (source)
+            r'(<?\-\[:([^\]]*)\]\-?>?)'  # arrow + relation block
+            r'\s*\(([^)]*)\)'            # (target)
+        )
+        
+        # Find all segments by scanning for overlapping (target)(next_source) boundaries
+        # Strategy: split the full pattern into segments at )( boundaries that follow an arrow
+        segments = []
+        remaining = pattern
+        
+        while remaining:
+            m = segment_re.match(remaining)
+            if not m:
+                if segments:
+                    raise ValueError(
+                        f"Invalid pattern continuation: ...{remaining[:40]}\n"
+                        f"{self.PATTERN_SYNTAX_HELP}"
+                    )
+                raise ValueError(
+                    f"Invalid pattern: {pattern}\n{self.PATTERN_SYNTAX_HELP}"
+                )
+            
+            seg = self._parse_single_segment(
+                m.group(1), m.group(2), m.group(3), m.group(4)
+            )
+            segments.append(seg)
+            
+            # Advance past the matched segment
+            remaining = remaining[m.end():].strip()
+            
+            if remaining:
+                # Next segment must start with the arrow: -[:...]-> or <-[:...]-
+                # But the source node is the previous target, so we expect -[:...]->(...) 
+                # Prepend the previous target as the new source
+                prev_target = m.group(4)
+                remaining = f"({prev_target}){remaining}"
+        
+        if not segments:
+            raise ValueError(
+                f"Invalid pattern: {pattern}\n{self.PATTERN_SYNTAX_HELP}"
+            )
+        
+        if len(segments) > self.MAX_CHAIN_SEGMENTS:
+            raise ValueError(
+                f"Pattern has {len(segments)} segments, maximum is "
+                f"{self.MAX_CHAIN_SEGMENTS}. Simplify the pattern."
+            )
+        
+        return segments
+    
+    def _parse_single_segment(
+        self,
+        source_str: str,
+        arrow_block: str,
+        rel_spec_str: str,
+        target_str: str,
+    ) -> Dict[str, Any]:
+        """Parse a single pattern segment into a structured query dict."""
+        # Determine direction from arrow
+        if arrow_block.startswith('<-') and arrow_block.endswith('-'):
+            direction = 'backward'
+        elif arrow_block.endswith('->'):
+            direction = 'forward'
+        else:
+            raise ValueError(
+                f"Ambiguous arrow in pattern: {arrow_block}\n"
+                "Use -> for forward or <- for backward.\n"
+                f"{self.PATTERN_SYNTAX_HELP}"
+            )
+        
+        # Parse relation spec: "calls,imports*2..4" or "calls" or "*1..3" or "" or "calls*2"
+        rel_types = None
+        min_hops = 1
+        max_hops = 1
+        
+        if '*' in rel_spec_str:
+            parts = rel_spec_str.split('*', 1)
+            types_part = parts[0].strip()
+            hops_part = parts[1].strip()
+            
+            if types_part:
+                rel_types = [t.strip().lower() for t in types_part.split(',') if t.strip()]
+            
+            if '..' in hops_part:
+                lo, hi = hops_part.split('..', 1)
+                try:
+                    min_hops = int(lo)
+                    max_hops = int(hi)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"Invalid hop specification '{hops_part}' in relation segment "
+                        f"'{rel_spec_str}'.\n{self.PATTERN_SYNTAX_HELP}"
+                    )
+            else:
+                try:
+                    min_hops = max_hops = int(hops_part)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"Invalid hop specification '{hops_part}' in relation segment "
+                        f"'{rel_spec_str}'.\n{self.PATTERN_SYNTAX_HELP}"
+                    )
+        elif rel_spec_str.strip():
+            rel_types = [t.strip().lower() for t in rel_spec_str.split(',') if t.strip()]
+        
+        # Normalize relation type synonyms (e.g., 'inherit' → 'extends')
+        if rel_types:
+            rel_types = [self.RELATION_SYNONYMS.get(rt, rt) for rt in rel_types]
+        
+        # Validate hop range
+        if min_hops < 1:
+            raise ValueError(f"Minimum hops must be >= 1, got {min_hops}")
+        if max_hops > self.MAX_PATTERN_HOPS:
+            raise ValueError(f"Maximum hops must be <= {self.MAX_PATTERN_HOPS}, got {max_hops}")
+        if min_hops > max_hops:
+            raise ValueError(f"min_hops ({min_hops}) > max_hops ({max_hops})")
+        
+        return {
+            'source': self._parse_node_spec(source_str),
+            'target': self._parse_node_spec(target_str),
+            'rel_types': rel_types,
+            'min_hops': min_hops,
+            'max_hops': max_hops,
+            'direction': direction,
+        }
+    
+    def _resolve_pattern_nodes(self, spec: Dict[str, Any]) -> Optional[Set[str]]:
+        """Resolve a node specifier to a set of node IDs.
+        
+        Returns None for full wildcard (any node) to avoid materializing huge sets.
+        """
+        name = spec.get('name')
+        types = spec.get('types')
+        
+        if name is None and types is None:
+            return None  # Full wildcard — caller handles iteration
+        
+        if name is not None:
+            # Named node lookup
+            node_ids = set(self._entity_index.get(name.lower(), set()))
+            if not node_ids:
+                # Fuzzy fallback
+                results = self.search(name, top_k=5)
+                node_ids = {r['entity']['id'] for r in results if 'entity' in r and 'id' in r['entity']}
+            # Filter by types if specified
+            if types and node_ids:
+                node_ids = {
+                    nid for nid in node_ids
+                    if self._graph.nodes[nid].get('type', '').lower() in types
+                }
+            return node_ids
+        
+        # Typed wildcard: union of type indices
+        node_ids = set()
+        for t in types:
+            node_ids.update(self._type_index.get(t, set()))
+            # Also check layer mapping
+            if t in self.LAYER_TYPE_MAPPING:
+                for lt in self.LAYER_TYPE_MAPPING[t]:
+                    node_ids.update(self._type_index.get(lt, set()))
+        return node_ids
+    
+    def _execute_pattern(
+        self,
+        parsed: Dict[str, Any],
+        max_results: int,
+        source_node_override: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Execute a parsed pattern query via BFS.
+        
+        Strategy: BFS from the anchored (smaller resolved set) side, checking
+        target constraints at each step once min_hops is reached.
+        
+        Args:
+            source_node_override: If provided, uses these node IDs as the source
+                instead of resolving from parsed['source']. Used by chain execution.
+        """
+        if source_node_override is not None:
+            source_nodes = source_node_override
+        else:
+            source_nodes = self._resolve_pattern_nodes(parsed['source'])
+        target_nodes = self._resolve_pattern_nodes(parsed['target'])
+        direction = parsed['direction']
+        rel_types = parsed.get('rel_types')
+        min_hops = parsed['min_hops']
+        max_hops = parsed['max_hops']
+        
+        # Decide BFS start side
+        # For forward queries: BFS from source using out_edges
+        # For backward queries: BFS from source using in_edges
+        # When one side is wildcard and the other is anchored, flip to BFS from the anchored side
+        if direction == 'forward':
+            start_nodes = source_nodes
+            end_nodes = target_nodes
+            get_edges = self._graph.out_edges
+            neighbor_idx = 1  # target is at index 1 in (src, tgt, data)
+        else:  # backward
+            start_nodes = source_nodes
+            end_nodes = target_nodes
+            get_edges = self._graph.in_edges
+            neighbor_idx = 0  # source is at index 0 in (src, tgt, data)
+        
+        # If start is wildcard but end is not, flip: BFS from end with reversed edges
+        flipped = False
+        if start_nodes is None and end_nodes is not None:
+            start_nodes, end_nodes = end_nodes, start_nodes
+            flipped = True
+            if direction == 'forward':
+                get_edges = self._graph.in_edges
+                neighbor_idx = 0
+            else:
+                get_edges = self._graph.out_edges
+                neighbor_idx = 1
+        
+        # If both wildcard — iterate all edges matching rel_types as seeds
+        if start_nodes is None:
+            start_nodes = self._seed_from_edges(rel_types, neighbor_idx)
+        
+        rel_types_set = set(rel_types) if rel_types else None
+        end_nodes_set = end_nodes  # None means any node is valid endpoint
+        
+        results = []
+        
+        # BFS: each item is (current_node, path_of_node_ids, edge_types_along_path)
+        from collections import deque
+        queue = deque((nid, [nid], []) for nid in start_nodes)
+        
+        while queue and len(results) < max_results:
+            current, path, edges = queue.popleft()
+            depth = len(edges)
+            
+            # If at or past min_hops, check if current matches target
+            if depth >= min_hops:
+                if self._node_matches_spec(current, end_nodes_set):
+                    # Reverse path/edges when flipped so output matches pattern order
+                    if flipped:
+                        results.append(self._format_path_result(
+                            path[::-1], edges[::-1]))
+                    else:
+                        results.append(self._format_path_result(path, edges))
+                    if len(results) >= max_results:
+                        break
+            
+            # If at max depth, don't expand further
+            if depth >= max_hops:
+                continue
+            
+            # Expand neighbors
+            for edge_tuple in get_edges(current, data=True):
+                neighbor = edge_tuple[neighbor_idx]
+                edge_data = edge_tuple[2]
+                edge_rel = edge_data.get('relation_type', '').lower()
+                
+                # Filter by relation type
+                if rel_types_set and edge_rel not in rel_types_set:
+                    continue
+                
+                # Avoid cycles within a single path
+                if neighbor in path:
+                    continue
+                
+                queue.append((neighbor, path + [neighbor], edges + [edge_rel]))
+        
+        return results
+    
+    def _seed_from_edges(
+        self,
+        rel_types: Optional[List[str]],
+        neighbor_idx: int,
+    ) -> Set[str]:
+        """For dual-wildcard queries, collect unique start nodes from matching edges.
+        
+        Seeds from the correct edge endpoint based on BFS direction:
+        - neighbor_idx=1 (forward/out_edges): seed from u (source), BFS follows outgoing
+        - neighbor_idx=0 (backward/in_edges): seed from v (target), BFS follows incoming
+        """
+        rel_set = set(rel_types) if rel_types else None
+        # Seed from the opposite end of where BFS will traverse toward
+        seed_idx = 0 if neighbor_idx == 1 else 1
+        seeds = set()
+        for u, v, data in self._graph.edges(data=True):
+            edge_rel = data.get('relation_type', '').lower()
+            if rel_set and edge_rel not in rel_set:
+                continue
+            seeds.add((u, v)[seed_idx])
+            if len(seeds) >= 500:  # Cap seeds for dual-wildcard performance
+                break
+        return seeds
+    
+    def _node_matches_spec(
+        self,
+        node_id: str,
+        resolved_set: Optional[Set[str]],
+    ) -> bool:
+        """Check if a node matches target specification (resolved set or wildcard)."""
+        if resolved_set is None:
+            return True  # Wildcard — any node matches
+        return node_id in resolved_set
+    
+    def _format_path_result(
+        self,
+        path: List[str],
+        edges: List[str],
+    ) -> Dict[str, Any]:
+        """Format a path result into a compact dict."""
+        path_entities = []
+        for nid in path:
+            data = self._graph.nodes.get(nid, {})
+            path_entities.append({
+                'id': nid,
+                'name': data.get('name', nid),
+                'type': data.get('type', ''),
+            })
+        return {
+            'path': path_entities,
+            'edges': edges,
+            'length': len(edges),
+        }
+    
+    def query_pattern(
+        self,
+        pattern: str,
+        max_results: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Execute a Cypher-like graph pattern query.
+        
+        Finds paths matching the pattern with multi-hop traversal and
+        relation type filtering. Supports both single-segment and
+        multi-segment chain patterns.
+        
+        Args:
+            pattern: Cypher-like pattern string.
+            
+                Single segment:
+                    (source)-[:relation*min..max]->(target)
+                
+                Multi-segment chain (each segment can have its own relation/hops):
+                    (A)-[:rel1]->(B)-[:rel2]->(C)
+                    (A)-[:rel1*1..2]->(B)-[:rel2]->(C)-[:rel3*1..3]->(D)
+                
+                Node specifiers:
+                    (?)             - any node (wildcard)
+                    (?:class)       - any node of type 'class'
+                    (?:class,func)  - any node of type 'class' or 'func'
+                    (UserService)   - node named 'UserService'
+                    (UserService:class) - named node with type filter
+                
+                Relation specifiers:
+                    [:calls]        - exactly 1 hop, edge type 'calls'
+                    [:calls*1..3]   - 1-3 hops, all edges 'calls'
+                    [:*1..3]        - 1-3 hops, any edge type
+                    [:]             - 1 hop, any edge type
+                
+                Direction (per segment):
+                    ->              - forward (outgoing edges)
+                    <-              - backward (incoming edges)
+            
+            max_results: Maximum paths to return (default 100, hard cap).
+            
+        Returns:
+            List of path results, each containing:
+                path: List of {id, name, type} for each node
+                edges: List of relation types along the path
+                length: Number of hops
+                
+        Raises:
+            ValueError: If pattern syntax is invalid or hop limit exceeded.
+            
+        Examples:
+            # Single segment
+            query_pattern("(UserService)-[:calls*1..3]->(?)")
+            query_pattern("(?:class)-[:extends]->(BaseModel)")
+            query_pattern("(Controller)<-[:calls*1..2]-(?)")
+            
+            # Multi-segment chain — per-hop relation control
+            query_pattern("(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)")
+            query_pattern("(?:user_story)-[:related_to]->(?:feature)-[:related_to]->(?:class)")
+            query_pattern("(Controller)-[:calls]->(?:class)-[:extends]->(BaseService)")
+            query_pattern("(?:user_story)-[:related_to]->(?:feature)-[:implements]->(?:requirement)")
+        """
+        max_results = min(max_results, self.MAX_PATTERN_RESULTS)
+        segments = self._parse_pattern(pattern)
+        
+        if len(segments) == 1:
+            return self._execute_pattern(segments[0], max_results)
+        
+        return self._execute_chain(segments, max_results)
+    
+    def _execute_chain(
+        self,
+        segments: List[Dict[str, Any]],
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        """Execute a multi-segment chain pattern.
+        
+        Runs each segment sequentially, feeding the endpoint node IDs
+        from one segment as the start nodes of the next, then stitches
+        the partial paths together.
+        """
+        MAX_ENDPOINT_CAP = 50  # Limit endpoints fed into next segment
+        
+        # -- Segment 1 --------------------------------------------------
+        seg1_results = self._execute_pattern(segments[0], max_results * 5)
+        if not seg1_results:
+            return []
+        
+        # For segments 2..N, iteratively extend the partial paths
+        partial_paths = seg1_results  # each is {path, edges, length}
+        
+        for seg in segments[1:]:
+            # Collect endpoint node IDs from current partial results
+            endpoint_ids: Set[str] = set()
+            for p in partial_paths:
+                last_entity = p['path'][-1]
+                endpoint_ids.add(last_entity['id'])
+                if len(endpoint_ids) >= MAX_ENDPOINT_CAP:
+                    break
+            
+            if not endpoint_ids:
+                return []
+            
+            # Short-circuit: if target is a named/typed spec that resolves to
+            # nothing, skip the BFS entirely
+            target_nodes = self._resolve_pattern_nodes(seg['target'])
+            if target_nodes is not None and not target_nodes:
+                return []
+            
+            # Run BFS for this segment from each endpoint
+            seg_results_by_start: Dict[str, List[Dict]] = {}
+            for start_id in endpoint_ids:
+                per_node = self._execute_pattern(
+                    seg, max_results * 3,
+                    source_node_override={start_id},
+                )
+                if per_node:
+                    seg_results_by_start[start_id] = per_node
+            
+            if not seg_results_by_start:
+                return []
+            
+            # Stitch: for each partial path, find continuations from its endpoint
+            next_partial: List[Dict[str, Any]] = []
+            for pp in partial_paths:
+                endpoint_id = pp['path'][-1]['id']
+                continuations = seg_results_by_start.get(endpoint_id, [])
+                for cont in continuations:
+                    # cont['path'][0] is the same node as pp['path'][-1] — skip duplicate
+                    stitched_path = pp['path'] + cont['path'][1:]
+                    stitched_edges = pp['edges'] + cont['edges']
+                    next_partial.append({
+                        'path': stitched_path,
+                        'edges': stitched_edges,
+                        'length': len(stitched_edges),
+                    })
+                    if len(next_partial) >= max_results:
+                        break
+                if len(next_partial) >= max_results:
+                    break
+            
+            partial_paths = next_partial
+            if not partial_paths:
+                return []
+        
+        return partial_paths[:max_results]
+    
+    def get_pattern_vocabulary(self) -> Dict[str, Any]:
+        """Return graph vocabulary for pattern query composition.
+        
+        Provides entity types and relation types with counts so an LLM or user
+        can compose valid query_pattern calls without prior knowledge of the
+        graph's schema.
+        
+        Returns dict with:
+            entity_types: {type: count} sorted by count descending
+            relation_types: {type: count} sorted by count descending
+            example_patterns: auto-generated examples from actual graph content
+        """
+        stats = self.get_stats()
+        entity_types = stats.get('entity_types', {})
+        relation_types = stats.get('relation_types', {})
+        
+        # Sort by count descending
+        sorted_etypes = dict(sorted(entity_types.items(), key=lambda x: -x[1]))
+        sorted_rtypes = dict(sorted(relation_types.items(), key=lambda x: -x[1]))
+        
+        # Auto-generate example patterns from actual graph content
+        examples = []
+        top_rtypes = list(sorted_rtypes.keys())[:3]
+        top_etypes = list(sorted_etypes.keys())[:3]
+        
+        if top_rtypes and top_etypes:
+            rt = top_rtypes[0]
+            et = top_etypes[0]
+            examples.append(f"(?:{et})-[:{rt}*1..2]->(?)")
+        if len(top_rtypes) > 1 and top_etypes:
+            rt = top_rtypes[1]
+            et = top_etypes[0]
+            examples.append(f"(?:{et})-[:{rt}]->(?)")
+        if len(top_etypes) > 1 and top_rtypes:
+            rt = top_rtypes[0]
+            et1, et2 = top_etypes[0], top_etypes[1]
+            examples.append(f"(?:{et1})-[:{rt}*1..3]->(?:{et2})")
+        
+        return {
+            'entity_types': sorted_etypes,
+            'relation_types': sorted_rtypes,
+            'example_patterns': examples,
+        }
+    
     # ========== Citation Helpers ==========
     
     def get_citation(self, entity_id: str) -> Optional[Citation]:

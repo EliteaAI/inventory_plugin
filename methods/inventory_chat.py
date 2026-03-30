@@ -1640,6 +1640,92 @@ class Method:
             description=TOOL_DESCRIPTIONS.get("query_graph", "Query the knowledge graph with structured filters. No similarity search - exact type/layer/file filtering. Input JSON: {\"types\": [\"class\", \"function\"], \"layers\": [\"code\"], \"files\": [\"*.py\"], \"name\": \"User\", \"related_to\": \"EntityName (type)\", \"relation_types\": [\"calls\", \"imports\"], \"direction\": \"out\", \"limit\": 30}"),
         ))
 
+        # 4b. Pattern Query Tool - Cypher-like multi-hop traversal
+        def query_pattern(pattern_input: str) -> str:
+            """Execute a Cypher-like pattern query for multi-hop graph traversal."""
+            try:
+                pattern = pattern_input.strip()
+                if not pattern:
+                    return wrapper._knowledge_graph.PATTERN_SYNTAX_HELP
+                
+                results = wrapper._knowledge_graph.query_pattern(pattern, max_results=50)
+                
+                if not results:
+                    return f"No paths found matching pattern: {pattern}"
+                
+                output = f"# Pattern: {pattern}\nFound {len(results)} path{'s' if len(results) != 1 else ''}\n\n"
+                
+                for i, result in enumerate(results, 1):
+                    path = result['path']
+                    edges = result['edges']
+                    length = result['length']
+                    
+                    parts = []
+                    for j, node in enumerate(path):
+                        parts.append(f"**{node['name']}** ({node['type']})")
+                        if j < len(edges):
+                            parts.append(f"=[{edges[j]}]=")
+                    
+                    output += f"{i:2}. {' '.join(parts)} ({length} hop{'s' if length != 1 else ''})\n"
+                
+                if len(results) >= 50:
+                    output += "\n_Showing first 50 results. Narrow your pattern for more specific results._\n"
+                
+                return output
+            
+            except ValueError as e:
+                return str(e)
+            except Exception as ex:
+                log.exception(f"[query_pattern] Error: {ex}")
+                return f"Error executing pattern query: {ex}"
+
+        tools.append(Tool(
+            name="query_pattern",
+            func=query_pattern,
+            description=TOOL_DESCRIPTIONS.get("query_pattern", (
+                "Execute Cypher-like graph pattern query for MULTI-HOP traversal. "
+                "Supports single-segment and multi-segment CHAIN patterns. "
+                "Single: (source)-[:relation*min..max]->(target). "
+                "Chain: (A)-[:rel1]->(B)-[:rel2]->(C) (up to 4 segments). "
+                "Examples: (UserService)-[:calls*1..3]->(?), "
+                "(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)"
+            )),
+        ))
+
+        # 4c. Pattern Vocabulary Tool - discover graph schema for composing patterns
+        def get_pattern_vocabulary(tool_input: str = "") -> str:
+            """List entity types and relation types so you can compose valid query_pattern calls."""
+            try:
+                vocab = wrapper._knowledge_graph.get_pattern_vocabulary()
+                etypes = vocab['entity_types']
+                rtypes = vocab['relation_types']
+                examples = vocab['example_patterns']
+                
+                output = "# Graph Vocabulary for Pattern Queries\n\n"
+                output += "## Entity Types\n"
+                for etype, count in etypes.items():
+                    output += f"- **{etype}**: {count}\n"
+                output += "\n## Relation Types\n"
+                for rtype, count in rtypes.items():
+                    output += f"- **{rtype}**: {count}\n"
+                if examples:
+                    output += "\n## Example Patterns\n"
+                    for ex in examples:
+                        output += f"- `{ex}`\n"
+                return output
+            except Exception as ex:
+                log.exception(f"[get_pattern_vocabulary] Error: {ex}")
+                return f"Error getting vocabulary: {ex}"
+
+        tools.append(Tool(
+            name="get_pattern_vocabulary",
+            func=get_pattern_vocabulary,
+            description=TOOL_DESCRIPTIONS.get("get_pattern_vocabulary", (
+                "List all entity types and relation types in the graph with counts. "
+                "Call BEFORE query_pattern when you don't know exact type or relation names."
+            )),
+        ))
+
         # 5. List Entity Types Tool
         def list_entity_types(tool_input: str = "") -> str:
             """List all entity types in the knowledge graph."""
