@@ -104,6 +104,128 @@ CORRECT (use chain pattern — different relation per hop):
 ## Current Settings
 {filters}"""
 
+
+# =============================================================================
+# MODULAR PROMPT SECTIONS — used by PromptBuilder for strategy-specific prompts
+# The monolithic INVENTORY_CHAT_SYSTEM_PROMPT above is kept as-is for backward
+# compatibility and is used directly by the hybrid (all-tools) strategy.
+# =============================================================================
+
+# Base role description — always included in every strategy prompt
+PROMPT_BASE = (
+    "You are an assistant that explores a KNOWLEDGE GRAPH containing "
+    "pre-extracted code entities and their relationships."
+)
+
+# Named rules — PromptBuilder picks only the rules relevant to each strategy
+PROMPT_RULES = {
+    "always_relate": (
+        "ALWAYS use get_related_entities after search_knowledge_graph\n"
+        "When you find an entity, you MUST call get_related_entities on it to understand how it works.\n"
+        "The relationships (CALLS, CONTAINS, IMPLEMENTS, EXTENDS) reveal the actual behavior."
+    ),
+    "graph_before_code": (
+        "Graph tools BEFORE code search\n"
+        "Priority order:\n"
+        "1. search_knowledge_graph → find entities\n"
+        "2. get_related_entities → explore connections (REQUIRED STEP)\n"
+        "3. query_graph → filter by type/layer\n"
+        "4. Source toolkit tools (search_code, search_index) → ONLY if graph tools fail"
+    ),
+    "code_last_resort": (
+        "Code search is a LAST RESORT\n"
+        "Use source toolkit code search tools ONLY when:\n"
+        "- Graph search returns nothing relevant\n"
+        "- You need exact syntax not in the graph\n"
+        "Do NOT use code search as your primary tool."
+    ),
+    "use_patterns": (
+        "Use query_pattern for multi-hop tracing\n"
+        "When tracing call chains, dependency paths, or inheritance hierarchies across multiple steps:\n"
+        "1. If you don't know the graph's entity types or relation names, call `get_pattern_vocabulary` first\n"
+        "2. Use query_pattern with Cypher-like syntax: `(Source)-[:calls*1..3]->(?)`\n"
+        "3. Supports typed wildcards: `(?:class)`, named entities: `(UserService)`, both directions: `->` and `<-`\n"
+        "4. Prefer query_pattern over repeated get_related_entities calls for multi-hop exploration\n"
+        "5. Use CHAIN patterns when different relation types are needed per hop:\n"
+        "   `(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)` traces feature→requirement→class\n"
+        "6. Chain patterns avoid multiple separate queries — combine when the path crosses different relation types"
+    ),
+}
+
+# Per-strategy focus statements — sets the tone for a focused prompt
+STRATEGY_INTROS = {
+    "entity_lookup": (
+        "Focus on identifying and understanding specific entities. "
+        "Use search_knowledge_graph to find the entity, then get_related_entities "
+        "to understand its connections and behavior."
+    ),
+    "search": (
+        "Focus on finding entities matching the user's criteria. "
+        "Use search tools to discover relevant entities, then explore their connections if needed."
+    ),
+    "traversal": (
+        "Focus on exploring relationships, call chains, dependency paths, and impact analysis "
+        "across the knowledge graph. Use pattern-based traversal for multi-hop exploration."
+    ),
+    "overview": (
+        "Focus on providing high-level information about the graph's contents, "
+        "entity types, counts, and architecture."
+    ),
+}
+
+# Which rules apply to each strategy (order matters — they appear in this order)
+STRATEGY_RULE_KEYS = {
+    "entity_lookup": ["always_relate"],
+    "search": ["graph_before_code", "code_last_resort"],
+    "traversal": ["use_patterns", "always_relate"],
+    "overview": [],
+}
+
+# Per-strategy example workflows
+STRATEGY_WORKFLOWS = {
+    "entity_lookup": (
+        '## Example Workflow for "how does authentication work?"\n\n'
+        "CORRECT:\n"
+        '1. search_knowledge_graph("authentication") → finds AuthService, login, etc.\n'
+        '2. get_related_entities("AuthService (class)") → shows login(), validate(), dependencies\n'
+        '3. get_related_entities("login (method)") → shows what login calls, its implementation\n'
+        "4. Answer from relationships\n"
+        "5. Code search only if more detail needed"
+    ),
+    "search": (
+        '## Example Workflow for "find all classes that handle payments"\n\n'
+        "CORRECT:\n"
+        '1. search_knowledge_graph("payment") → finds PaymentService, PaymentProcessor, etc.\n'
+        '2. get_related_entities("PaymentService (class)") → shows related entities\n'
+        "3. Use source toolkit tools only if graph results insufficient"
+    ),
+    "traversal": (
+        '## Example Workflow for "trace the call chain from Controller to Database"\n\n'
+        "CORRECT:\n"
+        "1. get_pattern_vocabulary() → learn types: class, function... relations: calls, imports, contains...\n"
+        '2. query_pattern("(Controller)-[:calls*1..4]->(?:class)") → get multi-hop call paths\n'
+        "3. Answer from structured paths\n\n"
+        '## Example Workflow for "which requirements trace through features to code?"\n\n'
+        "CORRECT (use chain pattern — different relation per hop):\n"
+        "1. get_pattern_vocabulary() → learn types and relations\n"
+        '2. query_pattern("(?:feature)-[:implements]->(?:requirement)-[:related_to]->(?:class)") → chain: feature→requirement→code\n'
+        "3. Answer from stitched paths\n\n"
+        "## When to use CHAIN patterns vs SINGLE-segment:\n"
+        "- **Single**: Same relation type across hops → `(A)-[:calls*1..4]->(B)` (one relation, multiple hops)\n"
+        "- **Chain**: Different relation types per hop → `(A)-[:rel1]->(B)-[:rel2]->(C)` (each hop has its own relation)\n"
+        "- **Chain**: Mixed entity types along the path → trace from docs to code via intermediaries\n"
+        "- **Avoid chains** when a single multi-hop pattern suffices — chains are slower due to per-segment execution"
+    ),
+    "overview": (
+        '## Example Workflow for "what types of entities are in this codebase?"\n\n'
+        "CORRECT:\n"
+        "1. list_entity_types() → see all entity types and counts\n"
+        '2. query_graph("type:class") → explore specific types if needed\n'
+        "3. Answer with summary of graph contents"
+    ),
+}
+
+
 # ReAct agent format template
 REACT_FORMAT_TEMPLATE = """
 
@@ -207,6 +329,12 @@ WHEN TO USE CHAINS vs SINGLE:
   Chain:  tracing across mixed entity domains (docs → code)""",
 
     "get_pattern_vocabulary": "List all entity types and relation types in the graph with counts. Call BEFORE query_pattern when you don't know exact type or relation names. Returns vocabulary and example patterns you can use.",
+
+    "impact_analysis": "ANALYZE what would break or be affected if an entity changes. "
+    "Shows direct dependents, transitive impact chains, and affected layers. "
+    "Parameters: 'entity_name' (required) — the entity to analyze. "
+    "Returns impact summary with affected entities grouped by impact depth (distance from the starting entity). "
+    "Use for: 'what calls this?', 'what depends on this?', 'what would break if I change X?'",
 }
 
 # Read-only tool patterns for filtering source toolkit tools

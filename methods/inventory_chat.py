@@ -580,7 +580,55 @@ class Method:
                     "error": None,
                 }
 
-            log.info(f"[inventory_chat] Built {len(tools)} tools")
+            log.info(f"[inventory_chat] Built {len(tools)} tools (all)")
+
+            # 6. Route query — select focused tool subset + compose prompt
+            from ..routing import QueryRouter, ToolSelector, PromptBuilder, GraphProfile
+
+            wrapper = self._get_or_create_wrapper(graph_path, {
+                "configuration": {
+                    "project_id": project_id,
+                    "application_id": toolkit_id,
+                    "settings": settings,
+                }
+            })
+            graph_stats = wrapper._knowledge_graph.get_stats()
+            has_source = any(
+                name not in {
+                    "search_knowledge_graph", "semantic_search", "get_entity_details",
+                    "get_related_entities", "query_graph", "query_pattern",
+                    "get_pattern_vocabulary", "list_entity_types", "impact_analysis",
+                }
+                for name in tools
+            )
+            profile = GraphProfile.from_stats(graph_stats, has_source_tools=has_source)
+
+            strategy = QueryRouter.classify(prompt)
+
+            focused_tools = ToolSelector.select(strategy, tools, profile)
+
+            # Format filter text for prompt
+            filter_desc_route = []
+            depth = filters.get("depth", 2)
+            max_nodes = filters.get("max_nodes", 500)
+            filter_desc_route.append(f"Depth: {depth} (relationship hops to traverse)")
+            filter_desc_route.append(f"Max nodes: {max_nodes} (maximum results to return)")
+            if filters.get("entity_types"):
+                filter_desc_route.append(f"Entity types: {', '.join(filters['entity_types'])}")
+            if filters.get("sources"):
+                filter_desc_route.append(f"Sources: {', '.join(filters['sources'])}")
+            if filters.get("layers"):
+                filter_desc_route.append(f"Layers: {', '.join(filters['layers'])}")
+            filter_text_route = "\n".join(filter_desc_route)
+
+            focused_tool_names = [t.name for t in focused_tools]
+            composed_prompt = PromptBuilder.compose(strategy, focused_tool_names, filter_text_route)
+
+            log.info(
+                f"[inventory_chat] Strategy: {strategy} | "
+                f"tools: {len(focused_tools)}/{len(tools)} | "
+                f"prompt chars: {len(composed_prompt)}"
+            )
 
             # 7. Get LLM instance with extended thinking for supported models
             model_config = {
@@ -609,16 +657,18 @@ class Method:
             with langfuse_trace_context(langfuse_trace_attrs):
                 result = self._execute_chat_agent(
                     llm=llm,
-                    tools=tools,
+                    tools=focused_tools,
                     prompt=prompt,
                     history=history,
                     filters=filters,
                     callback=callback,
                     langfuse_callback=langfuse_callback,
+                    system_prompt=composed_prompt,
                 )
 
-            # Add touched entities to result
+            # Add touched entities and routing info to result
             result["touched_entities"] = touched_entities
+            result["strategy"] = strategy
             log.info(f"[inventory_chat] Touched {len(touched_entities)} entities")
             log.info(f"[inventory_chat] Token usage: in={result.get('tokens_in', 0)}, out={result.get('tokens_out', 0)}")
 
@@ -628,6 +678,8 @@ class Method:
                 "touched_entities_count": len(touched_entities),
                 "tokens_in": result.get("tokens_in", 0),
                 "tokens_out": result.get("tokens_out", 0),
+                "strategy": strategy,
+                "tools_count": len(focused_tools),
             })
 
             return result
@@ -679,19 +731,27 @@ class Method:
         settings: Dict[str, Any],
         alita_client,
         touched_entities: List[Dict[str, Any]],
-    ) -> List:
+    ) -> Dict[str, Any]:
         """
         Build tools for the chat agent.
 
         Creates:
-        1. Graph search tool (with filters applied)
-        2. Entity details tool
-        3. Related entities tool
-        4. List entity types tool
-        5. Source toolkit tools (read-only operations from GitHub, etc.)
+        1. search_knowledge_graph — graph search with filters
+        2. semantic_search — embedding-based similarity (when embeddings exist)
+        3. get_entity_details — full entity info
+        4. get_related_entities — neighbours / relationships
+        5. query_graph — natural-language to Cypher-like graph traversal
+        6. query_pattern — structural pattern matching
+        7. get_pattern_vocabulary — available node/edge types for patterns
+        8. list_entity_types — type summary statistics
+        9. impact_analysis — what-if change impact analysis
+        10. Source toolkit tools (read-only operations from GitHub, etc.)
 
         Args:
             touched_entities: Shared list to collect entities accessed during execution
+
+        Returns:
+            Dict mapping tool name → Tool object
         """
         from langchain_core.tools.structured import StructuredTool
         from langchain_core.tools.simple import Tool
@@ -1726,6 +1786,88 @@ class Method:
             )),
         ))
 
+        # 4d. Impact Analysis Tool - analyze change dependencies
+        def impact_analysis(entity_name: str) -> str:
+            """Analyze what entities would be impacted by changes to the specified entity."""
+            try:
+                parsed_name, parsed_type = parse_entity_reference(entity_name)
+
+                entity, alternatives = smart_find_entity(parsed_name, parsed_type)
+
+                if not entity:
+                    if alternatives:
+                        suggestions = [f"  - {e.get('name')} ({e.get('type')})" for e in alternatives[:5]]
+                        return f"Entity '{parsed_name}' not found. Did you mean:\n" + "\n".join(suggestions)
+                    return f"Entity '{parsed_name}' not found. Try search_knowledge_graph to find the correct name."
+
+                track_entity(entity)
+
+                entity_id = entity.get('id')
+                if not entity_id:
+                    return "Entity has no ID for impact analysis."
+
+                # Downstream = what depends on this entity (affected by changes)
+                impact = wrapper._knowledge_graph.impact_analysis(
+                    entity_id, direction='downstream', max_depth=3
+                )
+
+                impacted = impact.get('impacted', [])
+
+                actual_name = entity.get('name', parsed_name)
+                actual_type = entity.get('type', 'unknown')
+
+                if not impacted:
+                    return f"No downstream dependencies found for '{actual_name}' ({actual_type}). This entity has no dependents that would be affected by changes."
+
+                output = f"# Impact Analysis: {actual_name} ({actual_type})\n\n"
+                output += f"**Direction:** downstream (what would break if this changes)\n"
+                output += f"**Total impacted:** {len(impacted)} entities\n\n"
+
+                # Group by depth
+                by_depth = {}
+                for item in impacted:
+                    depth = item['depth']
+                    if depth not in by_depth:
+                        by_depth[depth] = []
+                    by_depth[depth].append(item)
+
+                for depth in sorted(by_depth.keys()):
+                    items = by_depth[depth]
+                    output += f"## Level {depth} — {len(items)} {'directly' if depth == 1 else 'indirectly'} affected\n\n"
+
+                    for item in items[:15]:
+                        ent = item['entity']
+                        if ent:
+                            track_entity(ent)
+                            citation = ent.get('citation', {})
+                            location = citation.get('file_path', '') if isinstance(citation, dict) else ''
+                            output += f"- **{ent.get('name', '?')}** ({ent.get('type', '?')})"
+                            if location:
+                                output += f" - `{location}`"
+                            output += "\n"
+
+                    if len(items) > 15:
+                        output += f"- ... and {len(items) - 15} more\n"
+
+                    output += "\n"
+
+                output += f"\n💡 Use get_related_entities(\"{actual_name} ({actual_type})\") for detailed relationship breakdown."
+
+                return output
+
+            except Exception as e:
+                log.exception(f"[impact_analysis] Error: {e}")
+                return f"Error in impact analysis: {e}"
+
+        tools.append(Tool(
+            name="impact_analysis",
+            func=impact_analysis,
+            description=TOOL_DESCRIPTIONS.get("impact_analysis", (
+                "Analyze what would break or be affected if an entity changes. "
+                "Shows direct dependents and transitive impact chains."
+            )),
+        ))
+
         # 5. List Entity Types Tool
         def list_entity_types(tool_input: str = "") -> str:
             """List all entity types in the knowledge graph."""
@@ -1752,7 +1894,7 @@ class Method:
             description=TOOL_DESCRIPTIONS["list_entity_types"],
         ))
 
-        return tools
+        return {tool.name: tool for tool in tools}
 
     @web.method()
     def _execute_chat_agent(
@@ -1764,6 +1906,7 @@ class Method:
         filters: Dict[str, Any],
         callback: InventoryChatCallback,
         langfuse_callback=None,
+        system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute the chat agent with the given tools and prompt.
@@ -1772,6 +1915,8 @@ class Method:
 
         Args:
             langfuse_callback: Optional Langfuse CallbackHandler for tracing
+            system_prompt: Pre-composed system prompt from routing. If provided,
+                           skips internal prompt formatting.
 
         Returns structured response with answer and citations.
         """
@@ -1798,8 +1943,9 @@ class Method:
 
         filter_text = "\n".join(filter_desc)
 
-        # Build system prompt
-        system_prompt = INVENTORY_CHAT_SYSTEM_PROMPT.format(filters=filter_text)
+        # Build system prompt — use pre-composed from routing if provided
+        if system_prompt is None:
+            system_prompt = INVENTORY_CHAT_SYSTEM_PROMPT.format(filters=filter_text)
 
         # Create callback adapter for LangChain/LangGraph
         class LangChainCallbackAdapter(BaseCallbackHandler):
