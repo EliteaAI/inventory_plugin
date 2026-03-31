@@ -1894,6 +1894,89 @@ class Method:
             description=TOOL_DESCRIPTIONS["list_entity_types"],
         ))
 
+        # 6. Community tools — conditionally added when community data exists
+        if wrapper._has_communities():
+            class ListCommunitiesInput(BaseModel):
+                """Input for list_communities tool."""
+                top_n: int = Field(default=0, description="Max communities to show (0 = all)")
+
+            def list_communities_func(top_n: int = 0) -> str:
+                """List detected communities with labels and key members."""
+                try:
+                    return wrapper.list_communities(top_n=top_n if top_n > 0 else None)
+                except Exception as e:
+                    log.exception(f"[list_communities] Error: {e}")
+                    return f"Error listing communities: {e}"
+
+            tools.append(StructuredTool(
+                name="list_communities",
+                func=list_communities_func,
+                description="List all detected communities with their labels, sizes, and key members.",
+                args_schema=ListCommunitiesInput,
+            ))
+
+            class GetCommunityDetailInput(BaseModel):
+                """Input for get_community_detail tool."""
+                community_id: str = Field(description="Community identifier (e.g., 'community_0')")
+
+            def get_community_detail_func(community_id: str) -> str:
+                """Get detailed info about a specific community."""
+                try:
+                    return wrapper.get_community_detail(community_id=community_id)
+                except Exception as e:
+                    log.exception(f"[get_community_detail] Error: {e}")
+                    return f"Error getting community detail: {e}"
+
+            tools.append(StructuredTool(
+                name="get_community_detail",
+                func=get_community_detail_func,
+                description="Get detailed information about a specific community including members, centroids, and statistics.",
+                args_schema=GetCommunityDetailInput,
+            ))
+
+            class FindEntityCommunityInput(BaseModel):
+                """Input for find_entity_community tool."""
+                entity_name: str = Field(description="Name of the entity to look up")
+
+            def find_entity_community_func(entity_name: str) -> str:
+                """Find which community an entity belongs to."""
+                try:
+                    return wrapper.find_entity_community(entity_name=entity_name)
+                except Exception as e:
+                    log.exception(f"[find_entity_community] Error: {e}")
+                    return f"Error finding entity community: {e}"
+
+            tools.append(StructuredTool(
+                name="find_entity_community",
+                func=find_entity_community_func,
+                description="Find which community a given entity belongs to.",
+                args_schema=FindEntityCommunityInput,
+            ))
+
+            class SearchWithinCommunityInput(BaseModel):
+                """Input for search_within_community tool."""
+                community_id: str = Field(description="Community identifier to search within")
+                query: str = Field(description="Search query for finding entities within the community")
+
+            def search_within_community_func(community_id: str, query: str) -> str:
+                """Search entities within a specific community."""
+                try:
+                    return wrapper.search_within_community(
+                        community_id=community_id, query=query
+                    )
+                except Exception as e:
+                    log.exception(f"[search_within_community] Error: {e}")
+                    return f"Error searching within community: {e}"
+
+            tools.append(StructuredTool(
+                name="search_within_community",
+                func=search_within_community_func,
+                description="Search for entities matching a query within a specific community.",
+                args_schema=SearchWithinCommunityInput,
+            ))
+
+            log.info(f"[_build_chat_tools] Community tools enabled ({wrapper._knowledge_graph._metadata.get('community_data', {}).get('num_communities', 0)} communities)")
+
         return {tool.name: tool for tool in tools}
 
     @web.method()

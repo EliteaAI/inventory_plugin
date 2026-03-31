@@ -348,6 +348,7 @@ class KnowledgeGraph:
         self._metadata: Dict[str, Any] = {}  # Graph metadata (sources, timestamps)
         self._schema: Optional[Dict[str, Any]] = None  # Discovered entity schema
         self._embedding_model: Any = None  # LangChain Embeddings instance (set by generate_embeddings)
+        self._community_index: Dict[str, List[str]] = {}  # community_id -> [node_ids]
     
     # ========== Entity Operations ==========
     
@@ -1413,8 +1414,93 @@ class KnowledgeGraph:
                 1 for _, data in self._graph.nodes(data=True) if data.get('embedding')
             ),
             'embeddings_model': self._metadata.get('embeddings_model'),
+            'has_communities': bool(self._metadata.get('community_data')),
+            'num_communities': self._metadata.get('community_data', {}).get('num_communities', 0),
         }
     
+    # ========== Community Operations ==========
+
+    def rebuild_community_index(self) -> None:
+        """Rebuild _community_index from community_data in metadata."""
+        self._community_index = {}
+        community_data = self._metadata.get('community_data', {})
+        communities = community_data.get('communities', {})
+        for cid, cinfo in communities.items():
+            self._community_index[cid] = cinfo.get('members', [])
+        if self._community_index:
+            logger.info(
+                f"Rebuilt community index: {len(self._community_index)} communities"
+            )
+
+    def set_community_data(self, community_data: Dict[str, Any]) -> None:
+        """
+        Store community detection results and update node attributes.
+
+        Args:
+            community_data: Dict from CommunityAnalyzer.detect_communities()
+        """
+        self._metadata['community_data'] = community_data
+
+        # Set community_id attribute on each node
+        for cid, cinfo in community_data.get('communities', {}).items():
+            for node_id in cinfo.get('members', []):
+                if self._graph.has_node(node_id):
+                    self._graph.nodes[node_id]['community_id'] = cid
+
+        self.rebuild_community_index()
+
+    def get_communities(self) -> Dict[str, Any]:
+        """
+        Return community overview without full member lists.
+
+        Includes label, size, top centroids, and stats for each community.
+        """
+        community_data = self._metadata.get('community_data', {})
+        if not community_data:
+            return {}
+
+        overview = {
+            "algorithm": community_data.get("algorithm"),
+            "modularity": community_data.get("modularity"),
+            "num_communities": community_data.get("num_communities", 0),
+            "communities": {},
+        }
+
+        for cid, cinfo in community_data.get("communities", {}).items():
+            overview["communities"][cid] = {
+                "label": cinfo.get("label", ""),
+                "size": cinfo.get("stats", {}).get("size", len(cinfo.get("members", []))),
+                "centroids": cinfo.get("centroids", []),
+                "dominant_types": cinfo.get("dominant_types", []),
+                "dominant_layers": cinfo.get("dominant_layers", []),
+                "summary": cinfo.get("summary"),
+            }
+
+        return overview
+
+    def get_community(self, community_id: str) -> Optional[Dict[str, Any]]:
+        """Return full detail for a specific community."""
+        community_data = self._metadata.get('community_data', {})
+        return community_data.get('communities', {}).get(community_id)
+
+    def get_community_for_entity(self, entity_id: str) -> Optional[str]:
+        """Look up which community an entity belongs to."""
+        node = self._graph.nodes.get(entity_id)
+        if node:
+            return node.get('community_id')
+        return None
+
+    def get_community_centroids(self, community_id: str) -> List[Dict]:
+        """Return centroid entities with scores for a community."""
+        community = self.get_community(community_id)
+        if not community:
+            return []
+        return community.get('centroids', [])
+
+    def get_community_members(self, community_id: str) -> List[str]:
+        """Return member node IDs for a community."""
+        return self._community_index.get(community_id, [])
+
     # ========== Persistence ==========
     
     def dump_to_json(self, path: str, exclude_embeddings: bool = False) -> None:
@@ -1529,6 +1615,9 @@ class KnowledgeGraph:
         if not self._type_index or not self._file_index:
             self._rebuild_indices()
         
+        # Rebuild community index from stored community metadata
+        self.rebuild_community_index()
+        
         logger.info(f"Loaded graph from {path} ({self._graph.number_of_nodes()} entities, {self._graph.number_of_edges()} relations)")
     
     def _rebuild_indices(self) -> None:
@@ -1577,6 +1666,7 @@ class KnowledgeGraph:
         self._type_index.clear()
         self._file_index.clear()
         self._source_doc_index.clear()
+        self._community_index = {}
         self._schema = None
         self._metadata = {}
     

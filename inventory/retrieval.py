@@ -160,6 +160,29 @@ QueryPatternParams = create_model(
     max_results=(Optional[int], Field(default=50, description="Maximum paths to return (hard cap: 100)")),
 )
 
+# ========== Community Tool Parameter Schemas ==========
+
+ListCommunitiesParams = create_model(
+    "ListCommunitiesParams",
+    top_n=(Optional[int], Field(default=None, description="Maximum number of communities to return (default: all)")),
+)
+
+GetCommunityDetailParams = create_model(
+    "GetCommunityDetailParams",
+    community_id=(str, Field(description="Community identifier (e.g., 'community_0')")),
+)
+
+FindEntityCommunityParams = create_model(
+    "FindEntityCommunityParams",
+    entity_name=(str, Field(description="Name of the entity to look up")),
+)
+
+SearchWithinCommunityParams = create_model(
+    "SearchWithinCommunityParams",
+    community_id=(str, Field(description="Community identifier to search within")),
+    query=(str, Field(description="Search query for finding entities within the community")),
+)
+
 
 class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
     """
@@ -1550,9 +1573,262 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
         
         return output
     
+    # ========== Community Tool Methods ==========
+
+    def _has_communities(self) -> bool:
+        """Check if community data is available."""
+        return bool(self._knowledge_graph._metadata.get('community_data'))
+
+    def list_communities(self, top_n: Optional[int] = None) -> str:
+        """List all detected communities with labels, sizes, and top centroids."""
+        self._log_tool_event("Listing communities", "list_communities")
+
+        overview = self._knowledge_graph.get_communities()
+        if not overview:
+            return "No communities detected in this graph."
+
+        communities = overview.get("communities", {})
+        if not communities:
+            return "No communities detected in this graph."
+
+        # Sort by size descending
+        sorted_comms = sorted(
+            communities.items(),
+            key=lambda x: x[1].get("size", 0),
+            reverse=True,
+        )
+
+        if top_n is not None and isinstance(top_n, int) and top_n > 0:
+            sorted_comms = sorted_comms[:top_n]
+
+        algo = overview.get("algorithm", "unknown")
+        modularity = overview.get("modularity", 0)
+        output = (
+            f"# Communities ({overview.get('num_communities', 0)} detected, "
+            f"algorithm={algo}, modularity={modularity:.3f})\n\n"
+        )
+
+        for cid, info in sorted_comms:
+            size = info.get("size", 0)
+            label = info.get("label", cid)
+            centroids = info.get("centroids", [])
+            centroid_names = ", ".join(c["name"] for c in centroids[:3])
+            summary = info.get("summary")
+
+            output += f"## {cid}: {label}\n"
+            output += f"- **Size**: {size} entities\n"
+            if centroid_names:
+                output += f"- **Key entities**: {centroid_names}\n"
+            types = info.get("dominant_types", [])
+            if types:
+                output += f"- **Types**: {', '.join(types[:3])}\n"
+            if summary:
+                output += f"- **Summary**: {summary}\n"
+            output += "\n"
+
+        return output
+
+    def get_community_detail(self, community_id: str) -> str:
+        """Get detailed information about a specific community."""
+        self._log_tool_event(f"Community detail: {community_id}", "get_community_detail")
+
+        community = self._knowledge_graph.get_community(community_id)
+        if not community:
+            available = list(
+                self._knowledge_graph._metadata.get('community_data', {})
+                .get('communities', {}).keys()
+            )
+            return (
+                f"Community '{community_id}' not found. "
+                f"Available: {', '.join(available[:10]) if available else 'none'}"
+            )
+
+        label = community.get("label", community_id)
+        members = community.get("members", [])
+        centroids = community.get("centroids", [])
+        stats = community.get("stats", {})
+        summary = community.get("summary")
+
+        output = f"# {community_id}: {label}\n\n"
+
+        # Stats
+        output += "## Statistics\n"
+        output += f"- Size: {stats.get('size', len(members))} entities\n"
+        output += f"- Density: {stats.get('density', 0):.4f}\n"
+        output += f"- Cohesion: {stats.get('cohesion', 0):.4f}\n"
+        output += f"- Internal edges: {stats.get('internal_edges', 0)}\n\n"
+
+        # Summary
+        if summary:
+            output += f"## Summary\n{summary}\n\n"
+
+        # Centroids
+        output += "## Key Entities (Centroids)\n"
+        for c in centroids:
+            node = self._knowledge_graph._graph.nodes.get(c["id"], {})
+            sig = node.get("signature", "")
+            output += (
+                f"- **{c['name']}** ({c['type']}, score={c['score']:.3f})"
+            )
+            if sig:
+                output += f": `{sig}`"
+            output += "\n"
+
+        # Members sorted by architectural type priority
+        # Show architectural members (priority >= threshold) first, then
+        # a count of implementation-level members that are omitted.
+        output += f"\n## Members ({len(members)} total)\n"
+        centroid_ids = {c["id"] for c in centroids}
+        non_centroid = [m for m in members if m not in centroid_ids]
+
+        # Import community type priority for ordering
+        try:
+            from .communities import TYPE_PRIORITY, ARCHITECTURAL_MIN_PRIORITY
+        except ImportError:
+            TYPE_PRIORITY = {}
+            ARCHITECTURAL_MIN_PRIORITY = 5
+
+        def _member_sort_key(nid):
+            node = self._knowledge_graph._graph.nodes.get(nid, {})
+            etype = node.get('type', 'unknown').lower()
+            return (-TYPE_PRIORITY.get(etype, 0), node.get('name', nid).lower())
+
+        non_centroid.sort(key=_member_sort_key)
+
+        # Split into architectural and noise
+        arch_members = [
+            nid for nid in non_centroid
+            if TYPE_PRIORITY.get(
+                self._knowledge_graph._graph.nodes.get(nid, {}).get('type', 'unknown').lower(), 0
+            ) >= ARCHITECTURAL_MIN_PRIORITY
+        ]
+        noise_count = len(non_centroid) - len(arch_members)
+
+        for nid in arch_members[:30]:
+            node = self._knowledge_graph._graph.nodes.get(nid, {})
+            output += f"- {node.get('name', nid)} ({node.get('type', 'unknown')})\n"
+        if len(arch_members) > 30:
+            output += f"- ... and {len(arch_members) - 30} more architectural members\n"
+        if noise_count > 0:
+            output += f"- ({noise_count} implementation-level members: methods, variables, imports, etc.)\n"
+
+        # Micro clusters
+        micro = community.get("micro_clusters")
+        if micro:
+            output += f"\n## Micro-clusters ({len(micro)})\n"
+            for mid, minfo in micro.items():
+                mlabel = minfo.get("label", mid)
+                msize = len(minfo.get("members", []))
+                output += f"- **{mid}**: {mlabel} ({msize} entities)\n"
+
+        return output
+
+    def find_entity_community(self, entity_name: str) -> str:
+        """Find which community an entity belongs to."""
+        self._log_tool_event(f"Find community for: {entity_name}", "find_entity_community")
+
+        # Search by name to find entity ID
+        results = self._knowledge_graph.search(entity_name, top_k=5)
+        if not results:
+            return f"Entity '{entity_name}' not found in the graph."
+
+        output = f"# Community membership for '{entity_name}'\n\n"
+        for r in results:
+            entity = r["entity"]
+            eid = entity.get("id", "")
+            ename = entity.get("name", eid)
+            etype = entity.get("type", "unknown")
+            cid = self._knowledge_graph.get_community_for_entity(eid)
+            if cid:
+                community = self._knowledge_graph.get_community(cid)
+                label = community.get("label", cid) if community else cid
+                output += f"- **{ename}** ({etype}) → **{cid}**: {label}\n"
+            else:
+                output += f"- **{ename}** ({etype}) → no community assigned\n"
+
+        return output
+
+    def search_within_community(self, community_id: str, query: str) -> str:
+        """Search for entities matching a query within a specific community."""
+        self._log_tool_event(
+            f"Search in {community_id}: {query}", "search_within_community"
+        )
+
+        members = self._knowledge_graph.get_community_members(community_id)
+        if not members:
+            return f"Community '{community_id}' not found or has no members."
+
+        member_set = set(members)
+
+        # Use full search pipeline (token matching, scoring) then filter
+        results = self._knowledge_graph.search(query, top_k=200)
+        filtered = [r for r in results if r["entity"].get("id", "") in member_set]
+
+        if not filtered:
+            return (
+                f"No entities matching '{query}' found in {community_id} "
+                f"({len(members)} members)."
+            )
+
+        # Import type priority for sorting
+        try:
+            from .communities import TYPE_PRIORITY
+        except ImportError:
+            TYPE_PRIORITY = {}
+
+        # Sort: high-priority types first, then by search score
+        def _sort_key(r):
+            etype = r['entity'].get('type', 'unknown').lower()
+            priority = TYPE_PRIORITY.get(etype, 0)
+            score = r.get('score', 0)
+            return (-priority, -score)
+
+        filtered.sort(key=_sort_key)
+
+        output = f"# Search results in {community_id} for '{query}'\n\n"
+        for i, result in enumerate(filtered[:20], 1):
+            entity = result["entity"]
+            ename = entity.get("name", "")
+            etype = entity.get("type", "unknown")
+            layer = entity.get("layer", "")
+            type_label = f"{layer}/{etype}" if layer else etype
+            citations = entity.get("citations", [])
+
+            output += f"{i:2}. **{ename}** ({type_label})\n"
+            if citations:
+                c = citations[0]
+                fp = c.get("file_path", "")
+                line_info = ""
+                if c.get('line_start'):
+                    if c.get('line_end'):
+                        line_info = f":{c['line_start']}-{c['line_end']}"
+                    else:
+                        line_info = f":{c['line_start']}"
+                if fp:
+                    output += f"    📍 `{fp}{line_info}`\n"
+            elif entity.get('file_path'):
+                output += f"    📍 `{entity['file_path']}`\n"
+
+            # Show description if available
+            description = entity.get('description', '')
+            if not description and isinstance(entity.get('properties'), dict):
+                description = entity['properties'].get('description', '')
+            if description:
+                desc = description[:120]
+                if len(description) > 120:
+                    desc += '...'
+                output += f"    {desc}\n"
+
+            output += "\n"
+
+        if len(filtered) > 20:
+            output += f"\n_Showing 20 of {len(filtered)} matches._\n"
+
+        return output
+
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Return list of available retrieval tools."""
-        return [
+        tools = [
             {
                 "name": "search_graph",
                 "ref": self.search_graph,
@@ -1665,3 +1941,34 @@ class InventoryRetrievalApiWrapper(BaseToolApiWrapper):
                 "args_schema": ListFilesParams,
             },
         ]
+
+        # Conditionally add community tools if community data exists
+        if self._has_communities():
+            tools.extend([
+                {
+                    "name": "list_communities",
+                    "ref": self.list_communities,
+                    "description": "List all detected communities with their labels, sizes, and key members.",
+                    "args_schema": ListCommunitiesParams,
+                },
+                {
+                    "name": "get_community_detail",
+                    "ref": self.get_community_detail,
+                    "description": "Get detailed information about a specific community including members, centroids, and statistics.",
+                    "args_schema": GetCommunityDetailParams,
+                },
+                {
+                    "name": "find_entity_community",
+                    "ref": self.find_entity_community,
+                    "description": "Find which community a given entity belongs to.",
+                    "args_schema": FindEntityCommunityParams,
+                },
+                {
+                    "name": "search_within_community",
+                    "ref": self.search_within_community,
+                    "description": "Search for entities matching a query within a specific community.",
+                    "args_schema": SearchWithinCommunityParams,
+                },
+            ])
+
+        return tools

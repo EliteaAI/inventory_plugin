@@ -16,14 +16,107 @@ Supports comprehensive entity types across multiple layers:
 import json
 import logging
 import hashlib
+import re
 from typing import Any, Optional, List, Dict, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.exceptions import OutputParserException
+from langchain_core.outputs import Generation
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# ROBUST JSON PARSING
+# ============================================================================
+
+# Regex to strip markdown code fences: ```json ... ``` or ``` ... ```
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+
+# Regex to find single-quoted string values in JSON-like output.
+# Matches: key: 'value' patterns where the value contains double quotes
+# that forced the LLM to use single quotes instead.
+_SINGLE_QUOTE_VALUE_RE = re.compile(
+    r"""(?<=:\s)'((?:[^'\\]|\\.)*)'""",
+)
+
+
+def _repair_json_text(text: str) -> Any:
+    """
+    Attempt to parse JSON that may contain single-quoted strings.
+
+    LLMs sometimes use single quotes for string values that contain
+    double quotes (e.g. CSS selectors like '[role="dialog"]').
+    Standard json.loads rejects this. This function:
+    1. Strips markdown code fences
+    2. Replaces single-quoted values with properly escaped double-quoted values
+    3. Falls back to ast.literal_eval for Python-literal-style output
+    """
+    # Strip code fences
+    m = _FENCE_RE.search(text)
+    raw = m.group(1) if m else text.strip()
+
+    # First try standard parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Replace single-quoted values with double-quoted (escape inner double quotes)
+    def _sq_to_dq(match: re.Match) -> str:
+        inner = match.group(1)
+        # Escape any unescaped double quotes inside the value
+        escaped = inner.replace('"', '\\"')
+        return f': "{escaped}"'
+
+    repaired = _SINGLE_QUOTE_VALUE_RE.sub(_sq_to_dq, raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: ast.literal_eval handles Python-style dicts/lists
+    import ast
+    try:
+        result = ast.literal_eval(raw)
+        if isinstance(result, (dict, list)):
+            return result
+    except (ValueError, SyntaxError):
+        pass
+
+    raise json.JSONDecodeError("Failed to repair JSON", raw, 0)
+
+
+class RobustJsonOutputParser(JsonOutputParser):
+    """JsonOutputParser with fallback for single-quoted strings.
+
+    LLMs occasionally produce JSON with single-quoted string values
+    (especially for CSS selectors or code containing double quotes).
+    This subclass catches the standard parser failure and applies
+    repair heuristics before giving up.
+    """
+
+    def parse_result(
+        self, result: list[Generation], *, partial: bool = False
+    ) -> Any:
+        try:
+            return super().parse_result(result, partial=partial)
+        except OutputParserException:
+            # Standard parser failed — try repair
+            text = result[0].text.strip()
+            try:
+                parsed = _repair_json_text(text)
+                logger.debug("JSON repair succeeded for output with non-standard quoting")
+                return parsed
+            except (json.JSONDecodeError, Exception) as repair_err:
+                # Re-raise original-style error if repair also fails
+                raise OutputParserException(
+                    f"Invalid json output (repair also failed): {text[:500]}",
+                    llm_output=text,
+                ) from repair_err
 
 
 # ============================================================================
@@ -453,7 +546,7 @@ class DocumentClassifier:
     def __init__(self, llm: Any):
         self.llm = llm
         self.prompt = ChatPromptTemplate.from_template(DOCUMENT_CLASSIFIER_PROMPT)
-        self.parser = JsonOutputParser()
+        self.parser = RobustJsonOutputParser()
     
     def classify(self, document: Document) -> str:
         """Classify a single document."""
@@ -483,7 +576,7 @@ class EntitySchemaDiscoverer:
     def __init__(self, llm: Any):
         self.llm = llm
         self.prompt = ChatPromptTemplate.from_template(SCHEMA_DISCOVERY_PROMPT)
-        self.parser = JsonOutputParser()
+        self.parser = RobustJsonOutputParser()
     
     def discover(self, documents: List[Document]) -> Dict[str, Any]:
         """
@@ -554,7 +647,7 @@ class EntityExtractor:
         self.llm = llm
         self.embedding = embedding
         self.prompt = ChatPromptTemplate.from_template(ENTITY_EXTRACTION_PROMPT)
-        self.parser = JsonOutputParser()
+        self.parser = RobustJsonOutputParser()
         self._entity_cache: Dict[str, Dict] = {}
         self.max_retries = max_retries
         self.retry_delay = retry_delay
@@ -776,7 +869,7 @@ class RelationExtractor:
     def __init__(self, llm: Any, max_retries: int = 3, retry_delay: float = 2.0):
         self.llm = llm
         self.prompt = ChatPromptTemplate.from_template(RELATION_EXTRACTION_PROMPT)
-        self.parser = JsonOutputParser()
+        self.parser = RobustJsonOutputParser()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
 
@@ -1232,7 +1325,7 @@ class FactExtractor:
         self.llm = llm
         self.prompt = ChatPromptTemplate.from_template(FACT_EXTRACTION_PROMPT)
         self.code_prompt = ChatPromptTemplate.from_template(CODE_FACT_EXTRACTION_PROMPT)
-        self.parser = JsonOutputParser()
+        self.parser = RobustJsonOutputParser()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
     

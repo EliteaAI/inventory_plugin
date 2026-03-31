@@ -102,6 +102,9 @@ _STRATEGY_PATTERNS: Dict[str, List[re.Pattern]] = {
         re.compile(r"\b(?:what\s+types?|what\s+kinds?)\b", re.IGNORECASE),
         re.compile(r"\b(?:overview|architecture|structure|summary)\b", re.IGNORECASE),
         re.compile(r"\b(?:statistics?|stats)\b", re.IGNORECASE),
+        re.compile(r"\b(?:communit(?:y|ies))\b", re.IGNORECASE),
+        re.compile(r"\b(?:group(?:s|ing)?|cluster(?:s|ing)?)\b", re.IGNORECASE),
+        re.compile(r"\b(?:breakdown|decompos(?:e|ition))\b", re.IGNORECASE),
     ],
 }
 
@@ -176,6 +179,10 @@ STRATEGY_TOOL_NAMES: Dict[str, List[str]] = {
         "list_entity_types",
         "query_graph",
         "search_knowledge_graph",
+        "list_communities",
+        "get_community_detail",
+        "find_entity_community",
+        "search_within_community",
     ],
     # hybrid = all tools, handled specially in select()
 }
@@ -230,6 +237,8 @@ def _is_source_tool(tool_name: str) -> bool:
         "search_knowledge_graph", "semantic_search", "get_entity_details",
         "get_related_entities", "query_graph", "query_pattern",
         "get_pattern_vocabulary", "list_entity_types", "impact_analysis",
+        "list_communities", "get_community_detail",
+        "find_entity_community", "search_within_community",
     }
     return tool_name not in _GRAPH_TOOL_NAMES
 

@@ -1006,6 +1006,92 @@ class IngestionPipeline(BaseModel):
         
         return pruned
 
+    def _run_community_detection(self) -> None:
+        """
+        Run community detection on the knowledge graph (post quality-pass).
+
+        Uses CommunityAnalyzer with Leiden/Louvain. Results are stored
+        in _metadata['community_data'] and node attributes.
+        """
+        try:
+            from .communities import CommunityAnalyzer, HAS_IGRAPH, MIN_NODES_FOR_DETECTION
+        except ImportError:
+            logger.debug("Community detection module not available, skipping")
+            return
+
+        node_count = self._knowledge_graph._graph.number_of_nodes()
+        if node_count < MIN_NODES_FOR_DETECTION:
+            logger.info(
+                f"Skipping community detection: {node_count} nodes "
+                f"(minimum {MIN_NODES_FOR_DETECTION})"
+            )
+            return
+
+        if not HAS_IGRAPH:
+            logger.info("igraph not installed, using NetworkX fallback for community detection")
+
+        self._log_progress("🔍 Detecting communities...", "communities")
+        cd_start = time.time()
+
+        analyzer = CommunityAnalyzer()
+        community_data = analyzer.detect_communities(self._knowledge_graph._graph)
+
+        if community_data:
+            self._knowledge_graph.set_community_data(community_data)
+            cd_duration = time.time() - cd_start
+            num_c = community_data.get('num_communities', 0)
+            mod = community_data.get('modularity', 0)
+            logger.info(
+                f"⏱️ [TIMING] Community detection: {cd_duration:.3f}s, "
+                f"{num_c} communities, modularity={mod:.4f}"
+            )
+            self._log_progress(
+                f"🏘️ Detected {num_c} communities (modularity={mod:.3f})",
+                "communities"
+            )
+
+            # Generate LLM summaries for each community (parallel)
+            if self.llm and num_c > 0:
+                self._log_progress(
+                    f"📝 Generating summaries for {num_c} communities...",
+                    "communities"
+                )
+                sum_start = time.time()
+                try:
+                    def _llm_invoke(prompt: str) -> str:
+                        """Wrap LangChain LLM into a simple str->str callable."""
+                        response = self.llm.invoke(prompt)
+                        # BaseChatModel returns AIMessage; base LLM returns str
+                        if hasattr(response, 'content'):
+                            return response.content
+                        return str(response)
+
+                    summary_count = analyzer.generate_summaries(
+                        nx_graph=self._knowledge_graph._graph,
+                        community_data=community_data,
+                        llm_callable=_llm_invoke,
+                        max_workers=min(self.max_parallel_extractions, num_c),
+                    )
+                    # Persist updated community_data (now includes summaries)
+                    self._knowledge_graph.set_community_data(community_data)
+                    sum_duration = time.time() - sum_start
+                    logger.info(
+                        f"⏱️ [TIMING] Community summaries: {sum_duration:.3f}s, "
+                        f"{summary_count}/{num_c} generated"
+                    )
+                    self._log_progress(
+                        f"📝 Generated {summary_count}/{num_c} community summaries",
+                        "communities"
+                    )
+                except Exception as e:
+                    logger.warning(f"Community summary generation failed (non-fatal): {e}")
+                    self._log_progress(
+                        f"⚠️ Community summaries skipped: {e}",
+                        "warning"
+                    )
+        else:
+            logger.info("Community detection produced no results")
+
     def regenerate_embeddings(self, embedding_model: Any = None, force: bool = False) -> int:
         """
         Generate or regenerate entity embeddings on the current graph.
@@ -3253,6 +3339,9 @@ class IngestionPipeline(BaseModel):
                 logger.info(f"⏱️ [TIMING] Graph quality pass: {quality_duration:.3f}s, pruned {pruned} low-quality edges")
                 self._log_progress(f"🧹 Quality pass: pruned {pruned} low-quality edges", "quality")
             
+            # ========== COMMUNITY DETECTION ==========
+            self._run_community_detection()
+            
             # Generate embeddings if configured
             if self.auto_generate_embeddings and self._embedding:
                 try:
@@ -3432,6 +3521,9 @@ class IngestionPipeline(BaseModel):
             pruned = self._run_graph_quality_pass()
             if pruned > 0:
                 logger.info(f"🧹 Quality pass: pruned {pruned} low-quality edges")
+            
+            # Re-run community detection on full graph
+            self._run_community_detection()
             
             self._auto_save()
             result.graph_stats = self._knowledge_graph.get_stats()

@@ -169,7 +169,9 @@ STRATEGY_INTROS = {
     ),
     "overview": (
         "Focus on providing high-level information about the graph's contents, "
-        "entity types, counts, and architecture."
+        "entity types, counts, architecture, and community structure. "
+        "When communities are available, use list_communities for an architectural breakdown "
+        "into logical groups, then get_community_detail to drill into specific groups."
     ),
 }
 
@@ -221,7 +223,14 @@ STRATEGY_WORKFLOWS = {
         "CORRECT:\n"
         "1. list_entity_types() → see all entity types and counts\n"
         '2. query_graph("type:class") → explore specific types if needed\n'
-        "3. Answer with summary of graph contents"
+        "3. Answer with summary of graph contents\n\n"
+        '## Example Workflow for "give me an architectural breakdown"\n\n'
+        "CORRECT:\n"
+        "1. list_communities() → get all communities with labels, sizes, key entities\n"
+        '2. get_community_detail("community_0") → drill into a specific group for members and stats\n'
+        '3. find_entity_community("UserService") → check which group a specific entity belongs to\n'
+        '4. search_within_community("community_0", "auth") → find auth-related entities in that group\n'
+        "5. Answer with architectural summary based on community structure"
     ),
 }
 
@@ -335,6 +344,23 @@ WHEN TO USE CHAINS vs SINGLE:
     "Parameters: 'entity_name' (required) — the entity to analyze. "
     "Returns impact summary with affected entities grouped by impact depth (distance from the starting entity). "
     "Use for: 'what calls this?', 'what depends on this?', 'what would break if I change X?'",
+
+    "list_communities": "LIST detected communities — logical groupings of related entities discovered by graph clustering. "
+    "Shows each community's label, size, dominant types, and top centroids (key entities). "
+    "Use first to get a high-level architectural breakdown, then drill into specific communities with get_community_detail.",
+
+    "get_community_detail": "GET full details about a specific community: statistics, centroids (key entities), "
+    "architectural members, and micro-clusters. "
+    "Parameters: 'community_id' (required, e.g. 'community_0'). "
+    "Use after list_communities to explore a group in depth.",
+
+    "find_entity_community": "FIND which community a given entity belongs to. "
+    "Parameters: 'entity_name' (required). "
+    "Use to understand the architectural neighbourhood of a specific entity.",
+
+    "search_within_community": "SEARCH for entities matching a query within a specific community. "
+    "Parameters: 'community_id' (required), 'query' (required). "
+    "Use to explore members of a community by keyword, scoped to that group only.",
 }
 
 # Read-only tool patterns for filtering source toolkit tools
