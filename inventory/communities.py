@@ -794,6 +794,155 @@ class CommunityAnalyzer:
         )
         return micro_clusters
 
+    # ========== LLM Labels (Optional) ==========
+
+    def generate_labels(
+        self,
+        nx_graph,
+        community_data: Dict[str, Any],
+        llm_callable: Callable[[str], str],
+        max_workers: int = 5,
+    ) -> int:
+        """
+        Generate LLM-driven capability labels for each community in parallel.
+
+        Replaces heuristic auto-labels with concise intent/capability names
+        produced by the LLM.  Uses the same centroid + relationship context as
+        summaries.  Should be called *before* ``generate_summaries`` so the
+        improved labels feed into the summary prompts.
+
+        Args:
+            nx_graph: The full NetworkX DiGraph
+            community_data: Mutated in-place — ``label`` fields updated
+            llm_callable: ``str → str`` (prompt in, text out)
+            max_workers: Maximum parallel LLM calls
+
+        Returns:
+            Number of labels successfully generated
+        """
+        communities = community_data.get("communities", {})
+        if not communities:
+            return 0
+
+        tasks: List[Tuple[str, str]] = []
+        for cid, community in communities.items():
+            prompt = self._build_label_prompt(nx_graph, community)
+            tasks.append((cid, prompt))
+
+        def _label(item: Tuple[str, str]) -> Tuple[str, Optional[str]]:
+            cid, prompt = item
+            try:
+                raw = llm_callable(prompt)
+                # Clean LLM output: strip quotes, collapse whitespace, strip trailing punctuation
+                label = raw.strip().strip('"\'').strip()
+                # Collapse multiple internal whitespace characters
+                label = " ".join(label.split())
+                # Enforce reasonable length — truncate if LLM went verbose
+                if len(label) > 80:
+                    label = label[:80]
+                # Strip common trailing punctuation to align with "no punctuation" contract
+                label = label.rstrip('.,;:!?\'"\u2026\u00bb\u00ab)]}')
+                return (cid, label)
+            except Exception as e:
+                logger.warning(f"Label generation failed for {cid}: {e}")
+                return (cid, None)
+
+        count = 0
+        effective_workers = min(max_workers, len(tasks))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {executor.submit(_label, t): t[0] for t in tasks}
+            for future in as_completed(futures):
+                cid, label = future.result()
+                if label:
+                    communities[cid]["label"] = label
+                    count += 1
+
+        logger.info(f"Generated {count}/{len(tasks)} community labels via LLM")
+        return count
+
+    def _build_label_prompt(
+        self,
+        nx_graph,
+        community: Dict[str, Any],
+    ) -> str:
+        """Build prompt for LLM-driven community label generation."""
+        centroids = community.get("centroids", [])
+        members = community.get("members", [])
+        heuristic_label = community.get("label", "Unknown")
+
+        # Centroid details (same as summary prompt)
+        centroid_lines = []
+        for c in centroids:
+            node = nx_graph.nodes.get(c["id"], {})
+            sig = node.get("signature", "")
+            doc = node.get("docstring", "") or node.get("description", "")
+            line = f"- {c['name']} ({c['type']})"
+            if sig:
+                line += f": {sig}"
+            if doc:
+                doc_short = doc[:120].strip()
+                if len(doc) > 120:
+                    doc_short += "..."
+                line += f" — {doc_short}"
+            centroid_lines.append(line)
+
+        # Key relationships for centroids
+        relation_lines = []
+        centroid_ids = {c["id"] for c in centroids}
+        for cid_node in centroid_ids:
+            for _, target, data in nx_graph.out_edges(cid_node, data=True):
+                rt = data.get("relation_type", "related_to")
+                target_name = nx_graph.nodes.get(target, {}).get("name", target)
+                relation_lines.append(
+                    f"- {nx_graph.nodes.get(cid_node, {}).get('name', cid_node)} "
+                    f"--[{rt}]--> {target_name}"
+                )
+            for source, _, data in nx_graph.in_edges(cid_node, data=True):
+                rt = data.get("relation_type", "related_to")
+                source_name = nx_graph.nodes.get(source, {}).get("name", source)
+                relation_lines.append(
+                    f"- {source_name} --[{rt}]--> "
+                    f"{nx_graph.nodes.get(cid_node, {}).get('name', cid_node)}"
+                )
+        relation_lines = list(dict.fromkeys(relation_lines))[:10]
+
+        # Architectural members only (skip noise types)
+        non_centroid = [m for m in members if m not in centroid_ids]
+        arch_members = [
+            m for m in non_centroid
+            if TYPE_PRIORITY.get(
+                nx_graph.nodes.get(m, {}).get('type', 'unknown').lower(), 0
+            ) >= ARCHITECTURAL_MIN_PRIORITY
+        ]
+        roster_lines = []
+        for nid in arch_members[:15]:
+            node = nx_graph.nodes.get(nid, {})
+            roster_lines.append(
+                f"- {node.get('name', nid)} ({node.get('type', 'unknown')})"
+            )
+        if len(arch_members) > 15:
+            roster_lines.append(f"- ... and {len(arch_members) - 15} more")
+
+        prompt = (
+            "Given this code community, generate a short, descriptive label "
+            "(3-7 words) that captures its primary capability or responsibility.\n\n"
+            "## Key Entities (Centroids)\n"
+            + ("\n".join(centroid_lines) if centroid_lines else "- None")
+            + "\n\n## Key Relationships\n"
+            + ("\n".join(relation_lines) if relation_lines else "- None")
+            + "\n\n## Other Architectural Members\n"
+            + ("\n".join(roster_lines) if roster_lines else "- None")
+            + f"\n\nCurrent heuristic label: \"{heuristic_label}\"\n\n"
+            "Reply with ONLY the label — no quotes, no explanation, no punctuation. "
+            "Examples of good labels:\n"
+            "- Authentication & Session Management\n"
+            "- REST API Request Handling\n"
+            "- Database Connection Pooling\n"
+            "- UI Component Rendering Pipeline\n"
+            "- Test Infrastructure & Fixtures\n"
+        )
+        return prompt
+
     # ========== LLM Summaries (Optional) ==========
 
     def generate_summaries(

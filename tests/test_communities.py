@@ -669,6 +669,119 @@ class TestRetrievalFormatting:
         assert 'list_communities' not in tool_names
 
 
+# ========== LLM Label Tests ==========
+
+class TestLLMLabels:
+
+    def test_label_prompt_construction(self, three_cluster_kg):
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        first_cid = list(cd['communities'].keys())[0]
+        community = cd['communities'][first_cid]
+
+        prompt = analyzer._build_label_prompt(kg._graph, community)
+        assert "Key Entities" in prompt
+        assert "Key Relationships" in prompt
+        assert "3-7 words" in prompt
+        assert "Reply with ONLY the label" in prompt
+        # Heuristic label appears as reference
+        assert community['label'] in prompt
+
+    def test_generate_labels(self, three_cluster_kg):
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        # Save original heuristic labels
+        original_labels = {
+            cid: c['label'] for cid, c in cd['communities'].items()
+        }
+
+        def mock_llm(prompt):
+            return "Authentication & Session Management"
+
+        count = analyzer.generate_labels(kg._graph, cd, mock_llm)
+        assert count == cd['num_communities']
+
+        # All labels should be updated
+        for cid, cinfo in cd['communities'].items():
+            assert cinfo['label'] == "Authentication & Session Management"
+            assert cinfo['label'] != original_labels[cid]
+
+    def test_generate_labels_cleans_output(self, three_cluster_kg):
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        def mock_llm(prompt):
+            return '  "REST API Request Handling."  '
+
+        count = analyzer.generate_labels(kg._graph, cd, mock_llm)
+        assert count > 0
+        for cinfo in cd['communities'].values():
+            label = cinfo['label']
+            assert not label.startswith('"')
+            assert not label.endswith('.')
+            assert not label.startswith(' ')
+
+    def test_generate_labels_truncates_long_output(self, three_cluster_kg):
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        def mock_llm(prompt):
+            return "A" * 100   # Way too long
+
+        analyzer.generate_labels(kg._graph, cd, mock_llm)
+        for cinfo in cd['communities'].values():
+            assert len(cinfo['label']) <= 80
+
+    def test_generate_labels_keeps_heuristic_on_failure(self, three_cluster_kg):
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        original_labels = {
+            cid: c['label'] for cid, c in cd['communities'].items()
+        }
+
+        def failing_llm(prompt):
+            raise RuntimeError("LLM unavailable")
+
+        count = analyzer.generate_labels(kg._graph, cd, failing_llm)
+        assert count == 0
+
+        # Labels should be unchanged (heuristic preserved)
+        for cid, cinfo in cd['communities'].items():
+            assert cinfo['label'] == original_labels[cid]
+
+    def test_generate_labels_empty_communities(self, kg):
+        analyzer = CommunityAnalyzer()
+        count = analyzer.generate_labels(
+            kg._graph, {"communities": {}}, lambda p: "label"
+        )
+        assert count == 0
+
+    def test_labels_run_before_summaries(self, three_cluster_kg):
+        """Labels should improve summary prompts — verify the summary prompt
+        uses the updated label after generate_labels() runs."""
+        kg, auth, doc, data = three_cluster_kg
+        analyzer = CommunityAnalyzer()
+        cd = analyzer.detect_communities(kg._graph)
+
+        def mock_llm(prompt):
+            return "Auth & Security Layer"
+
+        analyzer.generate_labels(kg._graph, cd, mock_llm)
+
+        first_cid = list(cd['communities'].keys())[0]
+        community = cd['communities'][first_cid]
+        prompt = analyzer._build_summary_prompt(kg._graph, community, max_tokens=200)
+        assert "Auth & Security Layer" in prompt
+
+
 # ========== LLM Summary Tests ==========
 
 class TestLLMSummaries:

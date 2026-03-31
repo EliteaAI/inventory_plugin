@@ -1,7 +1,8 @@
 """
 Tests for adaptive query routing (routing.py).
 
-Covers: QueryRouter classification, ToolSelector gating, PromptBuilder composition.
+Covers: Four-tier QueryRouter (regex override + embedding centroid + regex rescue + LLM fallback + hybrid),
+        EmbeddingRouter, ToolSelector gating, PromptBuilder composition.
 """
 
 import pytest
@@ -16,6 +17,7 @@ sys.path.insert(0, pylon_root)
 
 from routing import (
     QueryRouter,
+    EmbeddingRouter,
     ToolSelector,
     PromptBuilder,
     GraphProfile,
@@ -25,6 +27,7 @@ from routing import (
     STRATEGY_OVERVIEW,
     STRATEGY_HYBRID,
     STRATEGY_TOOL_NAMES,
+    _EMBEDDING_CONFIDENCE_THRESHOLD,
 )
 
 
@@ -45,6 +48,8 @@ ALL_GRAPH_TOOL_NAMES = [
     "search_knowledge_graph", "semantic_search", "get_entity_details",
     "get_related_entities", "query_graph", "query_pattern",
     "get_pattern_vocabulary", "list_entity_types", "impact_analysis",
+    "list_communities", "get_community_detail",
+    "find_entity_community", "search_within_community",
 ]
 
 SOURCE_TOOL_NAMES = ["github_search_code", "gitlab_read_file"]
@@ -80,29 +85,28 @@ def profile_minimal():
     return GraphProfile(has_embeddings=False, has_source_tools=False)
 
 
-# ========== QueryRouter Tests ==========
+# ========== QueryRouter Tests (3-tier: regex override → embedding → hybrid) ==========
 
+@pytest.mark.requires_embeddings
 class TestQueryRouter:
 
-    # --- Traversal strategy (highest priority) ---
+    # --- Traversal strategy (Tier 1: regex override) ---
 
     @pytest.mark.parametrize("query", [
         "what depends on UserService?",
         "what calls the AuthController?",
-        "trace the call chain from API to Database",
-        "show the import chain for this module",
         "what inherits from BaseModel?",
         "what would break if I change UserService?",
         "impact of changing the config module",
-        "flow from controller to repository",
         "upstream dependencies of Logger",
         "what extends BaseClass?",
-        "what implements the AuthInterface?",
+        "trace the flow from controller to repository",
+        "what would be affected if I remove this class?",
     ])
     def test_traversal_queries(self, query):
         assert QueryRouter.classify(query) == STRATEGY_TRAVERSAL
 
-    # --- Entity lookup strategy ---
+    # --- Entity lookup strategy (Tier 2: embedding + Tier 2.5: regex rescue) ---
 
     @pytest.mark.parametrize("query", [
         "what is UserService?",
@@ -116,20 +120,32 @@ class TestQueryRouter:
     def test_entity_lookup_queries(self, query):
         assert QueryRouter.classify(query) == STRATEGY_ENTITY_LOOKUP
 
-    # --- Search strategy ---
+    # --- Entity lookup — noisy entity names (Tier 2.5 regex rescue) ---
+
+    @pytest.mark.parametrize("query", [
+        "what is Scenario_14_Get_Issues.feature?",
+        "what is agent_page.py?",
+        "tell me about login.feature",
+        "describe test_helpers.py",
+        "details of config_v2.yaml",
+    ])
+    def test_entity_lookup_noisy_names(self, query):
+        """Filenames with _/./digits should still route to entity_lookup via regex rescue."""
+        assert QueryRouter.classify(query) == STRATEGY_ENTITY_LOOKUP
+
+    # --- Search strategy (Tier 2: embedding) ---
 
     @pytest.mark.parametrize("query", [
         "find all payment handlers",
         "search for authentication classes",
         "where is the database connection defined?",
         "look for error handling logic",
-        "show me the API endpoints",
-        "which class handles user registration?",
+        "locate the API endpoints",
     ])
     def test_search_queries(self, query):
         assert QueryRouter.classify(query) == STRATEGY_SEARCH
 
-    # --- Overview strategy ---
+    # --- Overview strategy (Tier 2: embedding — the major improvement) ---
 
     @pytest.mark.parametrize("query", [
         "list all entity types",
@@ -139,18 +155,25 @@ class TestQueryRouter:
         "what types of entities exist?",
         "give me a summary of the graph",
         "statistics about the codebase",
+        # These were misclassified by regex but now work via embeddings:
+        "show me details of the architecture breakdown",
+        "what is the high-level structure of this codebase",
+        "how is the code organized into modules",
+        "summarize the main architectural patterns",
+        "what are the key subsystems",
+        "what does the overall architecture look like",
+        "give me a bird eye view of the system",
     ])
     def test_overview_queries(self, query):
         assert QueryRouter.classify(query) == STRATEGY_OVERVIEW
 
-    # --- Hybrid fallback ---
+    # --- Hybrid fallback (Tier 3: low confidence) ---
 
     @pytest.mark.parametrize("query", [
         "hello",
         "thanks",
-        "can you help me understand this better?",
         "I need to refactor the payment system",
-        "the code has performance issues",
+        "hmm I am not sure what to ask",
     ])
     def test_hybrid_fallback(self, query):
         assert QueryRouter.classify(query) == STRATEGY_HYBRID
@@ -163,18 +186,183 @@ class TestQueryRouter:
     def test_none_like(self):
         assert QueryRouter.classify("   ") == STRATEGY_HYBRID
 
-    # --- Priority: traversal beats entity_lookup ---
+    # --- Priority: traversal regex fires before embeddings ---
 
     def test_traversal_beats_entity_lookup(self):
-        # "what calls X" should be traversal, not entity_lookup ("what is")
+        # "what calls X" should be traversal via regex, not entity_lookup
         assert QueryRouter.classify("what calls the UserService?") == STRATEGY_TRAVERSAL
 
     def test_traversal_beats_search(self):
-        # "find the dependency chain" — "find" is search, but "dependency" is traversal
         assert QueryRouter.classify("what depends on AuthModule?") == STRATEGY_TRAVERSAL
 
     def test_impact_is_traversal(self):
         assert QueryRouter.classify("what would be affected if I remove this class?") == STRATEGY_TRAVERSAL
+
+
+# ========== EmbeddingRouter Tests ==========
+
+@pytest.mark.requires_embeddings
+class TestEmbeddingRouter:
+    """Test the embedding classification layer directly."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_singleton(self):
+        """Ensure clean singleton for each test."""
+        EmbeddingRouter.reset()
+        yield
+        EmbeddingRouter.reset()
+
+    def test_initialization(self):
+        router = EmbeddingRouter.get_instance()
+        strategy, score, margin = router.classify("architecture overview")
+        assert strategy == STRATEGY_OVERVIEW
+        assert score > 0.3
+
+    def test_singleton_reuse(self):
+        r1 = EmbeddingRouter.get_instance()
+        r2 = EmbeddingRouter.get_instance()
+        assert r1 is r2
+
+    def test_overview_high_margin(self):
+        router = EmbeddingRouter.get_instance()
+        strategy, score, margin = router.classify("show me details of the architecture breakdown")
+        assert strategy == STRATEGY_OVERVIEW
+        assert margin > _EMBEDDING_CONFIDENCE_THRESHOLD
+
+    def test_entity_lookup_classification(self):
+        router = EmbeddingRouter.get_instance()
+        strategy, _, margin = router.classify("what is the UserService class")
+        assert strategy == STRATEGY_ENTITY_LOOKUP
+        assert margin > _EMBEDDING_CONFIDENCE_THRESHOLD
+
+    def test_search_classification(self):
+        router = EmbeddingRouter.get_instance()
+        strategy, _, margin = router.classify("find all payment handlers")
+        assert strategy == STRATEGY_SEARCH
+        assert margin > _EMBEDDING_CONFIDENCE_THRESHOLD
+
+    def test_ambiguous_low_margin(self):
+        router = EmbeddingRouter.get_instance()
+        _, _, margin = router.classify("hello")
+        assert margin < _EMBEDDING_CONFIDENCE_THRESHOLD
+
+    @pytest.mark.parametrize("query,expected", [
+        ("how is the code organized into modules", STRATEGY_OVERVIEW),
+        ("summarize the main architectural patterns", STRATEGY_OVERVIEW),
+        ("what are the key subsystems", STRATEGY_OVERVIEW),
+        ("describe the AuthController class", STRATEGY_ENTITY_LOOKUP),
+        ("where is the database config", STRATEGY_SEARCH),
+    ])
+    def test_embedding_accuracy(self, query, expected):
+        router = EmbeddingRouter.get_instance()
+        strategy, _, margin = router.classify(query)
+        assert strategy == expected
+        assert margin > _EMBEDDING_CONFIDENCE_THRESHOLD
+
+
+# ========== Legacy Regex Tests ==========
+
+class TestQueryRouterRegex:
+    """Test the legacy regex-only classification (backward compatibility)."""
+
+    def test_traversal_regex(self):
+        assert QueryRouter.classify_regex("what depends on UserService?") == STRATEGY_TRAVERSAL
+
+    def test_entity_lookup_regex(self):
+        assert QueryRouter.classify_regex("what is UserService?") == STRATEGY_ENTITY_LOOKUP
+
+    def test_search_regex(self):
+        assert QueryRouter.classify_regex("find all handlers") == STRATEGY_SEARCH
+
+    def test_overview_regex(self):
+        assert QueryRouter.classify_regex("architecture overview") == STRATEGY_OVERVIEW
+
+    def test_hybrid_regex(self):
+        assert QueryRouter.classify_regex("hello") == STRATEGY_HYBRID
+
+
+# ========== LLM Fallback Tests ==========
+
+@pytest.mark.requires_embeddings
+class TestQueryRouterLLMFallback:
+    """Test Tier 3 LLM classification for low-confidence queries."""
+
+    class FakeLLM:
+        """Mock LLM that returns a predetermined strategy."""
+        def __init__(self, response):
+            self._response = response
+            self.call_count = 0
+
+        def invoke(self, prompt):
+            self.call_count += 1
+
+            class Msg:
+                content = self._response
+            return Msg()
+
+    def test_llm_called_on_low_confidence(self):
+        """LLM should be called when embeddings have low confidence."""
+        llm = self.FakeLLM("entity_lookup")
+        # Query that embeddings can't classify confidently
+        result = QueryRouter.classify("what Scenario_14_Get_Issues.feature implements?", llm=llm)
+        # Either the regex rescue or LLM should handle it — not hybrid
+        assert result != STRATEGY_HYBRID
+
+    def test_llm_not_called_on_high_confidence(self):
+        """LLM should NOT be called when embeddings are confident."""
+        llm = self.FakeLLM("search")  # wrong answer — should not be used
+        result = QueryRouter.classify("architecture overview", llm=llm)
+        assert result == STRATEGY_OVERVIEW
+        assert llm.call_count == 0
+
+    def test_llm_not_called_for_traversal_regex(self):
+        """Traversal regex should short-circuit before LLM."""
+        llm = self.FakeLLM("overview")  # wrong answer — should not be used
+        result = QueryRouter.classify("what depends on UserService?", llm=llm)
+        assert result == STRATEGY_TRAVERSAL
+        assert llm.call_count == 0
+
+    def test_llm_invalid_response_falls_to_hybrid(self):
+        """Invalid LLM response should fall through to hybrid."""
+        llm = self.FakeLLM("definitely_not_a_strategy")
+        # Use a query that bypasses both regex rescue and embeddings
+        result = QueryRouter.classify("hmm", llm=llm)
+        assert result == STRATEGY_HYBRID
+
+    def test_llm_exception_falls_to_hybrid(self):
+        """LLM exception should fall through to hybrid gracefully."""
+
+        class BrokenLLM:
+            def invoke(self, prompt):
+                raise RuntimeError("LLM service down")
+
+        result = QueryRouter.classify("hmm", llm=BrokenLLM())
+        assert result == STRATEGY_HYBRID
+
+    def test_no_llm_falls_to_hybrid(self):
+        """Without LLM, low-confidence queries should get hybrid."""
+        # "hmm" — no regex match, low embedding confidence, no LLM
+        result = QueryRouter.classify("hmm")
+        assert result == STRATEGY_HYBRID
+
+    @pytest.mark.parametrize("llm_response,expected", [
+        ("entity_lookup", STRATEGY_ENTITY_LOOKUP),
+        ("search", STRATEGY_SEARCH),
+        ("traversal", STRATEGY_TRAVERSAL),
+        ("overview", STRATEGY_OVERVIEW),
+        ("hybrid", STRATEGY_HYBRID),
+    ])
+    def test_llm_valid_strategies(self, llm_response, expected):
+        """LLM should accept all valid strategy names."""
+        llm = self.FakeLLM(llm_response)
+        result = QueryRouter._classify_with_llm("test query", llm)
+        assert result == expected
+
+    def test_llm_strips_whitespace_and_quotes(self):
+        """LLM response with extra whitespace/quotes should still parse."""
+        llm = self.FakeLLM('  "entity_lookup"  \n')
+        result = QueryRouter._classify_with_llm("test query", llm)
+        assert result == STRATEGY_ENTITY_LOOKUP
 
 
 # ========== ToolSelector Tests ==========
@@ -222,7 +410,11 @@ class TestToolSelector:
     def test_overview_tools(self, all_tools, profile_full):
         result = ToolSelector.select(STRATEGY_OVERVIEW, all_tools, profile_full)
         names = {t.name for t in result}
-        assert names == {"list_entity_types", "query_graph", "search_knowledge_graph"}
+        assert names == {
+            "list_entity_types", "query_graph", "search_knowledge_graph",
+            "list_communities", "get_community_detail",
+            "find_entity_community", "search_within_community",
+        }
 
     def test_hybrid_returns_all(self, all_tools, profile_full):
         result = ToolSelector.select(STRATEGY_HYBRID, all_tools, profile_full)

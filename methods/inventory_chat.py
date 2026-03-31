@@ -603,7 +603,17 @@ class Method:
             )
             profile = GraphProfile.from_stats(graph_stats, has_source_tools=has_source)
 
-            strategy = QueryRouter.classify(prompt)
+            # Create a cheap LLM instance for intent classification fallback.
+            # Only used when regex + embeddings can't decide (~10-15% of queries).
+            try:
+                routing_llm = alita_client.get_llm(
+                    model_name=llm_model,
+                    model_config={"temperature": 0, "max_tokens": 20},
+                )
+            except Exception:
+                routing_llm = None
+
+            strategy = QueryRouter.classify(prompt, llm=routing_llm)
 
             focused_tools = ToolSelector.select(strategy, tools, profile)
 

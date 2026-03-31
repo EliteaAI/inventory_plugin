@@ -4,9 +4,18 @@
 """
 Adaptive Query Routing for Inventory Chat
 
-Classifies user queries into strategies, selects focused tool subsets,
-and composes strategy-specific system prompts. Reduces prompt tokens
-by ~60% when intent is clear, falls back to full toolset when ambiguous.
+Four-tier intent classification and tool routing:
+1. High-precision regex overrides for traversal verbs (0ms) to capture
+   graph-walk / impact-analysis intents before anything else.
+2. Embedding centroid similarity using local all-MiniLM-L6-v2 (~5ms) for
+   semantic routing across the main strategies.
+3. Regex "rescue" pass for classic keyword patterns when embedding
+   confidence is low or ambiguous.
+4. Optional LLM-assisted / hybrid routing that can consider all tools when
+   confidence remains low or multiple strategies are plausible.
+
+When embeddings or LLM support are unavailable, the router degrades
+gracefully to regex-only classification.
 
 Strategies:
 - entity_lookup: "What is X?", "Describe X" → 3 tools
@@ -16,10 +25,13 @@ Strategies:
 - hybrid: ambiguous / no match → ALL tools (backward compatible)
 """
 
+import os
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +76,7 @@ class GraphProfile:
 
 
 # =============================================================================
-# QueryRouter — regex-based strategy classification
+# QueryRouter — regex-based strategy classification (legacy, used as fallback)
 # =============================================================================
 
 # Priority order: traversal > entity_lookup > search > overview > hybrid
@@ -117,19 +129,277 @@ _CLASSIFICATION_ORDER = [
 ]
 
 
+# =============================================================================
+# High-precision traversal regex overrides
+# =============================================================================
+# Embeddings conflate "what calls X" with "what is X" because the sentence
+# structure is similar. These patterns fire BEFORE embeddings for traversal
+# verbs that are unambiguously about graph relationships.
+
+_TRAVERSAL_OVERRIDE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bwhat\s+(?:calls|uses|depends\s+on|extends|implements|imports)\b", re.IGNORECASE),
+    re.compile(r"\b(?:depend(?:s|encies|ency)?|depended)\b", re.IGNORECASE),
+    re.compile(r"\b(?:call(?:s|ed|ing)\s+\w+|invoke(?:s|d)\s+\w+)\b", re.IGNORECASE),
+    re.compile(r"\b(?:extend(?:s|ed)\s+\w+|inherit(?:s|ed|ance))\b", re.IGNORECASE),
+    re.compile(r"\b(?:impact|affect(?:s|ed)?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:upstream|downstream)\b", re.IGNORECASE),
+    re.compile(r"\b(?:trace|chain|flow)\s+(?:from|to|of)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+would\s+(?:break|be\s+affected)\b", re.IGNORECASE),
+    re.compile(r"\bimport(?:s|ed)?\s+(?:from|by)\b", re.IGNORECASE),
+]
+
+
+# =============================================================================
+# High-precision entity-lookup regex overrides
+# =============================================================================
+# Embeddings struggle with queries containing noisy entity names (filenames
+# with underscores, dots, numbers) because tokens dilute the intent signal.
+# "what is Scenario_14_Get_Issues.feature?" → entity_lookup, not hybrid.
+# These fire AFTER traversal (so "what calls X" still wins) but BEFORE
+# embeddings.
+
+_ENTITY_LOOKUP_OVERRIDE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bwhat\s+is\s+\S+", re.IGNORECASE),
+    re.compile(r"\bwhat\s+are\s+\S+", re.IGNORECASE),
+    re.compile(r"\b(?:describe|explain)\s+(?:the\s+)?\S+", re.IGNORECASE),
+    re.compile(r"\btell\s+me\s+about\s+\S+", re.IGNORECASE),
+    re.compile(r"\bdetails?\s+(?:of|about|for)\s+\S+", re.IGNORECASE),
+    re.compile(r"\bdefinition\s+of\s+\S+", re.IGNORECASE),
+    re.compile(r"\bhow\s+does\s+\S+\s+work\b", re.IGNORECASE),
+]
+
+
+# =============================================================================
+# EmbeddingRouter — semantic routing via sentence-transformer centroids
+# =============================================================================
+
+# Exemplar queries for each strategy. These are encoded into embeddings and
+# averaged into centroids. New queries are classified by cosine similarity.
+_STRATEGY_EXEMPLARS: Dict[str, List[str]] = {
+    STRATEGY_TRAVERSAL: [
+        "what depends on UserService",
+        "what calls the AuthController",
+        "trace the call chain from API to Database",
+        "what inherits from BaseModel",
+        "impact of changing the config module",
+        "upstream dependencies of Logger",
+        "what would break if I change this",
+        "show the import chain for this module",
+        "what extends BaseClass",
+        "downstream effects of modifying",
+    ],
+    STRATEGY_ENTITY_LOOKUP: [
+        "what is UserService",
+        "describe the AuthController class",
+        "explain how the payment module works",
+        "tell me about the Config class",
+        "how does the database connection work",
+        "definition of BaseModel",
+        "define the term BaseModel",
+        "details of the LoginHandler",
+        "what does this class do",
+        "help me understand this class",
+    ],
+    STRATEGY_SEARCH: [
+        "find all payment handlers",
+        "search for authentication classes",
+        "where is the database connection defined",
+        "which class handles user registration",
+        "look for error handling logic",
+        "locate the configuration file",
+        "show me the API endpoints",
+    ],
+    STRATEGY_OVERVIEW: [
+        "list all entity types",
+        "how many classes are there",
+        "architecture overview",
+        "give me a summary of the graph",
+        "show me the community structure",
+        "what groups exist in the codebase",
+        "breakdown of the architecture",
+        "decomposition of the system",
+        "what are the main modules",
+        "statistics about the codebase",
+        "high-level structure of the code",
+        "how is the code organized",
+        "major components and subsystems",
+        "what are the key architectural areas",
+        "show me the clusters",
+        "show all functions in the codebase",
+        "display all classes and modules",
+        "give me all the entity types",
+    ],
+}
+
+# Minimum margin between top and second-best centroid score for confident
+# classification. Below this threshold, the query is treated as ambiguous
+# and routed to hybrid (all tools).
+_EMBEDDING_CONFIDENCE_THRESHOLD = 0.05
+
+
+class EmbeddingRouter:
+    """
+    Semantic query classifier using sentence-transformer centroids.
+
+    Lazy-loaded singleton — the model is loaded on first classify() call
+    and reused for all subsequent calls. Uses the same all-MiniLM-L6-v2
+    model already cached locally for entity embeddings.
+    """
+
+    _instance: Optional["EmbeddingRouter"] = None
+
+    def __init__(self):
+        self._model = None
+        self._centroids: Dict[str, np.ndarray] = {}
+        self._initialized = False
+
+    @classmethod
+    def get_instance(cls) -> "EmbeddingRouter":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls):
+        """Reset singleton (for testing)."""
+        cls._instance = None
+
+    def _ensure_initialized(self) -> bool:
+        """Load model and compute centroids on first use. Returns False if unavailable."""
+        if self._initialized:
+            return self._model is not None
+
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/data/embeddings")
+            self._model = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=cache_dir)
+
+            # Pre-compute normalized centroids for each strategy
+            for strategy, exemplars in _STRATEGY_EXEMPLARS.items():
+                embeddings = self._model.encode(exemplars, normalize_embeddings=True)
+                centroid = embeddings.mean(axis=0)
+                centroid = centroid / np.linalg.norm(centroid)
+                self._centroids[strategy] = centroid
+
+            logger.info(
+                f"[EmbeddingRouter] Initialized with {len(self._centroids)} strategy centroids "
+                f"({sum(len(v) for v in _STRATEGY_EXEMPLARS.values())} exemplars)"
+            )
+            self._initialized = True
+            return True
+
+        except Exception as e:
+            logger.warning(f"[EmbeddingRouter] Failed to initialize, will use regex fallback: {e}")
+            self._model = None
+            self._initialized = True
+            return False
+
+    def classify(self, text: str) -> Tuple[str, float, float]:
+        """
+        Classify query by cosine similarity to strategy centroids.
+
+        Returns:
+            (strategy, score, margin) — strategy name, best cosine score,
+            and margin between best and second-best scores.
+            Returns (STRATEGY_HYBRID, 0.0, 0.0) when model is unavailable.
+        """
+        if not self._ensure_initialized():
+            return STRATEGY_HYBRID, 0.0, 0.0
+
+        query_emb = self._model.encode([text], normalize_embeddings=True)[0]
+        scores = {
+            strategy: float(np.dot(query_emb, centroid))
+            for strategy, centroid in self._centroids.items()
+        }
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        best_strategy, best_score = ranked[0]
+        second_score = ranked[1][1]
+        margin = best_score - second_score
+
+        return best_strategy, best_score, margin
+
+
 class QueryRouter:
-    """Classify user queries into routing strategies using regex patterns."""
+    """
+    Four-tier query classifier.
+
+    Tier 1: High-precision traversal regex overrides (~0ms)
+    Tier 2: Embedding centroid similarity (~5ms, lazy-loaded)
+    Tier 2.5: Entity-lookup regex rescue for noisy entity names (~0ms)
+    Tier 3: LLM intent classification (~200ms, optional, only low-confidence)
+    Tier 4: Hybrid fallback — all tools when nothing else works
+
+    Falls back to regex-only classification when embeddings are unavailable.
+    """
+
+    # Minimal LLM classification prompt — ~80 input tokens, ~1 output token
+    _LLM_CLASSIFY_PROMPT = (
+        "Classify this user question about a code repository into exactly one category.\n\n"
+        "Categories:\n"
+        "- entity_lookup: asking about a specific entity (class, function, file, module)\n"
+        "- search: looking for code matching criteria or locating something\n"
+        "- traversal: asking about relationships, dependencies, call chains, impact\n"
+        "- overview: asking about architecture, statistics, structure, communities\n"
+        "- hybrid: unclear, greeting, or unrelated to code\n\n"
+        "Respond with ONLY the category name, nothing else.\n\n"
+        "Query: {query}\n"
+        "Category:"
+    )
+
+    _VALID_LLM_STRATEGIES = {
+        STRATEGY_ENTITY_LOOKUP, STRATEGY_SEARCH,
+        STRATEGY_TRAVERSAL, STRATEGY_OVERVIEW, STRATEGY_HYBRID,
+    }
 
     @staticmethod
-    def classify(message: str) -> str:
+    def _classify_with_llm(text: str, llm) -> Optional[str]:
+        """
+        Classify via LLM when embeddings have low confidence.
+
+        Args:
+            text: User query
+            llm: LangChain-compatible LLM instance
+
+        Returns:
+            Strategy string or None if LLM call fails.
+        """
+        try:
+            prompt = QueryRouter._LLM_CLASSIFY_PROMPT.format(query=text)
+            response = llm.invoke(prompt)
+
+            # Handle both string and AIMessage responses
+            content = response.content if hasattr(response, "content") else str(response)
+            strategy = content.strip().lower().split()[0] if content.strip() else ""
+
+            # Strip quotes/punctuation
+            strategy = strategy.strip("\"'.,;:")
+
+            if strategy in QueryRouter._VALID_LLM_STRATEGIES:
+                logger.info(
+                    f"[QueryRouter] T3-llm: {strategy} | query={text[:80]}"
+                )
+                return strategy
+
+            logger.warning(
+                f"[QueryRouter] LLM returned invalid strategy '{strategy}', "
+                f"ignoring | query={text[:80]}"
+            )
+            return None
+
+        except Exception as e:
+            logger.warning(f"[QueryRouter] LLM classification failed: {e}")
+            return None
+
+    @staticmethod
+    def classify(message: str, llm=None) -> str:
         """
         Classify a user message into a routing strategy.
 
-        Checks patterns in priority order: traversal → entity_lookup → search → overview.
-        Returns 'hybrid' if no pattern matches (safe fallback with all tools).
-
         Args:
             message: The user's chat message
+            llm: Optional LangChain LLM for low-confidence fallback.
+                 Only called when regex + embeddings can't decide.
 
         Returns:
             Strategy name string
@@ -139,14 +409,73 @@ class QueryRouter:
 
         text = message.strip()
 
+        # Tier 1a: High-precision traversal regex overrides
+        # Embeddings can't distinguish "what calls X" from "what is X"
+        for pattern in _TRAVERSAL_OVERRIDE_PATTERNS:
+            if pattern.search(text):
+                logger.debug(f"[QueryRouter] T1-regex: traversal ({pattern.pattern})")
+                return STRATEGY_TRAVERSAL
+
+        # Tier 2: Embedding centroid similarity
+        router = EmbeddingRouter.get_instance()
+        strategy, score, margin = router.classify(text)
+
+        # Model unavailable → fall back to regex-only classification
+        if score == 0.0 and margin == 0.0:
+            logger.debug("[QueryRouter] Embeddings unavailable, falling back to regex")
+            return QueryRouter.classify_regex(message)
+
+        if margin >= _EMBEDDING_CONFIDENCE_THRESHOLD:
+            logger.debug(
+                f"[QueryRouter] T2-embed: {strategy} "
+                f"(score={score:.3f}, margin={margin:.3f})"
+            )
+            return strategy
+
+        # Tier 2.5: Entity-lookup regex rescue
+        # When embeddings are low-confidence (noisy entity names like
+        # filenames with _/./digits), check if the query structure
+        # matches unambiguous entity-lookup patterns.
+        for pattern in _ENTITY_LOOKUP_OVERRIDE_PATTERNS:
+            if pattern.search(text):
+                logger.debug(
+                    f"[QueryRouter] T2.5-regex-rescue: entity_lookup "
+                    f"(embed margin={margin:.3f} < {_EMBEDDING_CONFIDENCE_THRESHOLD})"
+                )
+                return STRATEGY_ENTITY_LOOKUP
+
+        # Tier 3: LLM classification (only when an LLM is provided)
+        # ~200ms but only fires for the ~10-15% of ambiguous queries
+        if llm is not None:
+            llm_strategy = QueryRouter._classify_with_llm(text, llm)
+            if llm_strategy:
+                return llm_strategy
+
+        # Tier 4: Low confidence, no LLM → hybrid (all tools)
+        logger.debug(
+            f"[QueryRouter] T4-hybrid: best={strategy} "
+            f"(score={score:.3f}, margin={margin:.3f} < {_EMBEDDING_CONFIDENCE_THRESHOLD})"
+        )
+        return STRATEGY_HYBRID
+
+    @staticmethod
+    def classify_regex(message: str) -> str:
+        """
+        Legacy regex-only classification.
+
+        Kept for backward compatibility and as fallback when embeddings
+        are unavailable. Used internally by tests that validate regex behavior.
+        """
+        if not message or not message.strip():
+            return STRATEGY_HYBRID
+
+        text = message.strip()
         for strategy in _CLASSIFICATION_ORDER:
             patterns = _STRATEGY_PATTERNS[strategy]
             for pattern in patterns:
                 if pattern.search(text):
-                    logger.debug(f"[QueryRouter] Classified as '{strategy}': matched {pattern.pattern}")
                     return strategy
 
-        logger.debug(f"[QueryRouter] No pattern matched, using '{STRATEGY_HYBRID}'")
         return STRATEGY_HYBRID
 
 

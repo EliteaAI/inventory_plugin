@@ -1050,13 +1050,13 @@ class IngestionPipeline(BaseModel):
                 "communities"
             )
 
-            # Generate LLM summaries for each community (parallel)
+            # Generate LLM labels and summaries for each community (parallel)
             if self.llm and num_c > 0:
                 self._log_progress(
-                    f"📝 Generating summaries for {num_c} communities...",
+                    f"🏷️ Generating labels for {num_c} communities...",
                     "communities"
                 )
-                sum_start = time.time()
+                lbl_start = time.time()
                 try:
                     def _llm_invoke(prompt: str) -> str:
                         """Wrap LangChain LLM into a simple str->str callable."""
@@ -1066,6 +1066,32 @@ class IngestionPipeline(BaseModel):
                             return response.content
                         return str(response)
 
+                    label_count = analyzer.generate_labels(
+                        nx_graph=self._knowledge_graph._graph,
+                        community_data=community_data,
+                        llm_callable=_llm_invoke,
+                        max_workers=min(self.max_parallel_extractions, num_c),
+                    )
+                    # Persist after labels (summaries will use improved labels)
+                    self._knowledge_graph.set_community_data(community_data)
+                    lbl_duration = time.time() - lbl_start
+                    logger.info(
+                        f"⏱️ [TIMING] Community labels: {lbl_duration:.3f}s, "
+                        f"{label_count}/{num_c} generated"
+                    )
+                    self._log_progress(
+                        f"🏷️ Generated {label_count}/{num_c} community labels",
+                        "communities"
+                    )
+                except Exception as e:
+                    logger.warning(f"Community label generation failed (non-fatal): {e}")
+
+                self._log_progress(
+                    f"📝 Generating summaries for {num_c} communities...",
+                    "communities"
+                )
+                sum_start = time.time()
+                try:
                     summary_count = analyzer.generate_summaries(
                         nx_graph=self._knowledge_graph._graph,
                         community_data=community_data,
