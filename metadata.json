@@ -1,0 +1,7 @@
+{
+  "name": "Inventory - Knowledge Graph Provider",
+  "version": "1.0.0",
+  "description": "Knowledge graph construction and retrieval for codebase analysis",
+  "depends_on": [],
+  "init_after": []
+}

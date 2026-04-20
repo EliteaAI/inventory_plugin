@@ -1,0 +1,23 @@
+/.venv/
+/.cadence/
+/.idea
+/envs/
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+**/.pytest_cache/
+
+# Node modules
+static/ui/template/node_modules/
+static/ui/template/.vite/
+
+**.env
+static/ui/template/node_modules/

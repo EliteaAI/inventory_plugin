@@ -1,0 +1,320 @@
+/* ChatPanel styles - EliteaUI aligned */
+
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  flex: 1;
+  min-height: 0; /* Required for flex child to shrink */
+  border-radius: 0;
+  overflow: hidden;
+  font-family: "Montserrat", "Roboto", "Arial", sans-serif;
+  font-size: 14px;
+}
+
+/* Dark theme (default) */
+.chat-panel--dark {
+  background: #181F2A;
+}
+
+/* Light theme */
+.chat-panel--light {
+  background: #FFFFFF;
+}
+
+/* Chat input area */
+.chat-panel-input {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  flex-shrink: 0;
+}
+
+.chat-panel--dark .chat-panel-input {
+  background: rgba(14, 19, 29, 0.6);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.chat-panel--light .chat-panel-input {
+  background: #FAFAFA;
+  border-top: 1px solid #CBCED6;
+}
+
+.chat-panel-input textarea {
+  flex: 1;
+  min-height: 40px;
+  max-height: 150px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.chat-panel--dark .chat-panel-input textarea {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #FFFFFF;
+}
+
+.chat-panel--dark .chat-panel-input textarea:focus {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(244, 124, 255, 0.5);
+}
+
+.chat-panel--dark .chat-panel-input textarea::placeholder {
+  color: #ADAFB7;
+}
+
+.chat-panel--light .chat-panel-input textarea {
+  background: #FFFFFF;
+  border: 1px solid #CBCED6;
+  color: #0E131D;
+}
+
+.chat-panel--light .chat-panel-input textarea:focus {
+  border-color: #C428DD;
+}
+
+.chat-panel--light .chat-panel-input textarea::placeholder {
+  color: #777A83;
+}
+
+.chat-panel-input textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Send button - EliteaUI style */
+.chat-panel-send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 28px;
+  border: none;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  transition: background 0.2s, transform 0.1s, opacity 0.2s;
+  flex-shrink: 0;
+}
+
+.chat-panel--dark .chat-panel-send-btn {
+  background: #6ae8fa;
+  color: #0E131D;
+}
+
+.chat-panel--dark .chat-panel-send-btn:hover:not(:disabled) {
+  background: #83EFFF;
+}
+
+.chat-panel--light .chat-panel-send-btn {
+  background: #C428DD;
+}
+
+.chat-panel--light .chat-panel-send-btn:hover:not(:disabled) {
+  background: #9B1FB0;
+}
+
+.chat-panel-send-btn:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.chat-panel-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Stop button */
+.chat-panel-stop-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 28px;
+  background: #D71616;
+  border: none;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  transition: background 0.2s, transform 0.1s;
+  flex-shrink: 0;
+}
+
+.chat-panel-stop-btn:hover {
+  background: #B01212;
+}
+
+.chat-panel-stop-btn:active {
+  transform: scale(0.95);
+}
+
+/* Floating panel wrapper (when used as overlay) */
+.chat-panel-floating {
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Error message */
+.chat-panel-error {
+  padding: 8px 16px;
+  background: rgba(215, 22, 22, 0.1);
+  border-top: 1px solid rgba(215, 22, 22, 0.3);
+  color: #D71616;
+  font-size: 13px;
+}
+
+.chat-panel--light .chat-panel-error {
+  background: rgba(215, 22, 22, 0.05);
+}
+
+/* Toggle button - removed from CSS, now inline in App.jsx */
+
+/* Confirmation Modal */
+.confirmation-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.confirmation-modal {
+  width: 320px;
+  max-width: 90%;
+  border-radius: 12px;
+  padding: 24px;
+  text-align: center;
+  animation: scaleIn 0.2s ease-out;
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.confirmation-modal--dark {
+  background: #181F2A;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.confirmation-modal--light {
+  background: #FFFFFF;
+  border: 1px solid #CBCED6;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+.confirmation-modal-icon {
+  margin-bottom: 16px;
+}
+
+.confirmation-modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.confirmation-modal--dark .confirmation-modal-title {
+  color: #FFFFFF;
+}
+
+.confirmation-modal--light .confirmation-modal-title {
+  color: #0E131D;
+}
+
+.confirmation-modal-message {
+  font-size: 14px;
+  line-height: 1.5;
+  margin-bottom: 24px;
+}
+
+.confirmation-modal--dark .confirmation-modal-message {
+  color: #ADAFB7;
+}
+
+.confirmation-modal--light .confirmation-modal-message {
+  color: #777A83;
+}
+
+.confirmation-modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.confirmation-modal-btn {
+  padding: 10px 24px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+  border: none;
+}
+
+.confirmation-modal-btn:active {
+  transform: scale(0.98);
+}
+
+.confirmation-modal-btn--cancel {
+  background: transparent;
+}
+
+.confirmation-modal--dark .confirmation-modal-btn--cancel {
+  color: #ADAFB7;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.confirmation-modal--dark .confirmation-modal-btn--cancel:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #FFFFFF;
+}
+
+.confirmation-modal--light .confirmation-modal-btn--cancel {
+  color: #777A83;
+  border: 1px solid #CBCED6;
+}
+
+.confirmation-modal--light .confirmation-modal-btn--cancel:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: #0E131D;
+}
+
+.confirmation-modal-btn--confirm {
+  background: #D71616;
+  color: white;
+}
+
+.confirmation-modal-btn--confirm:hover {
+  background: #B01212;
+}
