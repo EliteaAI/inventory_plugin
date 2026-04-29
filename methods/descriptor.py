@@ -100,7 +100,7 @@ class Method:
                         # ========== Ingestion Tools ==========
                         {
                             "name": "run_ingestion",
-                            "description": "Run ingestion pipeline for a toolkit to build/update the knowledge graph. Uses AlitaClient to fetch from the source toolkit.",
+                            "description": "Run ingestion pipeline for a toolkit to build/update the knowledge graph. Uses EliteAClient to fetch from the source toolkit.",
                             "args_schema": {
                                 "toolkit_id": {
                                     "type": "Integer",

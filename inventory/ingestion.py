@@ -23,7 +23,7 @@ Multi-Source Support:
 
 Usage:
     # With full configuration
-    from alita_sdk.community.inventory import IngestionConfig, IngestionPipeline
+    from elitea_sdk.community.inventory import IngestionConfig, IngestionPipeline
     
     config = IngestionConfig.from_env()  # or .from_yaml("config.yml")
     pipeline = IngestionPipeline.from_config(config)
@@ -694,7 +694,7 @@ class IngestionPipeline(BaseModel):
     
     # Core dependencies
     llm: Any = None
-    alita: Any = None
+    elitea: Any = None
     
     # Graph persistence path
     graph_path: str = Field(description="Path to persist the knowledge graph JSON")
@@ -705,7 +705,7 @@ class IngestionPipeline(BaseModel):
     
     # Optional embedding for semantic search
     embedding: Optional[Any] = Field(default=None, description="Embedding model instance")
-    embedding_model: Optional[str] = Field(default=None, description="Embedding model name (for Alita)")
+    embedding_model: Optional[str] = Field(default=None, description="Embedding model name (for EliteA)")
     
     # Control automatic embedding generation during ingestion
     auto_generate_embeddings: bool = Field(
@@ -3055,8 +3055,8 @@ class IngestionPipeline(BaseModel):
             
             # Import chunker for on-the-fly chunking
             try:
-                from alita_sdk.tools.chunkers.universal_chunker import chunk_single_document
-                from alita_sdk.tools.chunkers.code.codeparser import parse_code_files_for_db
+                from elitea_sdk.tools.chunkers.universal_chunker import chunk_single_document
+                from elitea_sdk.tools.chunkers.code.codeparser import parse_code_files_for_db
                 from langchain.text_splitter import RecursiveCharacterTextSplitter
                 has_chunker = True
                 
@@ -3765,7 +3765,7 @@ def ingest_repository(
         IngestionResult with statistics
         
     Example:
-        from alita_sdk.community.github.api_wrapper import GitHubApiWrapper
+        from elitea_sdk.community.github.api_wrapper import GitHubApiWrapper
         
         github = GitHubApiWrapper(
             api_base="...",

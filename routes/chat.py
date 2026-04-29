@@ -618,14 +618,14 @@ class Route:
         log.info(f"[chat_models_route] Getting models for project={effective_project_id}")
 
         try:
-            # Get AlitaClient to fetch models from platform
-            alita_client = self._get_alita_client(int(effective_project_id))
-            if not alita_client:
+            # Get EliteAClient to fetch models from platform
+            elitea_client = self._get_elitea_client(int(effective_project_id))
+            if not elitea_client:
                 return {"error": "Platform API not configured", "models": []}, 500
 
             # Fetch LLM models from platform (includes shared models)
-            models_url = f"{alita_client.base_url}/api/v2/configurations/models/{effective_project_id}?include_shared=true"
-            resp = http_requests.get(models_url, headers=alita_client.headers, verify=False)
+            models_url = f"{elitea_client.base_url}/api/v2/configurations/models/{effective_project_id}?include_shared=true"
+            resp = http_requests.get(models_url, headers=elitea_client.headers, verify=False)
 
             if not resp.ok:
                 log.warning(f"[chat_models_route] Failed to fetch models: {resp.status_code}")

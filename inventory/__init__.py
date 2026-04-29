@@ -7,7 +7,7 @@ This module provides two distinct capabilities:
    from source code repositories. NOT a toolkit - it's a defined process.
    
    Usage:
-       from alita_sdk.community.inventory import (
+       from elitea_sdk.community.inventory import (
            IngestionPipeline, 
            ingest_repository,
            PYTHON_PRESET,
@@ -35,7 +35,7 @@ This module provides two distinct capabilities:
    a pre-built knowledge graph. Can be added to any agent.
    
    Usage:
-       from alita_sdk.community.inventory import InventoryRetrievalToolkit
+       from elitea_sdk.community.inventory import InventoryRetrievalToolkit
        
        # As a toolkit for agents
        toolkit = InventoryRetrievalToolkit.get_toolkit(

@@ -503,9 +503,9 @@ class Method:
         langfuse_callback = None
 
         try:
-            # 1. Get AlitaClient for platform API
-            alita_client = self._get_alita_client(project_id)
-            if not alita_client:
+            # 1. Get EliteAClient for platform API
+            elitea_client = self._get_elitea_client(project_id)
+            if not elitea_client:
                 return {
                     "answer": "",
                     "citations": [],
@@ -515,8 +515,8 @@ class Method:
 
             # 2. Fetch inventory toolkit settings
             import requests as http_requests
-            toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
-            resp = http_requests.get(toolkit_url, headers=alita_client.headers, verify=False)
+            toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
+            resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
 
             if not resp.ok:
                 return {
@@ -531,7 +531,7 @@ class Method:
             toolkit_name = toolkit_data.get("name", f"inventory-{toolkit_id}")
 
             # 3. Fetch Langfuse config for tracing (optional)
-            langfuse_config = fetch_langfuse_config(alita_client)
+            langfuse_config = fetch_langfuse_config(elitea_client)
             langfuse_trace_attrs = None
 
             if langfuse_config:
@@ -567,7 +567,7 @@ class Method:
                 graph_path=graph_path,
                 filters=filters,
                 settings=settings,
-                alita_client=alita_client,
+                elitea_client=elitea_client,
                 touched_entities=touched_entities,
             )
 
@@ -606,7 +606,7 @@ class Method:
             # Create a cheap LLM instance for intent classification fallback.
             # Only used when regex + embeddings can't decide (~10-15% of queries).
             try:
-                routing_llm = alita_client.get_llm(
+                routing_llm = elitea_client.get_llm(
                     model_name=llm_model,
                     model_config={"temperature": 0, "max_tokens": 20},
                 )
@@ -658,7 +658,7 @@ class Method:
                 # Extended thinking requires temperature=1
                 model_config["temperature"] = 1.0
 
-            llm = alita_client.get_llm(
+            llm = elitea_client.get_llm(
                 model_name=llm_model,
                 model_config=model_config,
             )
@@ -739,7 +739,7 @@ class Method:
         graph_path: str,
         filters: Dict[str, Any],
         settings: Dict[str, Any],
-        alita_client,
+        elitea_client,
         touched_entities: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
@@ -779,7 +779,7 @@ class Method:
         source_tools = self._get_source_toolkit_tools(
             project_id=project_id,
             toolkit_id=toolkit_id,
-            alita_client=alita_client,
+            elitea_client=elitea_client,
             settings=settings,
             touched_entities=touched_entities,
         )
@@ -2004,7 +2004,7 @@ class Method:
         """
         Execute the chat agent with the given tools and prompt.
 
-        Uses LangGraph agent pattern (same as alita-sdk) for better tool calling support.
+        Uses LangGraph agent pattern (same as elitea-sdk) for better tool calling support.
 
         Args:
             langfuse_callback: Optional Langfuse CallbackHandler for tracing
@@ -2017,7 +2017,7 @@ class Method:
         from langchain_core.messages import HumanMessage, AIMessage
         from langchain_core.callbacks import BaseCallbackHandler
         from langgraph.checkpoint.memory import MemorySaver
-        from alita_sdk.runtime.langchain.langraph_agent import create_graph
+        from elitea_sdk.runtime.langchain.langraph_agent import create_graph
 
         # Format filters for prompt
         filter_desc = []
@@ -2078,7 +2078,7 @@ class Method:
 
         lc_callback = LangChainCallbackAdapter(callback)
 
-        # Build LangGraph YAML schema (same pattern as alita-sdk Assistant)
+        # Build LangGraph YAML schema (same pattern as elitea-sdk Assistant)
         tool_names = [tool.name for tool in tools] if tools else []
         log.info(f"[_execute_chat_agent] Tool names: {tool_names}")
 
@@ -2142,7 +2142,7 @@ class Method:
 
         # Execute
         try:
-            # Create LangGraph agent using alita-sdk's create_graph
+            # Create LangGraph agent using elitea-sdk's create_graph
             agent = create_graph(
                 client=llm,
                 yaml_schema=yaml_schema,
@@ -2317,7 +2317,7 @@ class Method:
         self,
         project_id: int,
         toolkit_id: int,
-        alita_client,
+        elitea_client,
         settings: Dict[str, Any],
         touched_entities: List[Dict[str, Any]] = None,
     ) -> List:
@@ -2325,13 +2325,13 @@ class Method:
         Get read-only tools from all source toolkits.
 
         Reads sources_status.json to find configured sources, fetches their
-        toolkit configurations, instantiates them using alita-sdk, and
+        toolkit configurations, instantiates them using elitea-sdk, and
         filters to only include read-only operations.
 
         Args:
             project_id: Project ID
             toolkit_id: Inventory toolkit ID
-            alita_client: AlitaClient instance for API calls
+            elitea_client: EliteAClient instance for API calls
             settings: Inventory toolkit settings (for LLM configuration)
             touched_entities: Shared list to track accessed files/entities
 
@@ -2381,8 +2381,8 @@ class Method:
 
             try:
                 # Fetch toolkit configuration from platform with expand=true to get expanded credentials
-                toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}?expand=true"
-                resp = http_requests.get(toolkit_url, headers=alita_client.headers, verify=False)
+                toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}?expand=true"
+                resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
 
                 if not resp.ok:
                     log.warning(f"[_get_source_toolkit_tools] Failed to fetch toolkit {source_toolkit_id}: {resp.status_code}")
@@ -2394,7 +2394,7 @@ class Method:
 
                 log.info(f"[_get_source_toolkit_tools] Instantiating toolkit {source_toolkit_name} (type={toolkit_type}, id={source_toolkit_id})")
 
-                # Build toolkit config for alita-sdk
+                # Build toolkit config for elitea-sdk
                 toolkit_config = {
                     "id": int(source_toolkit_id),
                     "type": toolkit_type,
@@ -2411,16 +2411,16 @@ class Method:
                 )
 
                 # Get LLM for tools that need it
-                llm = alita_client.get_llm(
+                llm = elitea_client.get_llm(
                     model_name=llm_model,
                     model_config={"temperature": DEFAULT_LLM_TEMPERATURE, "max_tokens": DEFAULT_TOOL_LLM_MAX_TOKENS},
                 )
 
-                # Instantiate toolkit tools using alita-sdk
+                # Instantiate toolkit tools using elitea-sdk
                 source_tools = self._instantiate_toolkit_tools(
                     toolkit_config=toolkit_config,
                     llm=llm,
-                    alita_client=alita_client,
+                    elitea_client=elitea_client,
                 )
 
                 if source_tools:
@@ -2446,21 +2446,21 @@ class Method:
         self,
         toolkit_config: Dict[str, Any],
         llm,
-        alita_client,
+        elitea_client,
     ) -> List:
         """
-        Instantiate tools from a toolkit configuration using alita-sdk.
+        Instantiate tools from a toolkit configuration using elitea-sdk.
 
         Args:
             toolkit_config: Toolkit configuration dict
             llm: LLM instance
-            alita_client: AlitaClient instance
+            elitea_client: EliteAClient instance
 
         Returns:
             List of instantiated LangChain tools
         """
         try:
-            from alita_sdk.runtime.toolkits.tools import get_tools
+            from elitea_sdk.runtime.toolkits.tools import get_tools
 
             # Build tools_list format expected by get_tools()
             tools_list = [toolkit_config]
@@ -2468,14 +2468,14 @@ class Method:
             # Instantiate tools
             tools = get_tools(
                 tools_list,
-                alita_client=alita_client,
+                elitea_client=elitea_client,
                 llm=llm,
             )
 
             return tools
 
         except ImportError as e:
-            log.warning(f"[_instantiate_toolkit_tools] alita-sdk not available: {e}")
+            log.warning(f"[_instantiate_toolkit_tools] elitea-sdk not available: {e}")
             return []
         except Exception as e:
             log.exception(f"[_instantiate_toolkit_tools] Error instantiating toolkit: {e}")

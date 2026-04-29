@@ -4,7 +4,7 @@ Pattern loader - universal patterns for text extraction.
 IMPORTANT: Language-specific parsing has been moved to dedicated parsers.
 For parsing code and documents, use the parsers module:
 
-    from alita_sdk.community.inventory.parsers import (
+    from elitea_sdk.community.inventory.parsers import (
         parse_file,
         PythonParser, JavaScriptParser, JavaParser,
         KotlinParser, CSharpParser, RustParser, SwiftParser, GoParser,
@@ -32,7 +32,7 @@ def _create_universal_patterns() -> List[Pattern]:
     
     These patterns extract common textual references from any content.
     For structured content (code, markdown, HTML, etc.), use the 
-    dedicated parsers in alita_sdk.community.inventory.parsers.
+    dedicated parsers in elitea_sdk.community.inventory.parsers.
     """
     return [
         # "See X" / "See also X"
@@ -253,7 +253,7 @@ def extract_references_from_text(
     For structured content (code, markdown, HTML, etc.), use the 
     dedicated parsers instead:
     
-        from alita_sdk.community.inventory.parsers import parse_file
+        from elitea_sdk.community.inventory.parsers import parse_file
         result = parse_file("path/to/file.md")
     
     Args:
@@ -306,7 +306,7 @@ def get_patterns_for_file(file_path: str) -> List[Pattern]:
     Get patterns for a file. Returns universal patterns.
     
     DEPRECATED: Use parsers module for file-specific parsing:
-        from alita_sdk.community.inventory.parsers import parse_file
+        from elitea_sdk.community.inventory.parsers import parse_file
     """
     return get_universal_patterns()
 
@@ -316,7 +316,7 @@ def get_patterns_for_content_type(content_type: str) -> List[Pattern]:
     Get patterns for a content type. Returns universal patterns.
     
     DEPRECATED: Use parsers module for content-specific parsing:
-        from alita_sdk.community.inventory.parsers import MarkdownParser, ConfluenceParser
+        from elitea_sdk.community.inventory.parsers import MarkdownParser, ConfluenceParser
     """
     return get_universal_patterns()
 
@@ -330,7 +330,7 @@ def extract_references_from_content(
     Extract references from content.
     
     DEPRECATED: Use parsers module for structured content:
-        from alita_sdk.community.inventory.parsers import parse_file, MarkdownParser
+        from elitea_sdk.community.inventory.parsers import parse_file, MarkdownParser
     
     For simple text extraction, use extract_references_from_text() instead.
     """

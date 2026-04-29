@@ -1,11 +1,11 @@
 /**
- * AlitaIcon component
+ * EliteAIcon component
  * Elitea brand icon for chat avatar
  */
 import React from 'react';
 import SvgIcon from '@mui/material/SvgIcon';
 
-export default function AlitaIcon(props) {
+export default function EliteAIcon(props) {
   return (
     <SvgIcon {...props}>
       <svg

@@ -1,4 +1,4 @@
-/* ChatHeader styles - AlitaUI aligned */
+/* ChatHeader styles - EliteaUI aligned */
 
 .chat-header {
   display: flex;
@@ -34,7 +34,7 @@
   gap: 8px;
 }
 
-/* New conversation button - AlitaUI style */
+/* New conversation button - EliteaUI style */
 .chat-header-new-btn {
   width: 28px;
   height: 28px;

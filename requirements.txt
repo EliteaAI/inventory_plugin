@@ -1,5 +1,5 @@
 # Inventory Plugin Dependencies
-alita-sdk[runtime,tools]>=0.3.556
+elitea-sdk[runtime,tools]>=0.3.556
 networkx>=3.0
 igraph==0.11.9  # Community detection: Leiden, Infomap, Louvain, centrality metrics
 langfuse>=3.0.0  # Optional: for tracing support

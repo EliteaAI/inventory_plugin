@@ -110,16 +110,16 @@ class Method:
         }
 
     @web.method()
-    def _get_alita_client(self, project_id: int):
-        """Create AlitaClient instance for platform API calls.
+    def _get_elitea_client(self, project_id: int):
+        """Create EliteAClient instance for platform API calls.
 
         Args:
             project_id: The project ID to use for the client
 
         Returns:
-            AlitaClient instance or None if platform config is missing
+            EliteAClient instance or None if platform config is missing
         """
-        from alita_sdk.runtime.clients.client import AlitaClient
+        from elitea_sdk.runtime.clients.client import EliteAClient
 
         platform_api_url = self.descriptor.config.get("platform_api_url", "")
         platform_token = self.descriptor.config.get("ai_run_platform_token", "")
@@ -136,7 +136,7 @@ class Method:
             log.warning("Platform API URL or token not configured")
             return None
 
-        return AlitaClient(
+        return EliteAClient(
             base_url=platform_api_url.rstrip("/"),
             project_id=int(project_id),
             auth_token=platform_token,
@@ -720,9 +720,9 @@ class Method:
         import os
         from pathlib import Path
 
-        # Create AlitaClient using helper method
-        alita_client = self._get_alita_client(project_id)
-        if not alita_client:
+        # Create EliteAClient using helper method
+        elitea_client = self._get_elitea_client(project_id)
+        if not elitea_client:
             log.warning("Cannot download from artifacts: Platform API URL or token not configured")
             return False
 
@@ -732,7 +732,7 @@ class Method:
             # Download main graph file
             artifact_name = "graph.json"
             log.info(f"Downloading graph from artifacts: {artifact_bucket}/{artifact_name}")
-            graph_data = alita_client.artifact(artifact_bucket).get(artifact_name)
+            graph_data = elitea_client.artifact(artifact_bucket).get(artifact_name)
 
             if graph_data and not self._is_artifact_error(graph_data):
                 # Create directory if needed
@@ -745,7 +745,7 @@ class Method:
 
                 # Try to download sources_status.json
                 try:
-                    status_data = alita_client.artifact(artifact_bucket).get("sources_status.json")
+                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
                     if status_data and not self._is_artifact_error(status_data):
                         status_file = os.path.join(graph_dir, "sources_status.json")
                         with open(status_file, 'w', encoding='utf-8') as f:
@@ -757,14 +757,14 @@ class Method:
                 # Try to download checkpoints (they may or may not exist)
                 try:
                     # List all artifacts in the bucket to find checkpoints
-                    artifacts = alita_client.artifact(artifact_bucket).list(return_as_string=False)
+                    artifacts = elitea_client.artifact(artifact_bucket).list(return_as_string=False)
                     checkpoint_prefix = ".ingestion-checkpoint-"
 
                     for artifact_info in artifacts:
                         if isinstance(artifact_info, dict):
                             artifact_path = artifact_info.get('name', '')
                             if artifact_path.startswith(checkpoint_prefix):
-                                checkpoint_data = alita_client.artifact(artifact_bucket).get(artifact_path)
+                                checkpoint_data = elitea_client.artifact(artifact_bucket).get(artifact_path)
                                 if checkpoint_data and not self._is_artifact_error(checkpoint_data):
                                     checkpoint_file = os.path.join(graph_dir, os.path.basename(artifact_path))
                                     with open(checkpoint_file, 'w', encoding='utf-8') as f:
@@ -895,29 +895,29 @@ class Method:
             if not application_id:
                 return "Error: application_id not found in request context"
 
-            # Create AlitaClient for platform API calls
-            alita_client = self._get_alita_client(project_id)
-            if not alita_client:
+            # Create EliteAClient for platform API calls
+            elitea_client = self._get_elitea_client(project_id)
+            if not elitea_client:
                 return "Error: Platform API URL or token not configured. Check PLATFORM_API_URL and AI_RUN_PLATFORM_TOKEN."
 
-            self.invocation_thinking(f"Connecting to platform at {alita_client.base_url}...")
+            self.invocation_thinking(f"Connecting to platform at {elitea_client.base_url}...")
 
             # Instantiate source toolkit
             # Note: toolkit_id parameter refers to the SOURCE toolkit (GitHub/ADO/GitLab),
             # not the inventory toolkit itself
             # We fetch directly using the correct API path (/api/v2/elitea_core) because
-            # AlitaClient.toolkit() uses the old /api/v1 path
+            # EliteAClient.toolkit() uses the old /api/v1 path
             self.invocation_thinking(f"Loading source toolkit {toolkit_id}...")
             log.info(f"[run_ingestion] Loading source toolkit {toolkit_id}")
             try:
                 import requests as http_requests
-                from alita_sdk.tools import instantiate_toolkit
+                from elitea_sdk.tools import instantiate_toolkit
 
                 # Fetch toolkit data using correct API path with expand=true to get expanded credentials
-                toolkit_api_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
+                toolkit_api_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
                 log.info(f"[run_ingestion] Fetching toolkit from: {toolkit_api_url}")
 
-                resp = http_requests.get(toolkit_api_url, headers=alita_client.headers, verify=False)
+                resp = http_requests.get(toolkit_api_url, headers=elitea_client.headers, verify=False)
                 if not resp.ok:
                     log.error(f"[run_ingestion] Failed to fetch toolkit: {resp.status_code} - {resp.text}")
                     return f"Error: Failed to fetch source toolkit {toolkit_id}: {resp.status_code}"
@@ -925,10 +925,10 @@ class Method:
                 toolkit_data = resp.json()
                 log.info(f"[run_ingestion] Got toolkit data: {toolkit_data.get('name', 'unknown')}, type: {toolkit_data.get('type', 'unknown')}")
 
-                # Add alita client to settings (same as AlitaClient.toolkit() does)
+                # Add elitea client to settings (same as EliteAClient.toolkit() does)
                 if 'settings' not in toolkit_data:
                     toolkit_data['settings'] = {}
-                toolkit_data['settings']['alita'] = alita_client
+                toolkit_data['settings']['elitea'] = elitea_client
 
                 # Instantiate toolkit using instantiate_toolkit from SDK
                 source_toolkit_instance = instantiate_toolkit(toolkit_data)
@@ -948,7 +948,7 @@ class Method:
             # Extract toolkit metadata - prefer name from API response (user-friendly name like "websearch"),
             # then try api_wrapper attributes, then fallback to toolkit_id
             toolkit_name = toolkit_data.get('name') or getattr(source_toolkit, 'toolkit_name', None) or getattr(source_toolkit, 'name', f"toolkit_{toolkit_id}")
-            toolkit_type = toolkit_data.get('type') or getattr(source_toolkit, 'toolkit_type', None) or type(source_toolkit).__name__.lower().replace('apiwrapper', '').replace('alita', '')
+            toolkit_type = toolkit_data.get('type') or getattr(source_toolkit, 'toolkit_type', None) or type(source_toolkit).__name__.lower().replace('apiwrapper', '').replace('elitea', '')
 
             log.info(f"Source toolkit: {toolkit_name} (type: {toolkit_type})")
             self.invocation_thinking(f"Loaded {toolkit_type} toolkit: {toolkit_name}")
@@ -961,9 +961,9 @@ class Method:
                 log.info(f"Settings not in request, fetching inventory toolkit {application_id} settings from platform...")
                 try:
                     # Fetch raw toolkit data from platform API using correct path
-                    inventory_toolkit_url = f"{alita_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
+                    inventory_toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
                     log.info(f"[run_ingestion] Fetching inventory toolkit from: {inventory_toolkit_url}")
-                    resp = http_requests.get(inventory_toolkit_url, headers=alita_client.headers, verify=False)
+                    resp = http_requests.get(inventory_toolkit_url, headers=elitea_client.headers, verify=False)
                     if resp.ok:
                         inventory_toolkit_data = resp.json()
                         inventory_settings = inventory_toolkit_data.get("settings", {})
@@ -1044,8 +1044,8 @@ class Method:
             # Import ingestion modules
             from inventory import IngestionPipeline
 
-            # Get LLM instance directly from client (reusing alita_client created earlier)
-            llm = alita_client.get_llm(
+            # Get LLM instance directly from client (reusing elitea_client created earlier)
+            llm = elitea_client.get_llm(
                 model_name=llm_model or 'gpt-4o-mini',
                 model_config={'temperature': 0.0, 'max_tokens': 4096}
             )
@@ -1067,7 +1067,7 @@ class Method:
             # Create ingestion pipeline with stop-aware progress callback and parallelization config
             pipeline = IngestionPipeline(
                 llm=llm,
-                alita=alita_client,
+                elitea=elitea_client,
                 graph_path=graph_path,
                 auto_generate_embeddings=ingestion_config.get("generate_embeddings", True),
                 progress_callback=progress_callback,
@@ -1079,7 +1079,7 @@ class Method:
                 min_file_chars=ingestion_config.get("min_file_chars", 300),
             )
 
-            # source_toolkit was already instantiated via alita_client.toolkit() above
+            # source_toolkit was already instantiated via elitea_client.toolkit() above
 
             # Create a RunnableConfig for context (same as CLI does)
             import uuid
@@ -1152,7 +1152,7 @@ class Method:
                 if result.success and os.path.exists(graph_path):
                     with open(graph_path, 'rb') as f:
                         graph_data = f.read()
-                    alita_client.artifact(artifact_bucket).create("graph.json", graph_data)
+                    elitea_client.artifact(artifact_bucket).create("graph.json", graph_data)
                     log.info(f"Uploaded graph to artifact bucket: {artifact_bucket}/graph.json")
 
                 # Upload checkpoint file if exists
@@ -1162,7 +1162,7 @@ class Method:
                     with open(checkpoint_file, 'rb') as f:
                         checkpoint_data = f.read()
                     checkpoint_artifact = f".ingestion-checkpoint-{toolkit_name}.json"
-                    alita_client.artifact(artifact_bucket).create(checkpoint_artifact, checkpoint_data)
+                    elitea_client.artifact(artifact_bucket).create(checkpoint_artifact, checkpoint_data)
                     log.info(f"Uploaded checkpoint to artifact bucket: {artifact_bucket}/{checkpoint_artifact}")
 
                 # Always upload sources_status.json (even on failure, to track error state)
@@ -1170,7 +1170,7 @@ class Method:
                 if os.path.exists(status_file):
                     with open(status_file, 'rb') as f:
                         status_data = f.read()
-                    alita_client.artifact(artifact_bucket).create("sources_status.json", status_data)
+                    elitea_client.artifact(artifact_bucket).create("sources_status.json", status_data)
                     log.info(f"Uploaded sources_status.json to artifact bucket: {artifact_bucket}/sources_status.json")
             except Exception as e:
                 log.warning(f"Failed to upload artifacts to bucket: {e}")
@@ -1222,13 +1222,13 @@ class Method:
                         documents_processed=0,
                     )
                     # Try to upload the error status to artifacts
-                    if 'alita_client' in dir() or 'alita_client' in locals():
+                    if 'elitea_client' in dir() or 'elitea_client' in locals():
                         status_file = os.path.join(str(graph_dir), "sources_status.json")
                         if os.path.exists(status_file):
                             with open(status_file, 'rb') as f:
                                 status_data = f.read()
                             error_artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
-                            alita_client.artifact(error_artifact_bucket).create("sources_status.json", status_data)
+                            elitea_client.artifact(error_artifact_bucket).create("sources_status.json", status_data)
             except Exception as status_error:
                 log.warning(f"Failed to update source status on error: {status_error}")
             return f"Error during ingestion: {str(e)}"
@@ -1253,7 +1253,7 @@ class Method:
         if not file_paths:
             return "Error: file_paths is required"
 
-        # TODO: Implement delta update using AlitaClient
+        # TODO: Implement delta update using EliteAClient
         return f"Delta update from toolkit {toolkit_id} - Not yet implemented.", []
 
     @web.method()
@@ -2422,11 +2422,11 @@ class Method:
 
         status_file = graph_dir / "sources_status.json"
         if not status_file.exists() and project_id and application_id:
-            # Try to download from artifacts using AlitaClient
+            # Try to download from artifacts using EliteAClient
             try:
-                alita_client = self._get_alita_client(project_id)
-                if alita_client:
-                    status_data = alita_client.artifact(artifact_bucket).get("sources_status.json")
+                elitea_client = self._get_elitea_client(project_id)
+                if elitea_client:
+                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
                     if status_data and not self._is_artifact_error(status_data):
                         graph_dir.mkdir(parents=True, exist_ok=True)
                         with open(status_file, 'w', encoding='utf-8') as f:
@@ -3032,13 +3032,13 @@ class Method:
             "gpt-4o-mini"
         )
 
-        alita_client = self._get_alita_client(project_id)
-        if not alita_client:
+        elitea_client = self._get_elitea_client(project_id)
+        if not elitea_client:
             if output_format == "json":
                 return json_module.dumps({"error": "Platform API not configured"})
             return "Error: Platform API not configured"
 
-        llm = alita_client.get_llm(
+        llm = elitea_client.get_llm(
             model_name=llm_model,
             model_config={'temperature': 0.0, 'max_tokens': 4096}
         )

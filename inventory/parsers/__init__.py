@@ -25,7 +25,7 @@ The parsers extract:
 - Relationships: imports, calls, inheritance, references, etc.
 
 Usage:
-    from alita_sdk.community.inventory.parsers import (
+    from elitea_sdk.community.inventory.parsers import (
         # Code Parsers
         PythonParser,
         JavaScriptParser,

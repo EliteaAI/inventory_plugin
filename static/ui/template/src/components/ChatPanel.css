@@ -1,4 +1,4 @@
-/* ChatPanel styles - AlitaUI aligned */
+/* ChatPanel styles - EliteaUI aligned */
 
 .chat-panel {
   display: flex;
@@ -89,7 +89,7 @@
   cursor: not-allowed;
 }
 
-/* Send button - AlitaUI style */
+/* Send button - EliteaUI style */
 .chat-panel-send-btn {
   width: 36px;
   height: 36px;

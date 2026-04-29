@@ -1,4 +1,4 @@
-/* ChatMessage styles - AlitaUI aligned */
+/* ChatMessage styles - EliteaUI aligned */
 
 .chat-message {
   display: flex;
@@ -454,7 +454,7 @@
 }
 
 .chat-message-copy-icon.copied {
-  color: #2BD48D; /* AlitaUI success green */
+  color: #2BD48D; /* EliteaUI success green */
 }
 
 /* Thinking steps */

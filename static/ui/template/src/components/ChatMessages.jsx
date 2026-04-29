@@ -4,7 +4,7 @@
  */
 import React, { useEffect, useRef } from 'react';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
-import AlitaIcon from './AlitaIcon';
+import EliteAIcon from './EliteAIcon';
 import ChatMessage from './ChatMessage';
 import './ChatMessages.css';
 
@@ -95,7 +95,7 @@ function ChatMessages({ messages = [], isLoading = false, isStreaming = false, h
         {isStreaming && !messages.some((m) => m.isStreaming) && (
           <div className="chat-message assistant">
             <div className="chat-message-avatar">
-              <AlitaIcon sx={{ fontSize: 18 }} />
+              <EliteAIcon sx={{ fontSize: 18 }} />
             </div>
             <div className="chat-message-content">
               <div className="chat-message-text">

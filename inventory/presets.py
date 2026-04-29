@@ -5,7 +5,7 @@ These presets provide sensible defaults for whitelist/blacklist patterns
 to efficiently ingest code repositories while excluding unnecessary files.
 
 Usage:
-    from alita_sdk.community.inventory.presets import PYTHON_PRESET, JAVASCRIPT_PRESET
+    from elitea_sdk.community.inventory.presets import PYTHON_PRESET, JAVASCRIPT_PRESET
     
     result = pipeline.run(
         source='github',

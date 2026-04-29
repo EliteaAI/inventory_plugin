@@ -1,8 +1,8 @@
 """
 Configuration for Inventory Ingestion Pipeline.
 
-Since the ingestion runs within Alita, the LLM and embeddings are provided
-by the Alita client. Configuration only needs model names, not providers.
+Since the ingestion runs within EliteA, the LLM and embeddings are provided
+by the EliteA client. Configuration only needs model names, not providers.
 
 Usage:
     # From YAML config file
@@ -18,10 +18,10 @@ Usage:
         )
     )
     
-    # Use in pipeline (Alita client provides LLM/embeddings)
+    # Use in pipeline (EliteA client provides LLM/embeddings)
     pipeline = IngestionPipeline(
-        llm=alita.get_langchain_llm(config.llm_model),
-        embedding=alita.get_embeddings(config.embedding_model),
+        llm=elitea.get_langchain_llm(config.llm_model),
+        embedding=elitea.get_embeddings(config.embedding_model),
         graph_path=config.graph_path,
         guardrails=config.guardrails,
     )
@@ -115,11 +115,11 @@ class IngestionConfig(BaseModel):
     """
     Configuration for the ingestion pipeline.
     
-    Since ingestion runs within Alita, only model names are needed.
-    The Alita client handles provider details, API keys, etc.
+    Since ingestion runs within EliteA, only model names are needed.
+    The EliteA client handles provider details, API keys, etc.
     """
     
-    # Model names (Alita provides the actual LLM/embedding instances)
+    # Model names (EliteA provides the actual LLM/embedding instances)
     llm_model: str = Field(
         default="gpt-4o-mini", 
         description="LLM model name (e.g., gpt-4o-mini, claude-3-sonnet)"
@@ -223,7 +223,7 @@ class IngestionConfig(BaseModel):
 
 # Example YAML configuration template
 EXAMPLE_CONFIG_YAML = """# Inventory Ingestion Configuration
-# Model names only - Alita provides the actual LLM/embedding instances
+# Model names only - EliteA provides the actual LLM/embedding instances
 
 # LLM model name (required)
 llm_model: gpt-4o-mini

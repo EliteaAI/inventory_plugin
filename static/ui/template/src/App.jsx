@@ -668,7 +668,7 @@ function App() {
     lastQuery: searchQuery,
   }), [selectedEntity, nodeCount, edgeCount, searchQuery]);
 
-  // AlitaUI-inspired theme
+  // EliteaUI-inspired theme
   const theme = useMemo(
     () =>
       createTheme({

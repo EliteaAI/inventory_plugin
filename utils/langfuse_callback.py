@@ -23,20 +23,20 @@ from pylon.core.tools import log
 import requests
 
 
-def fetch_langfuse_config(alita_client) -> Optional[Dict[str, Any]]:
+def fetch_langfuse_config(elitea_client) -> Optional[Dict[str, Any]]:
     """
     Fetch langfuse configuration from project credentials.
 
     Args:
-        alita_client: AlitaClient instance
+        elitea_client: EliteAClient instance
 
     Returns:
         Dict with langfuse config (base_url, public_key, secret_key) or None
     """
     try:
         # Fetch configurations with type=langfuse and section=credentials
-        url = f'{alita_client.base_url}/api/v2/configurations/configurations/{alita_client.project_id}?type=langfuse&section=credentials'
-        response = requests.get(url, headers=alita_client.headers, verify=False, timeout=10)
+        url = f'{elitea_client.base_url}/api/v2/configurations/configurations/{elitea_client.project_id}?type=langfuse&section=credentials'
+        response = requests.get(url, headers=elitea_client.headers, verify=False, timeout=10)
         response.raise_for_status()
 
         result = response.json()

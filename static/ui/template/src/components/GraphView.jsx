@@ -307,7 +307,7 @@ const GraphView = forwardRef(function GraphView({ data, onNodeSelect, onExpandNo
           selector: 'node.highlighted',
           style: {
             'border-width': 5,
-            'border-color': '#6ae8fa', // AlitaUI primary for highlighting
+            'border-color': '#6ae8fa', // EliteaUI primary for highlighting
             'box-shadow': '0 0 10px #6ae8fa',
             width: 40,
             height: 40,

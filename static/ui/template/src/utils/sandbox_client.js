@@ -1,5 +1,5 @@
 /**
- * Lightweight Alita Client for JavaScript
+ * Lightweight EliteA Client for JavaScript
  * Migrated from Python SandboxClient
  */
 
