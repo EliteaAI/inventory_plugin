@@ -1,5 +1,6 @@
 service_location_url: ${APP_URL}
 base_path: /data/inventory
 
-# ai_run_platform_url: ${AI_RUN_PLATFORM_URL}
-# ai_run_platform_token: ${AI_RUN_PLATFORM_TOKEN}
+platform_api_url: <set here your domain/ip where the elitea platform is running e.g. http://192.168.1.42 for local development>
+ai_run_platform_url: ${AI_RUN_PLATFORM_URL}
+ai_run_platform_token: ${AI_RUN_PLATFORM_TOKEN}

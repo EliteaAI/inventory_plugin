@@ -1,7 +1,7 @@
 /.venv/
 /.cadence/
 /.idea
-/envs/
+/envs/override.env
 
 # OS files
 .DS_Store
@@ -14,6 +14,12 @@
 *.pyc
 *.pyo
 **/.pytest_cache/
+/pylon_inventory/cache/*
+/pylon_inventory/embeddings/*
+/pylon_inventory/graphs/*
+/pylon_inventory/plugins/*
+/pylon_inventory/requirements/*
+/pylon_inventory/pylon.db
 
 # Node modules
 static/ui/template/node_modules/

@@ -1,6 +1,6 @@
 services:
   pylon_inventory:
-    image: getcarrier/pylon:1.2.22
+    image: getcarrier/pylon:1.2.25
     user: "33:33"
     restart: unless-stopped
     logging:

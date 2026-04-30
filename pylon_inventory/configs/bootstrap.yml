@@ -1,6 +1,6 @@
 plugin_repo:
 - type: elitea_github
-  release: ${ALITA_RELEASE}
+  release: ${ELITEA_RELEASE}
   license_username: ${LICENSE_USERNAME}
   license_password: ${LICENSE_PASSWORD}
   add_source_data: false

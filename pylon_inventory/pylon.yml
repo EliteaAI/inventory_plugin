@@ -55,5 +55,5 @@ modules:
         type: git
         delete_git_dir: false
         depth: null
-      source: https://github.com/centry-core/bootstrap.git
-      branch: ${ALITA_RELEASE}
+      source: https://github.com/EliteaAI/bootstrap.git
+      branch: ${ELITEA_RELEASE}
