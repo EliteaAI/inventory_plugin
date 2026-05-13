@@ -2,6 +2,7 @@
 elitea-sdk[runtime,tools]>=0.3.556
 networkx>=3.0
 igraph==0.11.9  # Community detection: Leiden, Infomap, Louvain, centrality metrics
+kubernetes>=30.1.0  # K8s Jobs mode: controller creates/stat-monitors ingestion worker Jobs
 langfuse>=3.0.0  # Optional: for tracing support
 nest-asyncio>=1.5.0  # Required: allows nested event loops for concurrent chat sessions
 

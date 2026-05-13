@@ -6,10 +6,20 @@
 import json
 import traceback
 import sys
+import os
+import time
+import queue
+import threading
+import re
 from pathlib import Path
 
 from pylon.core.tools import log
 from pylon.core.tools import web
+
+
+def _is_ingestion_jobs_enabled() -> bool:
+    """Check whether run_ingestion should be delegated to K8s Jobs."""
+    return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
 
 # Add plugin directory to Python path for local inventory module
 plugin_dir = Path(__file__).parent.parent
@@ -141,6 +151,19 @@ class Method:
             project_id=int(project_id),
             auth_token=platform_token,
         )
+
+    @web.method()
+    def _get_platform_connection_settings(self):
+        """Return platform URL/token from plugin config with app_url fallback."""
+        platform_api_url = self.descriptor.config.get("platform_api_url", "")
+        platform_token = self.descriptor.config.get("ai_run_platform_token", "")
+        if not platform_api_url:
+            app_url = self.descriptor.config.get("app_url", "")
+            if app_url:
+                from urllib.parse import urlparse
+                parsed = urlparse(app_url)
+                platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
+        return platform_api_url.rstrip("/"), platform_token
 
     @web.method()
     def perform_invoke_request(self, toolkit_name, tool_name, request_data):
@@ -832,7 +855,6 @@ class Method:
     @web.method()
     def _tool_run_ingestion(self, params, graph_path, request_data):
         """Run full ingestion pipeline for a toolkit - mimics CLI ingest command"""
-        import os
         import json as json_module
         import tasknode_task
         from pathlib import Path
@@ -851,6 +873,9 @@ class Method:
 
         if not graph_path:
             return "Error: No graph path configured. Set bucket and graph_name in toolkit configuration."
+
+        if _is_ingestion_jobs_enabled():
+            return self._run_ingestion_job(params, graph_path, request_data)
 
         # Get context for slot tracking
         task_id = tasknode_task.id
@@ -1240,6 +1265,187 @@ class Method:
                     self.ingestion_tracker.release_slot(task_id)
                 except Exception as release_error:
                     log.warning(f"Failed to release ingestion slot: {release_error}")
+
+    @web.method()
+    def _run_ingestion_job(self, params, graph_path, request_data):
+        """Run inventory ingestion in a stateless K8s Job worker."""
+        import json as json_module
+
+        from inventory.k8s_ingestion_job_manager import get_ingestion_job_manager
+
+        toolkit_id = params.get("toolkit_id")
+        branch = params.get("branch")
+        output_format = params.get("output_format", "text")
+        config = request_data.get("configuration", {})
+        project_id = config.get("project_id") or params.get("project_id")
+        application_id = config.get("application_id") or params.get("application_id")
+
+        if not project_id:
+            return "Error: project_id not found in request context"
+        if not application_id:
+            return "Error: application_id not found in request context"
+
+        platform_url, platform_token = self._get_platform_connection_settings()
+        if not platform_url or not platform_token:
+            return "Error: Platform API URL or token not configured. Check platform_api_url and ai_run_platform_token."
+
+        inventory_settings = config.get("settings", {}) or {}
+        artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+        graph_dir = str(Path(graph_path).parent)
+        ingestion_config = self.descriptor.config.get("ingestion", {})
+        runtime_base_path = self.descriptor.config.get("base_path", "/data/inventory")
+
+        payload = {
+            "project_id": str(project_id),
+            "application_id": str(application_id),
+            "toolkit_id": str(toolkit_id),
+            "branch": branch,
+            "file_patterns": params.get("file_patterns", ""),
+            "exclude_patterns": params.get("exclude_patterns", ""),
+            "full_rebuild": params.get("full_rebuild", False),
+            "llm_model": params.get("llm_model"),
+            "graph_path": graph_path,
+            "graph_dir": graph_dir,
+            "inventory_settings": inventory_settings,
+            "ingestion_config": ingestion_config,
+            "artifact_bucket": artifact_bucket,
+            "platform_url": platform_url,
+            "platform_token": platform_token,
+        }
+
+        job_manager = get_ingestion_job_manager(base_path=runtime_base_path)
+        slots = job_manager.get_slot_availability()
+        if not slots.get("can_start"):
+            message = (
+                f"Inventory ingestion is busy: {slots.get('active', 0)}/{slots.get('total', 0)} "
+                "jobs are already running. Please retry later."
+            )
+            if output_format == "json":
+                return json_module.dumps({"success": False, "error": "service_busy", "message": message})
+            return f"Error: {message}"
+
+        job_id = job_manager.generate_job_id()
+        self.invocation_thinking(f"Starting inventory ingestion job: {job_id}")
+        create_result = job_manager.create_job(job_id, payload)
+        if not create_result.get("success"):
+            if output_format == "json":
+                return json_module.dumps({"success": False, "error": create_result.get("error", "job_creation_failed")})
+            return f"Error: {create_result.get('error', 'Failed to create K8s Job')}"
+
+        log.info("Created Inventory ingestion Job %s", job_id)
+        self.invocation_thinking(f"Job {job_id} created, streaming logs...")
+
+        prefix_re = re.compile(
+            r"^(?:[^|]*\|\s*)?"
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s*"
+            r"(?:(?:\[[A-Z]+\]\s+[^:]+?:\s+)|(?:\|\s*[A-Z]+\s*\|\s*[^|]+?\s+(?:--|-|:)\s+))"
+        )
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+        log_queue = queue.Queue()
+        pending_lines = []
+        last_emit = 0.0
+
+        def clean_line(line):
+            line = ansi_re.sub("", line.replace("\r", "")).strip("\n")
+            return prefix_re.sub("", line).strip()
+
+        def log_callback(line):
+            cleaned = clean_line(line)
+            if cleaned:
+                log_queue.put(cleaned)
+            print(line, file=sys.__stdout__, flush=True)
+
+        def log_worker():
+            try:
+                job_manager.stream_job_logs(job_id, log_callback, timeout=120)
+            except Exception as exc:
+                log_queue.put(f"[ERROR] Log streaming failed: {exc}")
+
+        threading.Thread(target=log_worker, daemon=True).start()
+
+        max_wait = 3600 * 24
+        poll_interval = 5
+        elapsed = 0
+        try:
+            while elapsed < max_wait:
+                self.invocation_stop_checkpoint()
+                now = time.time()
+                if now - last_emit >= 1.0:
+                    while True:
+                        try:
+                            pending_lines.append(log_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    if pending_lines:
+                        self.invocation_thinking("\n".join(pending_lines))
+                        pending_lines.clear()
+                    last_emit = now
+
+                status = job_manager.get_job_status(job_id)
+                phase = status.get("phase")
+                if phase == "succeeded":
+                    self.invocation_thinking("Inventory ingestion job completed successfully")
+                    break
+                if phase == "failed":
+                    result = job_manager.read_job_result(job_id, payload) or {}
+                    failure_info = job_manager.get_job_failure_info(job_id)
+                    error_msg = result.get("error") or failure_info.get("error") or f"Job {job_id} failed"
+                    error_category = result.get("error_category") or failure_info.get("error_category") or "unknown_error"
+                    job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+                    if output_format == "json":
+                        return json_module.dumps({"success": False, "error": error_msg, "error_category": error_category})
+                    return f"Error: {error_msg}"
+                if phase == "not_found":
+                    return f"Error: Job {job_id} not found"
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+        except Exception:
+            self.invocation_thinking(f"Stopping inventory ingestion job {job_id}...")
+            job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            raise
+
+        if elapsed >= max_wait:
+            job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            return f"Error: Job timed out after {max_wait} seconds"
+
+        result = job_manager.read_job_result(job_id, payload)
+        if result is None:
+            failure_info = job_manager.get_job_failure_info(job_id)
+            job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
+
+        sync_bucket = result.get("artifact_bucket") or artifact_bucket
+        self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket)
+        if graph_path in self.graph_instances:
+            del self.graph_instances[graph_path]
+        job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
+
+        if output_format == "json":
+            return json_module.dumps({
+                "success": result.get("success", False),
+                "source": result.get("source"),
+                "documents_processed": result.get("documents_processed", 0),
+                "entities_added": result.get("entities_added", 0),
+                "relations_added": result.get("relations_added", 0),
+                "errors": result.get("errors", [])[:10],
+                "duration_seconds": result.get("duration_seconds", 0),
+                "artifact_bucket": sync_bucket,
+            })
+
+        if result.get("success"):
+            output = f"# Ingestion Complete: {result.get('toolkit_name') or result.get('source')}\n\n"
+            output += f"**Source:** {result.get('source')}\n"
+            output += f"**Documents:** {result.get('documents_processed', 0)}\n"
+            output += f"**Entities:** {result.get('entities_added', 0)}\n"
+            output += f"**Relations:** {result.get('relations_added', 0)}\n"
+            output += f"**Duration:** {float(result.get('duration_seconds', 0)):.1f}s\n"
+            output += f"**Worker Job:** {job_id}\n"
+            return output
+
+        error_msg = f"Ingestion failed for {result.get('toolkit_name') or toolkit_id}\n\n"
+        for err in result.get("errors", [])[:10]:
+            error_msg += f"- {err}\n"
+        return error_msg
 
     @web.method()
     def _tool_delta_update(self, params, graph_path, request_data):
