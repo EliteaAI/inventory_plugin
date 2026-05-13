@@ -252,7 +252,7 @@ class K8sIngestionJobManager:
             client.V1EnvVar(name="PYTHONUNBUFFERED", value="1"),
             client.V1EnvVar(
                 name="PYTHONPATH",
-                value=f"{prebaked_path}:{requirements_path}:{plugin_path}:{baked_plugin_path}:/data/plugins",
+                value=f"{prebaked_path}:{requirements_path}:{plugin_path}:{baked_plugin_path}:/data/plugins:/app",
             ),
             client.V1EnvVar(name=PLATFORM_API_URL_ENV, value=get_platform_api_url(input_data)),
             client.V1EnvVar(name="AI_RUN_PLATFORM_TOKEN", value=input_data.get("platform_token") or ""),

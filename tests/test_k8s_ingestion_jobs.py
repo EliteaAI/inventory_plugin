@@ -76,4 +76,5 @@ def test_create_job_passes_platform_api_url_to_worker_env(monkeypatch, tmp_path)
     container = created["body"].spec.template.spec.containers[0]
     env = {item.name: item.value for item in container.env}
     assert env[PLATFORM_API_URL_ENV] == "https://elitea.example.com/api"
+    assert "/app" in env["PYTHONPATH"].split(":")
     assert "AI_RUN_PLATFORM_URL" not in env
