@@ -1391,7 +1391,7 @@ class Method:
                     failure_info = job_manager.get_job_failure_info(job_id)
                     error_msg = result.get("error") or failure_info.get("error") or f"Job {job_id} failed"
                     error_category = result.get("error_category") or failure_info.get("error_category") or "unknown_error"
-                    job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+                    job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
                     if output_format == "json":
                         return json_module.dumps({"success": False, "error": error_msg, "error_category": error_category})
                     return f"Error: {error_msg}"
@@ -1411,7 +1411,7 @@ class Method:
         result = job_manager.read_job_result(job_id, payload)
         if result is None:
             failure_info = job_manager.get_job_failure_info(job_id)
-            job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
             return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
 
         sync_bucket = result.get("artifact_bucket") or artifact_bucket
