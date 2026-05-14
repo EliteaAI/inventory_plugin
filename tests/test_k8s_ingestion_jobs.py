@@ -125,6 +125,46 @@ def test_read_job_progress_downloads_latest_artifact(tmp_path):
     assert progress == {"sequence": 3, "phase": "progress", "message": "Processed 10 files"}
 
 
+def test_cleanup_platform_job_objects_removes_progress_artifact(monkeypatch, tmp_path):
+    deleted_keys = []
+
+    class FakeArtifact:
+        def delete(self, key, check_exists=False):
+            deleted_keys.append((key, check_exists))
+
+    class FakeClient:
+        def artifact(self, bucket):
+            assert bucket == "graphs"
+            return FakeArtifact()
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+    monkeypatch.setattr(manager, "_get_elitea_client", lambda input_data: FakeClient())
+
+    manager._cleanup_platform_job_objects("job1", {"artifact_bucket": "graphs"})
+
+    assert deleted_keys == [
+        (job_input_key("job1"), False),
+        (job_result_key("job1"), False),
+        (job_progress_key("job1"), False),
+    ]
+
+
+def test_cleanup_job_can_delete_k8s_job(monkeypatch, tmp_path):
+    deleted_jobs = []
+
+    class FakeBatchApi:
+        def delete_namespaced_job(self, name, namespace, propagation_policy):
+            deleted_jobs.append((name, namespace, propagation_policy))
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+    monkeypatch.setattr(manager, "_cleanup_platform_job_objects", lambda job_id, input_data: None)
+    monkeypatch.setattr(manager, "_get_batch_api", lambda: FakeBatchApi())
+
+    manager.cleanup_job("job1", {"artifact_bucket": "graphs"}, delete_k8s_job=True)
+
+    assert deleted_jobs == [("inventory-worker-job1", "inventory", "Background")]
+
+
 def test_ingestion_tracker_updates_progress(tmp_path):
     tracker = IngestionTracker(base_path=str(tmp_path), max_parallel=2)
     tracker.acquire_slot(task_id="task1", project_id=2, toolkit_id=1, application_id=9)

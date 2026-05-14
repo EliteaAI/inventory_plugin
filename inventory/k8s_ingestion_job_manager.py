@@ -194,7 +194,7 @@ class K8sIngestionJobManager:
             return
         bucket = get_job_artifact_bucket(input_data)
         artifact = client.artifact(bucket)
-        for key in (job_input_key(job_id), job_result_key(job_id)):
+        for key in (job_input_key(job_id), job_result_key(job_id), job_progress_key(job_id)):
             try:
                 artifact.delete(key, check_exists=False)
             except TypeError:
