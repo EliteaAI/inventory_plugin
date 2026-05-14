@@ -1334,6 +1334,11 @@ class Method:
 
         log.info("Created Inventory ingestion Job %s", job_id)
         self.invocation_thinking(f"Job {job_id} created, streaming logs...")
+        try:
+            progress_client = job_manager._get_elitea_client(payload)
+        except Exception as exc:
+            log.debug("Failed to initialize Inventory job progress client: %s", exc)
+            progress_client = None
 
         prefix_re = re.compile(
             r"^(?:[^|]*\|\s*)?"
@@ -1344,6 +1349,8 @@ class Method:
         log_queue = queue.Queue()
         pending_lines = []
         last_emit = 0.0
+        last_progress_signature = None
+        controller_status_started = False
 
         def clean_line(line):
             line = ansi_re.sub("", line.replace("\r", "")).strip("\n")
@@ -1363,6 +1370,37 @@ class Method:
 
         threading.Thread(target=log_worker, daemon=True).start()
 
+        def emit_job_progress():
+            nonlocal last_progress_signature, controller_status_started
+            progress = job_manager.read_job_progress(job_id, payload, elitea_client=progress_client)
+            if not progress:
+                return
+            message = str(progress.get("message") or "").strip()
+            if not message:
+                return
+            phase = str(progress.get("phase") or "ingestion").strip() or "ingestion"
+            signature = (progress.get("sequence"), phase, message)
+            if signature == last_progress_signature:
+                return
+            last_progress_signature = signature
+            self.invocation_thinking(f"[{phase}] {message}")
+            if progress.get("toolkit_id") and progress.get("toolkit_name"):
+                try:
+                    from ..utils.source_status import SourceStatusManager
+
+                    status_manager = SourceStatusManager(graph_dir)
+                    if not controller_status_started:
+                        status_manager.start_ingestion(
+                            toolkit_id=str(progress.get("toolkit_id")),
+                            toolkit_name=str(progress.get("toolkit_name")),
+                            toolkit_type=str(progress.get("toolkit_type") or ""),
+                            branch=branch,
+                        )
+                        controller_status_started = True
+                    status_manager.update_progress(toolkit_id=str(progress.get("toolkit_id")), progress_message=message)
+                except Exception as exc:
+                    log.debug("Failed to mirror Inventory job progress locally: %s", exc)
+
         max_wait = 3600 * 24
         poll_interval = 5
         elapsed = 0
@@ -1371,6 +1409,7 @@ class Method:
                 self.invocation_stop_checkpoint()
                 now = time.time()
                 if now - last_emit >= 1.0:
+                    emit_job_progress()
                     while True:
                         try:
                             pending_lines.append(log_queue.get_nowait())

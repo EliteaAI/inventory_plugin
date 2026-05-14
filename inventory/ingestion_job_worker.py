@@ -13,6 +13,7 @@ import sys
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -85,6 +86,17 @@ def save_result(job_id: str, result: Dict[str, Any]) -> None:
             log.info("Uploaded result.json to platform artifacts")
     except Exception as exc:
         log.warning("Failed to upload job result to platform artifacts: %s", exc)
+
+
+def save_progress(job_id: str, elitea_client, artifact_bucket: str, progress: Dict[str, Any]) -> None:
+    try:
+        from inventory.k8s_ingestion_job_manager import job_progress_key
+
+        response = elitea_client.artifact(artifact_bucket).create(job_progress_key(job_id), json.dumps(progress, indent=2, default=str))
+        if isinstance(response, dict) and response.get("error"):
+            raise RuntimeError(response["error"])
+    except Exception as exc:
+        log.debug("Failed to upload job progress to platform artifacts: %s", exc)
 
 
 def categorize_error(error: Exception) -> str:
@@ -249,6 +261,25 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     status_manager = SourceStatusManager(graph_dir)
     status_manager.start_ingestion(toolkit_id=str(toolkit_id), toolkit_name=toolkit_name, toolkit_type=toolkit_type, branch=branch)
+    progress_state = {"sequence": 0, "last_upload": 0.0}
+
+    def publish_progress(message: str, phase: str, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - progress_state["last_upload"] < 2.0:
+            return
+        progress_state["sequence"] += 1
+        progress_state["last_upload"] = now
+        save_progress(job_id, elitea_client, artifact_bucket, {
+            "sequence": progress_state["sequence"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "message": message,
+            "toolkit_id": str(toolkit_id),
+            "toolkit_name": toolkit_name,
+            "toolkit_type": toolkit_type,
+        })
+
+    publish_progress("Starting ingestion...", "start", force=True)
 
     source_configs = inventory_settings.get("toolkit_configuration_source_configs") or inventory_settings.get("source_configs") or {}
     source_config = source_configs.get(str(toolkit_id), {}) if isinstance(source_configs, dict) else {}
@@ -264,6 +295,7 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
     def progress_callback(message: str, phase: str) -> None:
         log.info("[%s] %s", phase, message)
         status_manager.update_progress(toolkit_id=str(toolkit_id), progress_message=message)
+        publish_progress(message, phase, force=phase in {"complete", "error"})
 
     pipeline = IngestionPipeline(
         llm=llm,
@@ -290,9 +322,15 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
             relations_count=result.relations_added,
             documents_processed=result.documents_processed,
         )
+        publish_progress(
+            f"Ingestion complete! {result.entities_added} entities, {result.relations_added} relations",
+            "complete",
+            force=True,
+        )
     else:
         error_summary = result.errors[0] if result.errors else "Unknown error"
         status_manager.fail_ingestion(toolkit_id=str(toolkit_id), error_message=error_summary, documents_processed=result.documents_processed)
+        publish_progress(error_summary, "error", force=True)
 
     uploaded = _upload_output_artifacts(elitea_client, artifact_bucket, graph_dir, graph_path, toolkit_name, result.success)
     duration = time.time() - start_time

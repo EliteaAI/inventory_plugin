@@ -8,6 +8,7 @@ from inventory.k8s_ingestion_job_manager import (
     get_job_artifact_bucket,
     get_platform_api_url,
     job_input_key,
+    job_progress_key,
     job_result_key,
 )
 
@@ -15,6 +16,7 @@ from inventory.k8s_ingestion_job_manager import (
 def test_job_artifact_keys_use_dedicated_prefix():
     assert job_input_key("abc") == "_inventory_jobs/abc/input.json"
     assert job_result_key("abc") == "_inventory_jobs/abc/result.json"
+    assert job_progress_key("abc") == "_inventory_jobs/abc/progress.json"
 
 
 def test_job_artifact_bucket_uses_payload_then_env(monkeypatch):
@@ -102,3 +104,21 @@ def test_worker_logs_wait_until_container_is_running(monkeypatch, tmp_path):
 
     assert manager._wait_for_pod_logs_ready(core_api, "pod-name", timeout=2) is True
     assert core_api.calls == 2
+
+
+def test_read_job_progress_downloads_latest_artifact(tmp_path):
+    class FakeArtifact:
+        def get(self, key):
+            assert key == "_inventory_jobs/job1/progress.json"
+            return '{"sequence": 3, "phase": "progress", "message": "Processed 10 files"}'
+
+    class FakeClient:
+        def artifact(self, bucket):
+            assert bucket == "graphs"
+            return FakeArtifact()
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+
+    progress = manager.read_job_progress("job1", {"artifact_bucket": "graphs"}, elitea_client=FakeClient())
+
+    assert progress == {"sequence": 3, "phase": "progress", "message": "Processed 10 files"}

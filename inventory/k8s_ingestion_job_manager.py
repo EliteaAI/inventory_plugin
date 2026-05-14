@@ -33,6 +33,10 @@ def job_result_key(job_id: str) -> str:
     return f"{JOB_OBJECT_PREFIX}/{job_id}/result.json"
 
 
+def job_progress_key(job_id: str) -> str:
+    return f"{JOB_OBJECT_PREFIX}/{job_id}/progress.json"
+
+
 def get_job_artifact_bucket(input_data: Optional[Dict[str, Any]] = None) -> str:
     if input_data:
         return input_data.get("artifact_bucket") or DEFAULT_ARTIFACT_BUCKET
@@ -435,6 +439,20 @@ class K8sIngestionJobManager:
             except Exception:
                 pass
         return self._download_job_result(job_id, input_data)
+
+    def read_job_progress(self, job_id: str, input_data: Dict[str, Any], elitea_client=None) -> Optional[Dict[str, Any]]:
+        client = elitea_client or self._get_elitea_client(input_data)
+        if not client:
+            return None
+        try:
+            bucket = get_job_artifact_bucket(input_data)
+            data = client.artifact(bucket).get(job_progress_key(job_id))
+            if is_artifact_error(data):
+                return None
+            return json.loads(data)
+        except Exception as exc:
+            log.debug("Failed to read Inventory job progress: %s", exc)
+            return None
 
     def cleanup_job(self, job_id: str, input_data: Dict[str, Any], delete_k8s_job: bool = False) -> None:
         import shutil
