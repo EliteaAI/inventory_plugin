@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
-from pylon.core.tools import log
+try:
+    from pylon.core.tools import log
+except ModuleNotFoundError:
+    import logging
+
+    log = logging.getLogger(__name__)
 
 
 class IngestionSlotError(Exception):
@@ -236,6 +241,34 @@ class IngestionTracker:
         else:
             log.warning(f"Attempted to release unknown ingestion slot: task_id={task_id}")
 
+        return result
+
+    def update_progress(
+        self,
+        task_id: str,
+        progress_message: str,
+        progress_phase: Optional[str] = None,
+    ) -> bool:
+        """Update progress metadata for an active ingestion."""
+        def do_update(state):
+            in_progress = state.get("ingestions", {}).get("in_progress", [])
+            updated = False
+
+            for ing in in_progress:
+                if ing.get("task_id") == task_id:
+                    ing["progress_message"] = progress_message
+                    ing["last_updated"] = datetime.now(timezone.utc).isoformat()
+                    if progress_phase:
+                        ing["progress_phase"] = progress_phase
+                    updated = True
+                    break
+
+            state["ingestions"] = {"in_progress": in_progress}
+            return state, updated
+
+        result = self._atomic_update(do_update)
+        if not result:
+            log.debug(f"Attempted to update unknown ingestion progress: task_id={task_id}")
         return result
 
     def cleanup_stale_ingestions(self, max_age_hours: int = 24) -> int:

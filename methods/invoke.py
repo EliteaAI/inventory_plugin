@@ -1384,6 +1384,17 @@ class Method:
         last_emit = 0.0
         last_progress_signature = None
         controller_status_started = False
+        progress_line_re = re.compile(r"^\[([^\]]+)\]\s+(.+)$")
+
+        def update_tracking_progress(message, phase=None):
+            try:
+                self.ingestion_tracker.update_progress(
+                    tracking_task_id,
+                    progress_message=message,
+                    progress_phase=phase,
+                )
+            except Exception as progress_error:
+                log.debug("Failed to update K8s ingestion tracker progress: %s", progress_error)
 
         def clean_line(line):
             line = ansi_re.sub("", line.replace("\r", "")).strip("\n")
@@ -1393,6 +1404,9 @@ class Method:
             cleaned = clean_line(line)
             if cleaned:
                 log_queue.put(cleaned)
+                progress_match = progress_line_re.match(cleaned)
+                if progress_match:
+                    update_tracking_progress(progress_match.group(2), progress_match.group(1))
             print(line, file=sys.__stdout__, flush=True)
 
         def log_worker():
@@ -1417,6 +1431,7 @@ class Method:
                 return
             last_progress_signature = signature
             self.invocation_thinking(f"[{phase}] {message}")
+            update_tracking_progress(message, phase)
             if progress.get("toolkit_id") and progress.get("toolkit_name"):
                 try:
                     from ..utils.source_status import SourceStatusManager
@@ -2948,8 +2963,8 @@ class Method:
                 current_ingestion = ing
                 break
 
-        # If there's an active ingestion, try to get progress_message from sources_status.json
-        if current_ingestion and graph_path:
+        # If tracker progress is not available, fall back to sources_status.json.
+        if current_ingestion and graph_path and not current_ingestion.get("progress_message"):
             try:
                 from pathlib import Path
                 from ..utils.source_status import SourceStatusManager

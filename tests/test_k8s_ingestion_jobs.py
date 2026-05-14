@@ -11,6 +11,7 @@ from inventory.k8s_ingestion_job_manager import (
     job_progress_key,
     job_result_key,
 )
+from utils.ingestion_tracker import IngestionTracker
 
 
 def test_job_artifact_keys_use_dedicated_prefix():
@@ -122,3 +123,15 @@ def test_read_job_progress_downloads_latest_artifact(tmp_path):
     progress = manager.read_job_progress("job1", {"artifact_bucket": "graphs"}, elitea_client=FakeClient())
 
     assert progress == {"sequence": 3, "phase": "progress", "message": "Processed 10 files"}
+
+
+def test_ingestion_tracker_updates_progress(tmp_path):
+    tracker = IngestionTracker(base_path=str(tmp_path), max_parallel=2)
+    tracker.acquire_slot(task_id="task1", project_id=2, toolkit_id=1, application_id=9)
+
+    assert tracker.update_progress("task1", "Processed 10 files", progress_phase="progress") is True
+
+    active = tracker.get_active_ingestions()
+    assert active[0]["progress_message"] == "Processed 10 files"
+    assert active[0]["progress_phase"] == "progress"
+    assert active[0]["last_updated"]
