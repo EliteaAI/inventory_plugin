@@ -63,15 +63,18 @@ data:
             type: git
             delete_git_dir: false
             depth: null
-          source: https://github.com/centry-core/bootstrap.git
+          source: https://github.com/EliteaAI/bootstrap.git
           branch: {{ .Values.config.alitaRelease }}
 
   inventory_plugin.yml: |
     # Inventory Plugin Configuration
     service_location_url: {{ include "inventory.serviceLocationUrl" . }}
     base_path: {{ .Values.config.basePath }}
+    {{- if .Values.config.platformApiUrl }}
+    platform_api_url: {{ .Values.config.platformApiUrl }}
+    {{- end }}
     {{- if .Values.config.aiRunPlatformUrl }}
-    platform_api_url: {{ .Values.config.aiRunPlatformUrl }}
+    ai_run_platform_url: {{ .Values.config.aiRunPlatformUrl }}
     {{- end }}
     {{- if .Values.config.aiRunPlatformToken }}
     ai_run_platform_token: {{ .Values.config.aiRunPlatformToken }}
@@ -103,6 +106,9 @@ data:
     {{- end }}
     {{- if .Values.config.licensePassword }}
     LICENSE_PASSWORD: {{ .Values.config.licensePassword }}
+    {{- end }}
+    {{- if .Values.config.platformApiUrl }}
+    PLATFORM_API_URL: {{ .Values.config.platformApiUrl }}
     {{- end }}
     {{- if .Values.config.aiRunPlatformUrl }}
     AI_RUN_PLATFORM_URL: {{ .Values.config.aiRunPlatformUrl }}

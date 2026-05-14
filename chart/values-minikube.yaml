@@ -1,0 +1,104 @@
+# Minikube test values for Inventory Plugin
+#
+# Build the worker image into Minikube first:
+#   eval "$(minikube docker-env)"
+#   docker buildx build --platform linux/amd64 \
+#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+#     -f pylon_inventory/plugins/inventory_plugin/Dockerfile.worker \
+#     -t inventory-worker:local-cpu --load \
+#     pylon_inventory/plugins/inventory_plugin
+#
+# Install/upgrade with secrets supplied from your shell:
+#   helm upgrade --install inventory-smoke ./chart -n inventory --create-namespace \
+#     -f chart/values-minikube.yaml \
+#     --set-string config.aiRunPlatformToken="$AI_RUN_PLATFORM_TOKEN" \
+#     --set-string config.licensePassword="$GITHUB_TOKEN"
+
+image:
+  repository: getcarrier/pylon
+  tag: "1.2.25"
+  pullPolicy: IfNotPresent
+
+controller:
+  replicaCount: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1536Mi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  pylonRuntime: gevent
+  terminationGracePeriodSeconds: 600
+
+config:
+  # Platform reaches the plugin through local port-forwarding.
+  serviceLocationUrl: "http://192.168.1.42:8091"
+  basePath: /data/inventory
+
+  alitaRelease: main
+  pluginBranch: "feat/k8s-job-ingestion"
+  forcePluginUpdate: true
+
+  # Pure EliteA platform API base URL for EliteAClient/artifacts.
+  platformApiUrl: "http://192.168.1.42"
+
+  # Provider registration endpoint. Token is supplied with --set-string.
+  aiRunPlatformUrl: "http://192.168.1.42/api/v2/elitea_core/register_descriptor/1"
+  aiRunPlatformToken: ""
+
+  # Required only if the plugin repository is private. Supply password/token via --set-string.
+  licenseUsername: "x-access-token"
+  licensePassword: ""
+
+env: {}
+
+jobs:
+  enabled: true
+  workerImage: "inventory-worker:local-cpu"
+  workerImagePullPolicy: Never
+  maxConcurrentJobs: 2
+  ttlSecondsAfterFinished: 300
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: "500m"
+    limits:
+      memory: 4Gi
+      cpu: "2"
+
+storage:
+  persistence:
+    enabled: false
+
+ingress:
+  enabled: false
+
+podDisruptionBudget:
+  enabled: false
+
+securityContext:
+  runAsUser: 33
+  runAsGroup: 33
+  fsGroup: 33
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 33
+
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 120
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 10
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 5

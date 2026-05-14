@@ -16,7 +16,7 @@ fullnameOverride: ""
 # =============================================================================
 image:
   repository: getcarrier/pylon
-  tag: "1.2.22"
+  tag: "1.2.25"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -31,6 +31,8 @@ imagePullSecrets: []
 # =============================================================================
 controller:
   replicaCount: 1
+
+  strategy: {}
 
   resources:
     requests:
@@ -74,9 +76,13 @@ config:
   # Set to feature branch name for testing
   pluginBranch: "main"
 
-  # Platform API connection (required for AlitaClient — used by agent tool calls)
-  # AI_RUN_PLATFORM_URL: base URL of the ELITEA platform (e.g. http://elitea-core:80)
-  # AI_RUN_PLATFORM_TOKEN: JWT token for platform authentication
+  # Platform API base URL (required for EliteAClient API/artifact calls)
+  # Example: http://elitea-core:80
+  platformApiUrl: ""
+
+  # AI/Run provider registration URL and token
+  # aiRunPlatformUrl is the descriptor registration endpoint, not the API base URL.
+  # Example: http://elitea-core:80/api/v2/elitea_core/register_descriptor/1
   aiRunPlatformUrl: ""
   aiRunPlatformToken: ""
 
@@ -99,12 +105,13 @@ env: {}
 # =============================================================================
 # K8s Jobs-Based Scaling
 # =============================================================================
-# Ingestion work is executed as K8s Jobs (one Job per ingestion request).
-# The controller creates, monitors, and cleans up Jobs automatically.
-# Set enabled: false to fall back to in-process thread-based ingestion.
+# Ingestion work can be executed as stateless K8s Jobs (one Job per request).
+# Worker pods use emptyDir and synchronize input/results through the ELITEA
+# artifact API; they do NOT mount the controller PVC.
+# Set enabled: false to use in-process thread-based ingestion.
 # =============================================================================
 jobs:
-  enabled: true
+  enabled: false
 
   # Maximum concurrent ingestion Jobs cluster-wide
   maxConcurrentJobs: 3
@@ -112,8 +119,13 @@ jobs:
   # TTL for completed Jobs (seconds)
   ttlSecondsAfterFinished: 300
 
-  # Worker image (defaults to same as controller image if empty)
+  # Dedicated worker image. Defaults to controller image when empty, but
+  # production should set this to the Dockerfile.worker image.
   workerImage: ""
+  workerImagePullPolicy: IfNotPresent
+
+  # Workers do not call the K8s API, so no RBAC is needed for this SA.
+  workerServiceAccount: "default"
 
   # Job resource configuration
   resources:
@@ -133,7 +145,7 @@ storage:
     storageClass: ""
     size: 50Gi
     accessModes:
-      - ReadWriteMany  # Required for controller + Job pods shared access
+      - ReadWriteOnce  # Controller storage only; worker Jobs use emptyDir
 
   existingClaim: ""
 
