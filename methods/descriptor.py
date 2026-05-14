@@ -82,7 +82,7 @@ class Method:
                                 "description": "List of source toolkit IDs for data ingestion",
                                 "default": [],
                                 "json_schema_extra": {
-                                    "toolkit_types": ["github", "ado", "gitlab", "bitbucket"]
+                                    "toolkit_types": ["github", "ado_repos", "gitlab", "bitbucket"]
                                 }
                             },
                             "source_configs": {
