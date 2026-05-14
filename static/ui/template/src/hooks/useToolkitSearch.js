@@ -9,8 +9,7 @@ const PAGE_SIZE = 150;
 // Default toolkit types that can be used as data sources
 const DEFAULT_TOOLKIT_TYPES = [
   'github',
-  'ado',
-  'azure_devops',
+  'ado_repos',
   'gitlab',
   'bitbucket',
 ];

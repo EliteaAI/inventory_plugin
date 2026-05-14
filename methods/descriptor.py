@@ -82,7 +82,7 @@ class Method:
                                 "description": "List of source toolkit IDs for data ingestion",
                                 "default": [],
                                 "json_schema_extra": {
-                                    "toolkit_types": ["github", "ado", "gitlab", "bitbucket"]
+                                    "toolkit_types": ["github", "ado_repos", "gitlab", "bitbucket"]
                                 }
                             },
                             "source_configs": {
@@ -105,7 +105,7 @@ class Method:
                                 "toolkit_id": {
                                     "type": "Integer",
                                     "required": True,
-                                    "description": "Toolkit ID of the data source (GitHub, ADO, GitLab, etc.)"
+                                    "description": "Toolkit ID of the data source (GitHub, ADO Repos, GitLab, etc.)"
                                 },
                                 "branch": {
                                     "type": "String",
@@ -264,7 +264,7 @@ class Method:
                                 "source_toolkit": {
                                     "type": "String",
                                     "required": False,
-                                    "description": "Filter by source toolkit (e.g., 'github', 'ado', or toolkit ID)"
+                                    "description": "Filter by source toolkit (e.g., 'github', 'ado_repos', or toolkit ID)"
                                 },
                                 "file_pattern": {
                                     "type": "String",
@@ -500,7 +500,7 @@ class Method:
                                 "source_toolkit": {
                                     "type": "String",
                                     "required": False,
-                                    "description": "Filter by source toolkit (e.g., 'github', 'ado', or toolkit ID)"
+                                    "description": "Filter by source toolkit (e.g., 'github', 'ado_repos', or toolkit ID)"
                                 },
                                 "limit": {
                                     "type": "Integer",
@@ -531,7 +531,7 @@ class Method:
                                 "source_toolkit": {
                                     "type": "String",
                                     "required": False,
-                                    "description": "Filter by source toolkit (e.g., 'github', 'ado', or toolkit ID)"
+                                    "description": "Filter by source toolkit (e.g., 'github', 'ado_repos', or toolkit ID)"
                                 },
                                 "limit": {
                                     "type": "Integer",
@@ -557,7 +557,7 @@ class Method:
                                 "source_toolkit": {
                                     "type": "String",
                                     "required": True,
-                                    "description": "Source toolkit identifier (e.g., 'github', 'ado', or toolkit ID)"
+                                    "description": "Source toolkit identifier (e.g., 'github', 'ado_repos', or toolkit ID)"
                                 },
                                 "entity_type": {
                                     "type": "String",

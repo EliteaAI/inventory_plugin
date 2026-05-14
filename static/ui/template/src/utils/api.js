@@ -506,11 +506,10 @@ export async function chatQuery(projectId, toolkitId, query, context = {}) {
 
 /**
  * List available toolkits in the project (for adding to inventory)
- * Filters for toolkits that can be used as data sources (github, ado, gitlab, etc.)
+ * Filters for repository toolkits that expose loader() and can be used as inventory data sources.
  */
 export async function listAvailableToolkits(projectId) {
-  // Toolkit types that can be data sources for inventory
-  const sourceTypes = ['github', 'ado', 'azure_devops', 'gitlab', 'bitbucket', 'confluence', 'jira'];
+  const sourceTypes = ['github', 'ado_repos', 'azure_devops_repos', 'gitlab', 'bitbucket'];
 
   const response = await apiRequest(`/api/v2/elitea_core/tools/prompt_lib/${projectId}?limit=100`);
 

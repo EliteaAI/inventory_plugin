@@ -751,7 +751,7 @@ class SandboxClient {
     /**
      * List toolkits with optional filters
      * @param {Object} options - Query options
-     * @param {string[]} options.toolkitTypes - Filter by toolkit types (e.g., ['github', 'ado'])
+      * @param {string[]} options.toolkitTypes - Filter by toolkit types (e.g., ['github', 'ado_repos'])
      * @param {number} options.limit - Maximum number of results (default: 20)
      * @param {number} options.offset - Offset for pagination (default: 0)
      * @param {string} options.query - Search query string

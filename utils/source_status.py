@@ -20,7 +20,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
-from pylon.core.tools import log
+try:
+    from pylon.core.tools import log
+except ModuleNotFoundError:
+    import logging
+
+    log = logging.getLogger(__name__)
 
 
 class SourceStatus:

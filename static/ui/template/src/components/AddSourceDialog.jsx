@@ -35,7 +35,7 @@ import useToolkitSearch from '../hooks/useToolkitSearch';
 // Toolkit type options for filtering
 const TOOLKIT_TYPE_OPTIONS = [
   { value: 'github', label: 'GitHub' },
-  { value: 'ado', label: 'Azure DevOps' },
+  { value: 'ado_repos', label: 'Azure DevOps Repos' },
   { value: 'gitlab', label: 'GitLab' },
   { value: 'bitbucket', label: 'Bitbucket' },
 ];
@@ -43,6 +43,8 @@ const TOOLKIT_TYPE_OPTIONS = [
 // Toolkit type icons and colors
 const TOOLKIT_CONFIG = {
   github: { icon: GitHubIcon, color: '#333' },
+  ado_repos: { icon: CloudIcon, color: '#0078d4' },
+  azure_devops_repos: { icon: CloudIcon, color: '#0078d4' },
   ado: { icon: CloudIcon, color: '#0078d4' },
   azure_devops: { icon: CloudIcon, color: '#0078d4' },
   gitlab: { icon: StorageIcon, color: '#fc6d26' },
@@ -58,14 +60,14 @@ export default function AddSourceDialog({
   existingSourceIds = [],
 }) {
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedTypes, setSelectedTypes] = useState(['github', 'ado', 'gitlab', 'bitbucket']);
+  const [selectedTypes, setSelectedTypes] = useState(['github', 'ado_repos', 'gitlab', 'bitbucket']);
   const { toolkits, isLoading, error, hasMore, search, loadMore, clearResults } = useToolkitSearch();
 
   // Reset state when dialog opens
   useEffect(() => {
     if (isOpen) {
       setSearchQuery('');
-      setSelectedTypes(['github', 'ado', 'gitlab', 'bitbucket']);
+      setSelectedTypes(['github', 'ado_repos', 'gitlab', 'bitbucket']);
       clearResults();
     }
   }, [isOpen, clearResults]);
