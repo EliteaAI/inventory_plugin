@@ -157,7 +157,7 @@ function ToolkitSelector({
             <StorageIcon sx={{ fontSize: 48, color: 'text.disabled', mb: 1 }} />
             <Typography variant="body2" color="text.secondary">
               {toolkits.length === 0
-                ? 'No source toolkits found in this project. Create a GitHub, ADO, or other repository toolkit first.'
+                ? 'No source toolkits found in this project. Create a GitHub, Azure DevOps Repos, or other repository toolkit first.'
                 : 'No toolkits match your search.'}
             </Typography>
           </Box>

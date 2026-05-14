@@ -25,6 +25,8 @@ import EditSourceDialog from './EditSourceDialog';
 // Toolkit type icons and colors
 const TOOLKIT_CONFIG = {
   github: { icon: GitHubIcon, color: '#333' },
+  ado_repos: { icon: CloudIcon, color: '#0078d4' },
+  azure_devops_repos: { icon: CloudIcon, color: '#0078d4' },
   ado: { icon: CloudIcon, color: '#0078d4' },
   azure_devops: { icon: CloudIcon, color: '#0078d4' },
   gitlab: { icon: StorageIcon, color: '#fc6d26' },
