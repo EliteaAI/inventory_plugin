@@ -151,6 +151,7 @@ class IngestionTracker:
         project_id: int,
         toolkit_id: int,
         application_id: int,
+        enforce_limit: bool = True,
     ) -> bool:
         """
         Attempt to acquire an ingestion slot.
@@ -160,6 +161,7 @@ class IngestionTracker:
             project_id: Project ID
             toolkit_id: Source toolkit ID
             application_id: Application/inventory toolkit ID
+            enforce_limit: Whether to enforce the local max_parallel limit
 
         Returns:
             True if slot acquired, raises IngestionSlotError if no slots available
@@ -168,7 +170,7 @@ class IngestionTracker:
             in_progress = state.get("ingestions", {}).get("in_progress", [])
 
             # Check if we have capacity
-            if len(in_progress) >= self.max_parallel:
+            if enforce_limit and len(in_progress) >= self.max_parallel:
                 # Return current state and False to indicate failure
                 return state, False
 

@@ -1325,9 +1325,42 @@ class Method:
             return f"Error: {message}"
 
         job_id = job_manager.generate_job_id()
+        tracking_task_id = job_id
+        try:
+            import tasknode_task
+
+            tracking_task_id = tasknode_task.id
+        except Exception:
+            pass
+
+        tracking_slot_acquired = False
+
+        def release_tracking_slot():
+            nonlocal tracking_slot_acquired
+            if not tracking_slot_acquired:
+                return
+            try:
+                self.ingestion_tracker.release_slot(tracking_task_id)
+            except Exception as release_error:
+                log.warning("Failed to release K8s ingestion tracking slot: %s", release_error)
+            tracking_slot_acquired = False
+
+        try:
+            self.ingestion_tracker.acquire_slot(
+                task_id=tracking_task_id,
+                project_id=int(project_id) if project_id else 0,
+                toolkit_id=int(toolkit_id) if toolkit_id else 0,
+                application_id=int(application_id) if application_id else 0,
+                enforce_limit=False,
+            )
+            tracking_slot_acquired = True
+        except Exception as track_error:
+            log.warning("Failed to mirror K8s ingestion in local tracker: %s", track_error)
+
         self.invocation_thinking(f"Starting inventory ingestion job: {job_id}")
         create_result = job_manager.create_job(job_id, payload)
         if not create_result.get("success"):
+            release_tracking_slot()
             if output_format == "json":
                 return json_module.dumps({"success": False, "error": create_result.get("error", "job_creation_failed")})
             return f"Error: {create_result.get('error', 'Failed to create K8s Job')}"
@@ -1431,26 +1464,31 @@ class Method:
                     error_msg = result.get("error") or failure_info.get("error") or f"Job {job_id} failed"
                     error_category = result.get("error_category") or failure_info.get("error_category") or "unknown_error"
                     job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
+                    release_tracking_slot()
                     if output_format == "json":
                         return json_module.dumps({"success": False, "error": error_msg, "error_category": error_category})
                     return f"Error: {error_msg}"
                 if phase == "not_found":
+                    release_tracking_slot()
                     return f"Error: Job {job_id} not found"
                 time.sleep(poll_interval)
                 elapsed += poll_interval
         except Exception:
             self.invocation_thinking(f"Stopping inventory ingestion job {job_id}...")
             job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            release_tracking_slot()
             raise
 
         if elapsed >= max_wait:
             job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
+            release_tracking_slot()
             return f"Error: Job timed out after {max_wait} seconds"
 
         result = job_manager.read_job_result(job_id, payload)
         if result is None:
             failure_info = job_manager.get_job_failure_info(job_id)
             job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
+            release_tracking_slot()
             return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
 
         sync_bucket = result.get("artifact_bucket") or artifact_bucket
@@ -1458,6 +1496,7 @@ class Method:
         if graph_path in self.graph_instances:
             del self.graph_instances[graph_path]
         job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
+        release_tracking_slot()
 
         if output_format == "json":
             return json_module.dumps({
@@ -2886,6 +2925,20 @@ class Method:
         # Get all active ingestions
         active_ingestions = self.ingestion_tracker.get_active_ingestions()
         tracker_status = self.ingestion_tracker.get_status()
+        if _is_ingestion_jobs_enabled():
+            try:
+                from inventory.k8s_ingestion_job_manager import get_ingestion_job_manager
+
+                runtime_base_path = self.descriptor.config.get("base_path", "/data/inventory")
+                job_slots = get_ingestion_job_manager(base_path=runtime_base_path).get_slot_availability()
+                tracker_status = {
+                    "max_parallel": job_slots.get("total", tracker_status["max_parallel"]),
+                    "active_count": job_slots.get("active", tracker_status["active_count"]),
+                    "available_slots": job_slots.get("available", tracker_status["available_slots"]),
+                    "active_ingestions": active_ingestions,
+                }
+            except Exception as slot_error:
+                log.debug(f"Could not get K8s ingestion slot status: {slot_error}")
 
         # Find ingestion for current project/application
         current_ingestion = None
