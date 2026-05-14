@@ -43,6 +43,8 @@ def test_job_input_sanitization_removes_secrets():
         "platform_url": "https://elitea.example.com",
         "platform_token": "secret-token",
         "artifact_x_secret": "secret-header",
+        "custom_headers": {"Authorization": "Bearer secret", "X-Trace-Id": "trace-1"},
+        "nested": [{"api_key": "secret-api-key", "safe": "value"}],
     }
 
     sanitized = K8sIngestionJobManager._sanitize_job_input(input_data)
@@ -51,6 +53,8 @@ def test_job_input_sanitization_removes_secrets():
     assert sanitized["platform_url"] == "https://elitea.example.com"
     assert "platform_token" not in sanitized
     assert "artifact_x_secret" not in sanitized
+    assert sanitized["custom_headers"] == {"X-Trace-Id": "trace-1"}
+    assert sanitized["nested"] == [{"safe": "value"}]
 
 
 def test_create_job_passes_platform_api_url_to_worker_env(monkeypatch, tmp_path):

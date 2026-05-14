@@ -23,6 +23,18 @@ JOB_OBJECT_PREFIX = "_inventory_jobs"
 JOB_ARTIFACT_BUCKET_ENV = "INVENTORY_ARTIFACT_BUCKET"
 JOB_PROJECT_ID_ENV = "INVENTORY_PROJECT_ID"
 PLATFORM_API_URL_ENV = "PLATFORM_API_URL"
+SENSITIVE_INPUT_KEY_PARTS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "api_key",
+    "apikey",
+    "private_key",
+    "client_secret",
+    "refresh_token",
+)
 
 
 def job_input_key(job_id: str) -> str:
@@ -142,10 +154,18 @@ class K8sIngestionJobManager:
     @staticmethod
     def _sanitize_job_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Remove secrets from input.json before uploading it to artifacts."""
-        sanitized = dict(input_data)
-        sanitized.pop("platform_token", None)
-        sanitized.pop("artifact_x_secret", None)
-        return sanitized
+        def is_sensitive_key(key: Any) -> bool:
+            normalized = str(key).lower().replace("-", "_")
+            return any(part in normalized for part in SENSITIVE_INPUT_KEY_PARTS)
+
+        def sanitize(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: sanitize(item) for key, item in value.items() if not is_sensitive_key(key)}
+            if isinstance(value, list):
+                return [sanitize(item) for item in value]
+            return value
+
+        return sanitize(input_data)
 
     def _get_elitea_client(self, input_data: Dict[str, Any]):
         return create_elitea_client(

@@ -1506,39 +1506,44 @@ class Method:
             release_tracking_slot()
             return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
 
-        sync_bucket = result.get("artifact_bucket") or artifact_bucket
-        self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket)
-        if graph_path in self.graph_instances:
-            del self.graph_instances[graph_path]
-        job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
-        release_tracking_slot()
+        try:
+            sync_bucket = result.get("artifact_bucket") or artifact_bucket
+            self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket)
+            if graph_path in self.graph_instances:
+                del self.graph_instances[graph_path]
 
-        if output_format == "json":
-            return json_module.dumps({
-                "success": result.get("success", False),
-                "source": result.get("source"),
-                "documents_processed": result.get("documents_processed", 0),
-                "entities_added": result.get("entities_added", 0),
-                "relations_added": result.get("relations_added", 0),
-                "errors": result.get("errors", [])[:10],
-                "duration_seconds": result.get("duration_seconds", 0),
-                "artifact_bucket": sync_bucket,
-            })
+            if output_format == "json":
+                return json_module.dumps({
+                    "success": result.get("success", False),
+                    "source": result.get("source"),
+                    "documents_processed": result.get("documents_processed", 0),
+                    "entities_added": result.get("entities_added", 0),
+                    "relations_added": result.get("relations_added", 0),
+                    "errors": result.get("errors", [])[:10],
+                    "duration_seconds": result.get("duration_seconds", 0),
+                    "artifact_bucket": sync_bucket,
+                })
 
-        if result.get("success"):
-            output = f"# Ingestion Complete: {result.get('toolkit_name') or result.get('source')}\n\n"
-            output += f"**Source:** {result.get('source')}\n"
-            output += f"**Documents:** {result.get('documents_processed', 0)}\n"
-            output += f"**Entities:** {result.get('entities_added', 0)}\n"
-            output += f"**Relations:** {result.get('relations_added', 0)}\n"
-            output += f"**Duration:** {float(result.get('duration_seconds', 0)):.1f}s\n"
-            output += f"**Worker Job:** {job_id}\n"
-            return output
+            if result.get("success"):
+                output = f"# Ingestion Complete: {result.get('toolkit_name') or result.get('source')}\n\n"
+                output += f"**Source:** {result.get('source')}\n"
+                output += f"**Documents:** {result.get('documents_processed', 0)}\n"
+                output += f"**Entities:** {result.get('entities_added', 0)}\n"
+                output += f"**Relations:** {result.get('relations_added', 0)}\n"
+                output += f"**Duration:** {float(result.get('duration_seconds', 0)):.1f}s\n"
+                output += f"**Worker Job:** {job_id}\n"
+                return output
 
-        error_msg = f"Ingestion failed for {result.get('toolkit_name') or toolkit_id}\n\n"
-        for err in result.get("errors", [])[:10]:
-            error_msg += f"- {err}\n"
-        return error_msg
+            error_msg = f"Ingestion failed for {result.get('toolkit_name') or toolkit_id}\n\n"
+            for err in result.get("errors", [])[:10]:
+                error_msg += f"- {err}\n"
+            return error_msg
+        finally:
+            try:
+                job_manager.cleanup_job(job_id, payload, delete_k8s_job=False)
+            except Exception as cleanup_error:
+                log.warning("Failed to cleanup Inventory ingestion job artifacts: %s", cleanup_error)
+            release_tracking_slot()
 
     @web.method()
     def _tool_delta_update(self, params, graph_path, request_data):
