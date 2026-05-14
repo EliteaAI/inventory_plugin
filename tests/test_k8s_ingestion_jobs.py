@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from inventory.k8s_ingestion_job_manager import (
     DEFAULT_ARTIFACT_BUCKET,
     JOB_ARTIFACT_BUCKET_ENV,
@@ -78,3 +80,25 @@ def test_create_job_passes_platform_api_url_to_worker_env(monkeypatch, tmp_path)
     assert env[PLATFORM_API_URL_ENV] == "https://elitea.example.com/api"
     assert "/app" in env["PYTHONPATH"].split(":")
     assert "AI_RUN_PLATFORM_URL" not in env
+
+
+def test_worker_logs_wait_until_container_is_running(monkeypatch, tmp_path):
+    class FakeCoreApi:
+        def __init__(self):
+            self.calls = 0
+
+        def read_namespaced_pod(self, name, namespace):
+            self.calls += 1
+            if self.calls == 1:
+                state = SimpleNamespace(waiting=SimpleNamespace(reason="ContainerCreating"))
+            else:
+                state = SimpleNamespace(running=SimpleNamespace(started_at="now"))
+            status = SimpleNamespace(name="worker", state=state)
+            return SimpleNamespace(status=SimpleNamespace(container_statuses=[status]))
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+    core_api = FakeCoreApi()
+    monkeypatch.setattr("inventory.k8s_ingestion_job_manager.time.sleep", lambda seconds: None)
+
+    assert manager._wait_for_pod_logs_ready(core_api, "pod-name", timeout=2) is True
+    assert core_api.calls == 2

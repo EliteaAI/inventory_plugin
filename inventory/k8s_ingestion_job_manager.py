@@ -368,6 +368,34 @@ class K8sIngestionJobManager:
             time.sleep(1)
         return None
 
+    @staticmethod
+    def _is_worker_container_loggable(container_statuses: list[Any]) -> bool:
+        worker_status = next((status for status in container_statuses if getattr(status, "name", "") == "worker"), None)
+        if worker_status is None and container_statuses:
+            worker_status = container_statuses[0]
+        if worker_status is None:
+            return False
+        state = getattr(worker_status, "state", None)
+        return bool(getattr(state, "running", None) or getattr(state, "terminated", None))
+
+    @staticmethod
+    def _is_log_startup_race(exc: Exception) -> bool:
+        error_text = str(exc)
+        return "waiting to start" in error_text or "ContainerCreating" in error_text or "PodInitializing" in error_text
+
+    def _wait_for_pod_logs_ready(self, core_v1: Any, pod_name: str, timeout: int) -> bool:
+        for _ in range(timeout):
+            try:
+                pod = core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                pod_status = getattr(pod, "status", None)
+                container_statuses = getattr(pod_status, "container_statuses", None) or []
+                if self._is_worker_container_loggable(container_statuses):
+                    return True
+            except Exception as exc:
+                log.debug("Error reading Inventory job pod status: %s", exc)
+            time.sleep(1)
+        return False
+
     def stream_job_logs(self, job_id: str, callback: Callable[[str], None], timeout: int = 60) -> None:
         self._init_k8s_client()
         core_v1 = self._k8s_client.CoreV1Api()
@@ -378,9 +406,23 @@ class K8sIngestionJobManager:
         try:
             from kubernetes import watch
 
-            watcher = watch.Watch()
-            for line in watcher.stream(core_v1.read_namespaced_pod_log, name=pod_name, namespace=self.namespace, follow=True):
-                callback(line)
+            startup_deadline = time.time() + timeout
+            while time.time() < startup_deadline:
+                if not self._wait_for_pod_logs_ready(core_v1, pod_name, timeout=1):
+                    continue
+                try:
+                    watcher = watch.Watch()
+                    for line in watcher.stream(core_v1.read_namespaced_pod_log, name=pod_name, namespace=self.namespace, follow=True):
+                        callback(line)
+                    return
+                except Exception as exc:
+                    if self._is_log_startup_race(exc):
+                        log.debug("Inventory job log stream not ready yet for pod %s: %s", pod_name, exc)
+                        time.sleep(1)
+                        continue
+                    callback(f"[ERROR] Log streaming failed: {exc}")
+                    return
+            callback(f"[ERROR] Worker container logs for job {job_id} were not available within {timeout}s")
         except Exception as exc:
             callback(f"[ERROR] Log streaming failed: {exc}")
 
