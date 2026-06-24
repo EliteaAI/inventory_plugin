@@ -129,6 +129,58 @@ def test_read_job_progress_downloads_latest_artifact(tmp_path):
     assert progress == {"sequence": 3, "phase": "progress", "message": "Processed 10 files"}
 
 
+def test_read_job_progress_returns_none_when_artifact_missing(tmp_path):
+    # elitea_sdk's artifact .get() returns a human-readable string (not JSON, not an
+    # "error" dict) when the progress object does not exist yet. read_job_progress must
+    # treat it as "no progress yet" and not raise / log a JSON decode error.
+    class FakeArtifact:
+        def get(self, key):
+            return "File '_inventory_jobs/job1/progress.json' not found. "
+
+    class FakeClient:
+        def artifact(self, bucket):
+            return FakeArtifact()
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+
+    progress = manager.read_job_progress("job1", {"artifact_bucket": "graphs"}, elitea_client=FakeClient())
+
+    assert progress is None
+
+
+def test_read_job_progress_ignores_non_object_json(tmp_path):
+    # Progress is consumed via ``.get()``; a JSON array (or any non-object) must not be
+    # returned as progress, otherwise call sites would crash on ``list.get``.
+    class FakeArtifact:
+        def get(self, key):
+            return "[1, 2, 3]"
+
+    class FakeClient:
+        def artifact(self, bucket):
+            return FakeArtifact()
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+
+    progress = manager.read_job_progress("job1", {"artifact_bucket": "graphs"}, elitea_client=FakeClient())
+
+    assert progress is None
+
+
+def test_iter_log_lines_reassembles_split_chunks():
+    # A single logical log line can arrive across multiple byte chunks; _iter_log_lines
+    # must buffer and emit only whole, newline-delimited lines.
+    class FakeStream:
+        def stream(self, *args, **kwargs):
+            yield b"[batch] Proce"
+            yield b"ssing final batch 5 (9 files)\n[done] "
+            yield b"finished\n"
+
+    lines = list(K8sIngestionJobManager._iter_log_lines(FakeStream()))
+
+    assert lines == ["[batch] Processing final batch 5 (9 files)", "[done] finished"]
+
+
+
 def test_cleanup_platform_job_objects_removes_progress_artifact(monkeypatch, tmp_path):
     deleted_keys = []
 
