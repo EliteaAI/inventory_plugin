@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 log = logging.getLogger(__name__)
 
@@ -420,6 +420,26 @@ class K8sIngestionJobManager:
             time.sleep(1)
         return False
 
+    @staticmethod
+    def _iter_log_lines(log_stream: Any) -> Iterator[str]:
+        """Yield whole, newline-delimited lines from a streamed pod-log response.
+
+        ``read_namespaced_pod_log(_preload_content=False)`` returns a urllib3
+        ``HTTPResponse`` that streams arbitrary byte chunks (a single chunk may hold a
+        partial line or several lines). Buffer the bytes and split on newlines so the
+        downstream regex-based progress parser always receives complete lines.
+        """
+        buffer = b""
+        for chunk in log_stream.stream(decode_content=True):
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                yield line.decode("utf-8", errors="replace").rstrip("\r")
+        if buffer:
+            yield buffer.decode("utf-8", errors="replace").rstrip("\r")
+
     def stream_job_logs(self, job_id: str, callback: Callable[[str], None], timeout: int = 60) -> None:
         self._init_k8s_client()
         core_v1 = self._k8s_client.CoreV1Api()
@@ -435,7 +455,8 @@ class K8sIngestionJobManager:
                 try:
                     # kubernetes client >=31 dropped the implicit ``watch`` kwarg that
                     # ``Watch().stream()`` injects into ``read_namespaced_pod_log``; stream
-                    # the raw HTTP response directly instead (line-iterable, follow=True).
+                    # the raw HTTP response directly instead (follow=True) and reassemble
+                    # whole lines from the byte chunks it yields.
                     log_stream = core_v1.read_namespaced_pod_log(
                         name=pod_name,
                         namespace=self.namespace,
@@ -443,8 +464,8 @@ class K8sIngestionJobManager:
                         _preload_content=False,
                     )
                     try:
-                        for raw_line in log_stream:
-                            callback(raw_line.decode("utf-8", errors="replace").rstrip("\r\n"))
+                        for line in self._iter_log_lines(log_stream):
+                            callback(line)
                     finally:
                         log_stream.close()
                     return
@@ -485,11 +506,17 @@ class K8sIngestionJobManager:
             if isinstance(data, str):
                 data = data.strip()
                 # A missing progress object comes back as a human-readable string
-                # (e.g. "File '..._inventory_jobs/<job>/progress.json' not found. ");
-                # only attempt to parse genuine JSON payloads.
-                if not data or data[0] not in "{[":
+                # (e.g. "File '..._inventory_jobs/<job>/progress.json' not found. ").
+                # Progress is a JSON object consumed via ``.get()``, so only parse a
+                # genuine object and keep decode errors local instead of letting the
+                # outer handler log them as failures.
+                if not data.startswith("{"):
                     return None
-                return json.loads(data)
+                try:
+                    parsed = json.loads(data)
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
             return None
         except Exception as exc:
             log.debug("Failed to read Inventory job progress: %s", exc)
