@@ -428,16 +428,25 @@ class K8sIngestionJobManager:
             callback(f"[ERROR] Pod for job {job_id} was not created within {timeout}s")
             return
         try:
-            from kubernetes import watch
-
             startup_deadline = time.time() + timeout
             while time.time() < startup_deadline:
                 if not self._wait_for_pod_logs_ready(core_v1, pod_name, timeout=1):
                     continue
                 try:
-                    watcher = watch.Watch()
-                    for line in watcher.stream(core_v1.read_namespaced_pod_log, name=pod_name, namespace=self.namespace, follow=True):
-                        callback(line)
+                    # kubernetes client >=31 dropped the implicit ``watch`` kwarg that
+                    # ``Watch().stream()`` injects into ``read_namespaced_pod_log``; stream
+                    # the raw HTTP response directly instead (line-iterable, follow=True).
+                    log_stream = core_v1.read_namespaced_pod_log(
+                        name=pod_name,
+                        namespace=self.namespace,
+                        follow=True,
+                        _preload_content=False,
+                    )
+                    try:
+                        for raw_line in log_stream:
+                            callback(raw_line.decode("utf-8", errors="replace").rstrip("\r\n"))
+                    finally:
+                        log_stream.close()
                     return
                 except Exception as exc:
                     if self._is_log_startup_race(exc):
@@ -469,7 +478,16 @@ class K8sIngestionJobManager:
             data = client.artifact(bucket).get(job_progress_key(job_id))
             if is_artifact_error(data):
                 return None
-            return json.loads(data)
+            if isinstance(data, (bytes, bytearray)):
+                data = data.decode("utf-8", errors="replace")
+            if isinstance(data, dict):
+                return data
+            if isinstance(data, str):
+                data = data.strip()
+                if not data:
+                    return None
+                return json.loads(data)
+            return None
         except Exception as exc:
             log.debug("Failed to read Inventory job progress: %s", exc)
             return None
