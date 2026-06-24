@@ -38,9 +38,10 @@ config:
   # Platform reaches the plugin through local port-forwarding.
   serviceLocationUrl: "http://192.168.1.42:8091"
   basePath: /data/inventory
+  pylonLogLevel: debug
 
   alitaRelease: main
-  pluginBranch: "feat/k8s-job-ingestion"
+  pluginBranch: "main"
   forcePluginUpdate: true
 
   # Pure EliteA platform API base URL for EliteAClient/artifacts.

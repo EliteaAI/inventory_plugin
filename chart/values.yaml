@@ -69,6 +69,9 @@ config:
   # Base path for inventory files (inside container)
   basePath: /data/inventory
 
+  # Pylon framework log level: debug, info, warning, error
+  pylonLogLevel: info
+
   # Alita release branch for bootstrap plugin
   alitaRelease: main
 
@@ -95,6 +98,14 @@ config:
   # When enabled, an initContainer removes the plugins folder before starting
   # This forces a fresh git clone from GitHub on every pod restart
   forcePluginUpdate: false
+
+  # Extra pip index used when the controller installs plugin requirements at runtime.
+  # Defaults to the PyTorch CPU wheel index so torch/torchvision resolve to the CPU
+  # builds (e.g. torch==2.x+cpu) instead of the PyPI wheels that pull the full NVIDIA
+  # CUDA stack (~2-2.5 GB of cuDNN/cuBLAS/NCCL/triton). The cluster is CPU-only, so the
+  # CUDA packages are dead weight that make the runtime install slow and prone to
+  # partial/corrupt state on interruption. Set to "" to disable (GPU deployments).
+  pipExtraIndexUrl: "https://download.pytorch.org/whl/cpu"
 
 # =============================================================================
 # Inventory Feature Flags (Environment Variables)

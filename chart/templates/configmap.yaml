@@ -27,7 +27,7 @@ data:
     # Logging
     #
     log:
-      level: info
+      level: {{ .Values.config.pylonLogLevel | default "info" }}
 
     #
     # Pylon DB
@@ -48,6 +48,10 @@ data:
         mode: relaxed
         activation: bulk
         cache: /data/cache/pip
+        {{- if .Values.config.pipExtraIndexUrl }}
+        # CPU-only torch wheels: avoids pulling the full NVIDIA CUDA stack at runtime.
+        extra_index_url: {{ .Values.config.pipExtraIndexUrl }}
+        {{- end }}
         provider:
           type: folder
           path: /data/requirements
