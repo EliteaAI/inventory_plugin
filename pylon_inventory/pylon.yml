@@ -40,6 +40,8 @@ modules:
     mode: relaxed
     activation: bulk
     cache: /data/cache/pip
+    # CPU-only torch wheels: avoids pulling the full NVIDIA CUDA stack at runtime.
+    extra_index_url: https://download.pytorch.org/whl/cpu
     provider:
       type: folder
       path: /data/requirements
