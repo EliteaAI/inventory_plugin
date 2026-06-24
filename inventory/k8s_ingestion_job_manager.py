@@ -484,7 +484,10 @@ class K8sIngestionJobManager:
                 return data
             if isinstance(data, str):
                 data = data.strip()
-                if not data:
+                # A missing progress object comes back as a human-readable string
+                # (e.g. "File '..._inventory_jobs/<job>/progress.json' not found. ");
+                # only attempt to parse genuine JSON payloads.
+                if not data or data[0] not in "{[":
                     return None
                 return json.loads(data)
             return None

@@ -129,6 +129,26 @@ def test_read_job_progress_downloads_latest_artifact(tmp_path):
     assert progress == {"sequence": 3, "phase": "progress", "message": "Processed 10 files"}
 
 
+def test_read_job_progress_returns_none_when_artifact_missing(tmp_path):
+    # elitea_sdk's artifact .get() returns a human-readable string (not JSON, not an
+    # "error" dict) when the progress object does not exist yet. read_job_progress must
+    # treat it as "no progress yet" and not raise / log a JSON decode error.
+    class FakeArtifact:
+        def get(self, key):
+            return "File '_inventory_jobs/job1/progress.json' not found. "
+
+    class FakeClient:
+        def artifact(self, bucket):
+            return FakeArtifact()
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+
+    progress = manager.read_job_progress("job1", {"artifact_bucket": "graphs"}, elitea_client=FakeClient())
+
+    assert progress is None
+
+
+
 def test_cleanup_platform_job_objects_removes_progress_artifact(monkeypatch, tmp_path):
     deleted_keys = []
 
