@@ -1603,7 +1603,43 @@ class Method:
         if not platform_url or not platform_token:
             return "Error: Platform API URL or token not configured. Check platform_api_url and ai_run_platform_token."
 
+        # Resolve the inventory toolkit settings before dispatching to the worker. The
+        # platform delivers the toolkit configuration under configuration.parameters (the
+        # merged ``params``), not configuration.settings, so config.get("settings") is
+        # normally empty on the agent path. Mirror the standalone path and fetch the saved
+        # settings from the platform API when they are absent -- otherwise the worker
+        # receives empty settings and falls back to the default "graphs" bucket with no
+        # per-source configuration (file patterns, branch).
         inventory_settings = config.get("settings", {}) or {}
+        if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
+            try:
+                import requests as http_requests
+
+                inventory_toolkit_url = (
+                    f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/"
+                    f"{project_id}/{application_id}"
+                )
+                resp = http_requests.get(
+                    inventory_toolkit_url,
+                    headers={"Authorization": f"Bearer {platform_token}"},
+                    verify=False,
+                )
+                if resp.ok:
+                    fetched_settings = resp.json().get("settings", {})
+                    if fetched_settings:
+                        inventory_settings = fetched_settings
+                    log.info(
+                        "[run_ingestion_job] Fetched inventory settings keys: %s",
+                        list(inventory_settings.keys()),
+                    )
+                else:
+                    log.warning(
+                        "[run_ingestion_job] Failed to fetch inventory settings: %s - %s",
+                        resp.status_code, resp.text,
+                    )
+            except Exception as fetch_err:
+                log.warning("[run_ingestion_job] Could not fetch inventory settings: %s", fetch_err)
+
         artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
         graph_dir = str(Path(graph_path).parent)
         ingestion_config = self.descriptor.config.get("ingestion", {})
