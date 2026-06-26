@@ -9,9 +9,9 @@ import {
 } from '@mui/material';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import {
-  startProviderTool,
-  pollProviderToolStatus,
-  stopProviderTask,
+  invokeToolAsync,
+  pollTaskStatus,
+  stopPlatformTask,
   getToolkitSources,
   getIngestionStatus,
   saveIngestionStatus,
@@ -182,30 +182,42 @@ function ToolkitDrawer({
     }, 5000);
   }, [checkIngestionStatus]);
 
-  // Run ingestion for a single source with tracking
-  // This properly tracks invocation_id for stop support
+  // Run ingestion for a single source with tracking.
+  // Routes through the platform's test_toolkit_tool path (invokeToolAsync) so pylon_main
+  // mints a per-project auth token and injects llm_settings into the invocation. This makes
+  // ingestion work for private projects without deployment-time credentials, matching how
+  // chat_query / reindex_graph already run. Tracks the platform task_id for stop support.
   const runIngestionWithTracking = useCallback(async (sourceToolkitId) => {
     // Create abort controller for this ingestion
     abortControllerRef.current = new AbortController();
 
-    // Start the ingestion and get invocation_id
-    const response = await startProviderTool('run_ingestion', {
+    // Start the ingestion via the platform and get the task_id.
+    // The platform path delivers llm_settings (credentials) but NOT the inventory
+    // toolkit's project/application id (its request shape is configuration.parameters,
+    // with no project_id/application_id keys). Pass them explicitly so the provider can
+    // build the graph path and resolve per-request platform credentials from llm_settings.
+    const response = await invokeToolAsync(projectId, toolkitId, 'run_ingestion', {
       toolkit_id: sourceToolkitId,
+      project_id: projectId,
+      application_id: toolkitId,
       output_format: 'json',
     });
 
-    if (!response.invocation_id) {
-      throw new Error('No invocation_id returned from server');
+    const taskId = response.task_id || response.id;
+    if (!taskId) {
+      throw new Error('No task_id returned from server');
     }
 
-    // Track the current invocation
-    currentInvocationRef.current = response.invocation_id;
-    console.log(`[Ingestion] Started invocation: ${response.invocation_id}`);
+    // Track the current task
+    currentInvocationRef.current = taskId;
+    console.log(`[Ingestion] Started task: ${taskId}`);
 
     // Poll for completion (with abort support)
     try {
-      const result = await pollProviderToolStatus(
-        response.invocation_id,
+      const result = await pollTaskStatus(
+        projectId,
+        taskId,
+        36000000,
         abortControllerRef.current.signal
       );
       return result;
@@ -213,7 +225,7 @@ function ToolkitDrawer({
       currentInvocationRef.current = null;
       abortControllerRef.current = null;
     }
-  }, []);
+  }, [projectId, toolkitId]);
 
   // Handle triggering ingestion for a single source
   // Uses runIngestionWithTracking to properly track invocation_id for stop support
@@ -322,7 +334,7 @@ function ToolkitDrawer({
     }
   }, [projectId, toolkitId, configuredSources, bucket, graphName, onReindexComplete, runIngestionWithTracking, startStatusPolling, parseIngestionError]);
 
-  // Stop ingestion - abort polling and stop the backend task
+  // Stop ingestion - abort polling and cancel the platform task
   const handleStopIngestion = useCallback(async () => {
     console.log('[Ingestion] Stop requested');
     ingestionAbortRef.current = true;
@@ -332,17 +344,17 @@ function ToolkitDrawer({
       abortControllerRef.current.abort();
     }
 
-    // Stop the backend task if we have an invocation_id
+    // Cancel the platform task if we have a task_id
     if (currentInvocationRef.current) {
       console.log(`[Ingestion] Stopping task: ${currentInvocationRef.current}`);
       try {
-        await stopProviderTask(currentInvocationRef.current);
+        await stopPlatformTask(projectId, currentInvocationRef.current);
         console.log('[Ingestion] Task stopped successfully');
       } catch (err) {
         console.error('[Ingestion] Failed to stop task:', err);
       }
     }
-  }, []);
+  }, [projectId]);
 
   return (
     <Drawer

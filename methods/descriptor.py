@@ -127,6 +127,22 @@ class Method:
                                     "required": False,
                                     "description": "Force full rebuild instead of incremental update",
                                     "default": False
+                                },
+                                "project_id": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Target project ID (auto-populated by the UI/platform context; do not set manually)",
+                                    "json_schema_extra": {
+                                        "hidden": True
+                                    }
+                                },
+                                "application_id": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Inventory toolkit (application) ID that owns the knowledge graph (auto-populated by the UI/platform context; do not set manually)",
+                                    "json_schema_extra": {
+                                        "hidden": True
+                                    }
                                 }
                             },
                             "tool_metadata": {

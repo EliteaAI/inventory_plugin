@@ -7,6 +7,8 @@ import json
 import traceback
 import sys
 import os
+import base64
+import hashlib
 import time
 import queue
 import threading
@@ -20,6 +22,243 @@ from pylon.core.tools import web
 def _is_ingestion_jobs_enabled() -> bool:
     """Check whether run_ingestion should be delegated to K8s Jobs."""
     return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
+
+
+def _platform_settings_from_llm_settings(llm_settings):
+    """Derive platform base URL, auth token and project_id from per-request ``llm_settings``.
+
+    The platform (``provider_worker`` in ``pylon_indexer``) injects an ``llm_settings``
+    dict into every tool invocation. The JWT it carries (``api_key``) authorizes not only
+    LLM calls but the platform's artifact/toolkit REST APIs as well, and the platform base
+    URL can be recovered by stripping the ``/llm[/api][/vN]`` suffix from ``api_base``.
+    Building the EliteAClient from this dict -- instead of a deployment-time token -- is what
+    lets the inventory provider operate against any project (including private ones) with no
+    per-deployment configuration, mirroring the deepwiki provider's ``extract_artifact_settings``.
+
+    Returns ``{"base_url", "api_key", "project_id"}`` or ``None`` when the dict does not
+    carry a usable ``api_base``/``api_key`` pair.
+    """
+    if not isinstance(llm_settings, dict):
+        return None
+    api_base = llm_settings.get("api_base") or llm_settings.get("openai_api_base") or ""
+    api_key = llm_settings.get("api_key") or llm_settings.get("openai_api_key") or ""
+    if not api_base or not api_key:
+        return None
+    project_id = (
+        llm_settings.get("organization")
+        or llm_settings.get("openai_organization")
+        or llm_settings.get("project_id")
+        or ""
+    )
+    base_url = re.sub(r"/llm(/api)?(/v\d+)?/?$", "", api_base).rstrip("/")
+    return {"base_url": base_url, "api_key": api_key, "project_id": str(project_id)}
+
+
+# Per-project platform credentials derived from ``llm_settings`` on platform-path
+# (agent/``provider_worker``) invocations such as ``run_ingestion``. Direct-path
+# operations -- the UI chat (sio handler) and the model selector route -- carry no
+# ``llm_settings`` of their own yet still need to call the platform (the chat builds
+# its LLM via ``elitea_client.get_llm``). Reusing the most recent project-scoped JWT
+# lets those operations stay config-independent (no deployment token) once any
+# platform-path call has run for the project. In-memory and per-process, which is
+# sufficient for the standalone single-worker provider; refreshed on every
+# platform-path call so the cached token tracks the latest invocation.
+#
+# Scope note: keyed by project_id (project-scoped), so all users of a project share
+# the last token seen. The inventory chat/model list operate on project-level data,
+# so this is acceptable for a project-shared assistant; it is strictly safer than a
+# single deployment-wide static token.
+_PLATFORM_CREDS_CACHE = {}
+_PLATFORM_CREDS_CACHE_LOCK = threading.Lock()
+_PLATFORM_CREDS_TTL_SECONDS = 12 * 60 * 60  # 12h
+# Durable "stamp" of the llm_settings-derived credentials on the provider's /data volume.
+# In-memory alone is wiped on every container restart and is not shared across worker
+# processes, so a direct-path chat or model-selector call (which carries no llm_settings)
+# could not see the token a platform-path ingestion had already resolved -- it fell back to
+# the (empty) deployment token and failed. Persisting to /data (bind-mounted, gitignored
+# under cache/) makes the credentials survive restarts and be visible regardless of which
+# worker handled the ingestion.
+_PLATFORM_CREDS_DISK_DIR = os.environ.get(
+    "INVENTORY_PLATFORM_CREDS_DIR", "/data/cache/platform_creds"
+)
+
+
+def _platform_creds_disk_path(project_id):
+    return os.path.join(_PLATFORM_CREDS_DISK_DIR, f"{project_id}.json")
+
+
+# Encrypt the persisted stamp at rest. The entry holds a project-scoped JWT, so writing it
+# as plain JSON would leave a grep-able secret on the (bind-mounted) /data volume. Fernet
+# (AES-128-CBC + HMAC, from the already-present ``cryptography`` package) is cheap for a
+# sub-kilobyte blob and authenticates the ciphertext. The key comes from
+# ``INVENTORY_PLATFORM_CREDS_KEY`` when set -- the only tier that actually protects the file
+# against someone holding just the volume, since the key then lives solely in the container
+# env. Absent that, a key is derived from a static module secret, which only *obfuscates*
+# (the key is recoverable from the code) but still keeps the token out of plaintext. If
+# ``cryptography`` is somehow unavailable the writer falls back to base64 (obfuscation only).
+# The on-disk file stays valid JSON -- ``{"v":2,"enc":...,"data":...}`` -- so the format is
+# self-describing and the reader still loads any legacy plaintext stamp written before this.
+_PLATFORM_CREDS_KEY_ENV = "INVENTORY_PLATFORM_CREDS_KEY"
+_PLATFORM_CREDS_STATIC_SECRET = b"inventory-plugin:platform-creds:v2"
+_PLATFORM_CREDS_CIPHER = None
+_PLATFORM_CREDS_CIPHER_READY = False
+
+
+def _platform_creds_cipher():
+    """Return a cached Fernet cipher, or ``None`` when ``cryptography`` is unavailable."""
+    global _PLATFORM_CREDS_CIPHER, _PLATFORM_CREDS_CIPHER_READY
+    if _PLATFORM_CREDS_CIPHER_READY:
+        return _PLATFORM_CREDS_CIPHER
+    _PLATFORM_CREDS_CIPHER_READY = True
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as exc:  # pragma: no cover - cryptography is a standard dependency
+        log.debug("cryptography unavailable; platform creds will be base64-obfuscated: %s", exc)
+        return None
+    configured = os.environ.get(_PLATFORM_CREDS_KEY_ENV, "").strip()
+    if configured:
+        try:
+            # Accept a ready-made Fernet key, else derive one from the passphrase.
+            try:
+                cipher = Fernet(configured.encode())
+            except (ValueError, TypeError):
+                derived = base64.urlsafe_b64encode(hashlib.sha256(configured.encode()).digest())
+                cipher = Fernet(derived)
+        except Exception as exc:
+            log.warning("Invalid %s; falling back to derived key: %s", _PLATFORM_CREDS_KEY_ENV, exc)
+            cipher = None
+        if cipher is not None:
+            _PLATFORM_CREDS_CIPHER = cipher
+            return cipher
+    # No (valid) configured key -- derive a deterministic obfuscation key from the static secret.
+    derived = base64.urlsafe_b64encode(hashlib.sha256(_PLATFORM_CREDS_STATIC_SECRET).digest())
+    _PLATFORM_CREDS_CIPHER = Fernet(derived)
+    return _PLATFORM_CREDS_CIPHER
+
+
+def _encode_platform_creds(entry):
+    """Serialize ``entry`` for disk as a self-describing JSON envelope (secret not in plaintext)."""
+    payload = json.dumps(entry, separators=(",", ":")).encode("utf-8")
+    cipher = _platform_creds_cipher()
+    if cipher is not None:
+        token = cipher.encrypt(payload).decode("ascii")
+        return json.dumps({"v": 2, "enc": "fernet", "data": token})
+    return json.dumps({"v": 2, "enc": "b64", "data": base64.b64encode(payload).decode("ascii")})
+
+
+def _decode_platform_creds(raw):
+    """Inverse of :func:`_encode_platform_creds`; tolerates legacy plaintext stamps."""
+    try:
+        blob = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(blob, dict):
+        return None
+    enc = blob.get("enc")
+    if enc is None:
+        # Legacy plaintext stamp written before encryption was added.
+        return blob if blob.get("api_key") else None
+    data = blob.get("data") or ""
+    try:
+        if enc == "fernet":
+            cipher = _platform_creds_cipher()
+            if cipher is None:
+                return None
+            payload = cipher.decrypt(data.encode("ascii"))
+        elif enc == "b64":
+            payload = base64.b64decode(data.encode("ascii"))
+        else:
+            return None
+        return json.loads(payload.decode("utf-8"))
+    except Exception as exc:  # InvalidToken (wrong/rotated key), bad base64, corrupt JSON
+        log.debug("Could not decode platform creds blob: %s", exc)
+        return None
+
+
+def _write_platform_creds_disk(project_id, entry):
+    """Persist resolved credentials so sibling workers and post-restart calls can reuse them."""
+    try:
+        os.makedirs(_PLATFORM_CREDS_DISK_DIR, exist_ok=True)
+        path = _platform_creds_disk_path(project_id)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(_encode_platform_creds(entry))
+        os.replace(tmp, path)  # atomic publish
+        try:
+            os.chmod(path, 0o600)  # the entry holds a project-scoped JWT
+        except OSError:
+            pass
+    except Exception as exc:  # best-effort -- never break a request over a cache write
+        log.debug("Could not persist platform creds for %s: %s", project_id, exc)
+
+
+def _read_platform_creds_disk(project_id):
+    """Read persisted credentials for ``project_id``; drop the file if expired or corrupt."""
+    path = _platform_creds_disk_path(project_id)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            entry = _decode_platform_creds(handle.read())
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log.debug("Could not read platform creds for %s: %s", project_id, exc)
+        return None
+    if not isinstance(entry, dict) or not entry.get("api_key") or not entry.get("base_url"):
+        return None
+    if time.time() - entry.get("ts", 0) > _PLATFORM_CREDS_TTL_SECONDS:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return entry
+
+
+def _cache_platform_settings(project_id, derived):
+    """Remember ``llm_settings``-derived platform credentials for later direct-path calls.
+
+    Stored both in-memory (fast path) and on the /data volume (durable across restarts and
+    visible to sibling worker processes), so the direct-path chat and model selector -- which
+    carry no ``llm_settings`` -- can reuse the credentials a platform-path call (e.g.
+    ``run_ingestion``) resolved for the project.
+    """
+    if not project_id or not derived:
+        return
+    entry = {
+        "base_url": derived["base_url"],
+        "api_key": derived["api_key"],
+        "project_id": str(project_id),
+        "ts": time.time(),
+    }
+    with _PLATFORM_CREDS_CACHE_LOCK:
+        _PLATFORM_CREDS_CACHE[str(project_id)] = entry
+    _write_platform_creds_disk(project_id, entry)
+
+
+def _lookup_cached_platform_settings(project_id):
+    """Return cached platform credentials for ``project_id`` if present and not expired.
+
+    Checks the in-memory cache first, then falls back to the durable /data stamp (repopulating
+    memory on a hit) so a restarted or sibling worker still resolves the per-project token.
+    """
+    if not project_id:
+        return None
+    key = str(project_id)
+    with _PLATFORM_CREDS_CACHE_LOCK:
+        entry = _PLATFORM_CREDS_CACHE.get(key)
+        if entry:
+            if time.time() - entry.get("ts", 0) > _PLATFORM_CREDS_TTL_SECONDS:
+                _PLATFORM_CREDS_CACHE.pop(key, None)
+                entry = None
+            else:
+                return entry
+    # Memory miss (or expired) -- consult the durable stamp.
+    disk_entry = _read_platform_creds_disk(key)
+    if disk_entry:
+        with _PLATFORM_CREDS_CACHE_LOCK:
+            _PLATFORM_CREDS_CACHE[key] = disk_entry
+        return disk_entry
+    return None
 
 # Add plugin directory to Python path for local inventory module
 plugin_dir = Path(__file__).parent.parent
@@ -120,49 +359,103 @@ class Method:
         }
 
     @web.method()
-    def _get_elitea_client(self, project_id: int):
-        """Create EliteAClient instance for platform API calls.
+    def _resolve_platform_settings(self, llm_settings=None, project_id=None):
+        """Resolve ``(base_url, auth_token, project_id)`` for platform API calls.
+
+        Prefers per-request credentials derived from ``llm_settings`` (config-independent --
+        works for any project, including private ones, without a deployment-time token).
+        Falls back to the deployment config (see ``_get_platform_connection_settings``) for
+        call paths that carry no ``llm_settings`` -- notably the inventory UI/REST ingestion
+        path, which posts directly to ``/tools/inventory/.../invoke`` without going through
+        the agent/``provider_worker`` pipeline that injects ``llm_settings``.
+        """
+        derived = _platform_settings_from_llm_settings(llm_settings)
+        if derived:
+            resolved_pid = derived["project_id"] or project_id
+            _cache_platform_settings(resolved_pid, derived)
+            log.info(
+                "Platform settings resolved from per-request llm_settings (base_url=%s, project_id=%s)",
+                derived["base_url"], resolved_pid,
+            )
+            return derived["base_url"], derived["api_key"], resolved_pid
+        cached = _lookup_cached_platform_settings(project_id)
+        if cached:
+            log.info(
+                "Platform settings resolved from cached llm_settings (base_url=%s, project_id=%s)",
+                cached["base_url"], cached["project_id"],
+            )
+            return cached["base_url"], cached["api_key"], cached["project_id"] or project_id
+        base_url, token = self._get_platform_connection_settings()
+        log.info(
+            "Platform settings resolved from deployment config (base_url=%s, has_token=%s, llm_settings_present=%s)",
+            base_url, bool(token), bool(isinstance(llm_settings, dict) and llm_settings),
+        )
+        return base_url, token, project_id
+
+    @web.method()
+    def _get_elitea_client(self, project_id, llm_settings=None):
+        """Create an EliteAClient instance for platform API calls.
+
+        When ``llm_settings`` (injected by the platform on every tool invocation) carries a
+        usable JWT and base URL, the client is scoped to the calling user/project and no
+        deployment-time token is required. Otherwise falls back to the deployment
+        ``platform_api_url`` / ``ai_run_platform_token`` config.
 
         Args:
-            project_id: The project ID to use for the client
+            project_id: The project ID to use for the client.
+            llm_settings: Per-request LLM settings dict expanded by the platform.
 
         Returns:
-            EliteAClient instance or None if platform config is missing
+            EliteAClient instance or None if no credentials could be resolved.
         """
         from elitea_sdk.runtime.clients.client import EliteAClient
 
-        platform_api_url = self.descriptor.config.get("platform_api_url", "")
-        platform_token = self.descriptor.config.get("ai_run_platform_token", "")
+        base_url, auth_token, resolved_project_id = self._resolve_platform_settings(
+            llm_settings, project_id
+        )
 
-        # Fallback: derive platform URL from app_url if platform_api_url not set
-        if not platform_api_url:
-            app_url = self.descriptor.config.get("app_url", "")
-            if app_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(app_url)
-                platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
-
-        if not platform_api_url or not platform_token:
+        if not base_url or not auth_token:
             log.warning("Platform API URL or token not configured")
+            return None
+        if not resolved_project_id:
+            log.warning("Cannot construct EliteAClient: project_id is missing")
             return None
 
         return EliteAClient(
-            base_url=platform_api_url.rstrip("/"),
-            project_id=int(project_id),
-            auth_token=platform_token,
+            base_url=base_url.rstrip("/"),
+            project_id=int(resolved_project_id),
+            auth_token=auth_token,
         )
 
     @web.method()
     def _get_platform_connection_settings(self):
-        """Return platform URL/token from plugin config with app_url fallback."""
-        platform_api_url = self.descriptor.config.get("platform_api_url", "")
-        platform_token = self.descriptor.config.get("ai_run_platform_token", "")
+        """Return platform base URL/token from plugin config.
+
+        The EliteA API base URL is resolved from the first available config source:
+        explicit ``platform_api_url``, else the host of ``ai_run_platform_url`` (the
+        descriptor-registration endpoint), else the host of ``service_location_url`` /
+        ``app_url``. The token comes from ``ai_run_platform_token``. Inventory configs
+        commonly leave ``platform_api_url`` unset and only provide ``service_location_url``
+        (``${APP_URL}``) plus ``ai_run_platform_url`` (``${AI_RUN_PLATFORM_URL}``), so this
+        host-derivation fallback is required for the UI/REST path (which carries no
+        per-request ``llm_settings``) to build an EliteAClient.
+        """
+        from urllib.parse import urlparse
+
+        config = self.descriptor.config
+        platform_api_url = config.get("platform_api_url", "")
+        platform_token = config.get("ai_run_platform_token", "")
+
         if not platform_api_url:
-            app_url = self.descriptor.config.get("app_url", "")
-            if app_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(app_url)
-                platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
+            for key in ("ai_run_platform_url", "service_location_url", "app_url"):
+                candidate = config.get(key, "")
+                if not candidate:
+                    continue
+                parsed = urlparse(candidate)
+                if parsed.scheme and parsed.hostname:
+                    platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
+                    break
+
         return platform_api_url.rstrip("/"), platform_token
 
     @web.method()
@@ -190,14 +483,16 @@ class Method:
             toolkit_params = request_data.get("configuration", {}).get("parameters", {})
             tool_params = request_data.get("parameters", {})
 
-            log.info(f"Toolkit params: {toolkit_params}")
-            log.info(f"Tool params: {tool_params}")
-
             # Merge parameters (tool params override toolkit params)
             params = toolkit_params.copy()
             for key, value in tool_params.items():
                 if key not in params or value:
                     params[key] = value
+
+            # Key-only at debug level: these dicts carry secrets (LLM JWT, source
+            # credentials, DB connection strings) and must never be logged verbatim.
+            log.debug("Toolkit param keys: %s", list(toolkit_params.keys()))
+            log.debug("Tool param keys: %s", list(tool_params.keys()))
 
             # Route to appropriate handler based on toolkit type
             if toolkit_name == "inventory_search":
@@ -217,10 +512,8 @@ class Method:
     @web.method()
     def _handle_inventory_tool(self, invocation_id, tool_name, params, request_data):
         """Handle all inventory toolkit tools"""
-        log.info(f"[DEBUG] _handle_inventory_tool called: tool_name={tool_name}")
-        log.info(f"[DEBUG] params: {params}")
-        log.info(f"[DEBUG] config keys: {request_data.get('configuration', {}).keys()}")
-        
+        log.debug("[inventory] handling tool: %s", tool_name)
+
         # Tool routing map
         tools = {
             # Ingestion tools
@@ -271,19 +564,25 @@ class Method:
                 include_traceback=False,
             )
 
-        # Get graph path from project and application IDs
+        # Resolve project/application context. The direct UI REST path supplies
+        # project_id/application_id under "configuration"; the platform
+        # (test_toolkit_tool) path supplies them only as tool params and carries
+        # per-request credentials under configuration.parameters.llm_settings, from
+        # whose "organization" claim project_id can also be derived.
         config = request_data.get("configuration", {})
+        llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
-
-        log.info(f"[DEBUG] Extracted project_id={project_id}, application_id={application_id}")
+        if not project_id and isinstance(llm_settings, dict):
+            project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
         # Construct graph path: /data/graphs/<project_id>/<application_id>/graph.json
         graph_path = None
         if project_id and application_id:
             graph_path = f"/data/graphs/{project_id}/{application_id}/graph.json"
 
-        log.info(f"[DEBUG] Constructed graph_path: {graph_path}")
+        log.debug("[inventory] tool=%s project_id=%s application_id=%s graph_path=%s",
+                  tool_name, project_id, application_id, graph_path)
 
         # Track cache access for this graph (using project_id and application_id as keys)
         if project_id and application_id:
@@ -503,6 +802,7 @@ class Method:
                 history=[],  # No history for single-shot queries
                 emit_fn=None,  # No streaming
                 model=None,  # Use toolkit's configured model
+                llm_settings=params.get("llm_settings"),  # per-request creds (config-independent)
             )
 
             # Format response
@@ -738,13 +1038,13 @@ class Method:
         return False
 
     @web.method()
-    def _download_graph_from_artifacts(self, graph_path, project_id, application_id, artifact_bucket):
+    def _download_graph_from_artifacts(self, graph_path, project_id, application_id, artifact_bucket, llm_settings=None):
         """Download graph and checkpoints from artifact bucket if not present locally"""
         import os
         from pathlib import Path
 
-        # Create EliteAClient using helper method
-        elitea_client = self._get_elitea_client(project_id)
+        # Create EliteAClient using helper method (prefers per-request llm_settings creds)
+        elitea_client = self._get_elitea_client(project_id, llm_settings)
         if not elitea_client:
             log.warning("Cannot download from artifacts: Platform API URL or token not configured")
             return False
@@ -816,11 +1116,11 @@ class Method:
         import os
         from inventory import InventoryRetrievalApiWrapper
 
-        log.info(f"[_get_or_create_wrapper] graph_path={graph_path}, has_request_data={request_data is not None}")
+        log.debug("[_get_or_create_wrapper] graph_path=%s, has_request_data=%s", graph_path, request_data is not None)
 
         # Check if graph exists locally, if not try to download from artifacts
         if graph_path and not os.path.exists(graph_path) and request_data:
-            log.info(f"[_get_or_create_wrapper] Graph not found at {graph_path}, attempting to download from artifacts")
+            log.debug("[_get_or_create_wrapper] Graph not found at %s, attempting to download from artifacts", graph_path)
 
             # Get project and application IDs from request
             config = request_data.get("configuration", {})
@@ -829,14 +1129,16 @@ class Method:
             # Get artifact bucket from toolkit settings
             settings = config.get("settings", {})
             artifact_bucket = settings.get("toolkit_configuration_bucket", "graphs")
+            # Per-request platform creds expanded by the platform under parameters.llm_settings
+            llm_settings = config.get("parameters", {}).get("llm_settings")
 
-            log.info(f"[_get_or_create_wrapper] project_id={project_id}, application_id={application_id}, artifact_bucket={artifact_bucket}")
+            log.debug("[_get_or_create_wrapper] project_id=%s, application_id=%s, artifact_bucket=%s", project_id, application_id, artifact_bucket)
 
             if project_id and application_id:
                 download_result = self._download_graph_from_artifacts(
-                    graph_path, project_id, application_id, artifact_bucket
+                    graph_path, project_id, application_id, artifact_bucket, llm_settings
                 )
-                log.info(f"[_get_or_create_wrapper] Download result: {download_result}")
+                log.debug("[_get_or_create_wrapper] Download result: %s", download_result)
             else:
                 log.warning(f"[_get_or_create_wrapper] Cannot download from artifacts: project_id={project_id}, application_id={application_id}")
 
@@ -877,11 +1179,17 @@ class Method:
         if _is_ingestion_jobs_enabled():
             return self._run_ingestion_job(params, graph_path, request_data)
 
-        # Get context for slot tracking
+        # Get context for slot tracking. The platform (test_toolkit_tool) path carries
+        # credentials under configuration.parameters.llm_settings but supplies project/
+        # application ids only as tool params; project_id can also be derived from the
+        # llm_settings "organization" claim.
         task_id = tasknode_task.id
         config = request_data.get("configuration", {})
+        llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
+        if not project_id and isinstance(llm_settings, dict):
+            project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
         # Try to acquire an ingestion slot
         slot_acquired = False
@@ -909,19 +1217,23 @@ class Method:
         log.info(f"[run_ingestion] ===== Starting ingestion for toolkit {toolkit_id} =====")
 
         try:
-            # Get project_id and application_id from request context
+            # Get project_id and application_id from request context (same resolution as
+            # the slot-tracking block above: config -> tool params -> llm_settings claim).
             config = request_data.get("configuration", {})
-            log.info(f"[run_ingestion] config keys: {list(config.keys())}")
+            log.debug("[run_ingestion] config keys: %s", list(config.keys()))
+            llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
             project_id = config.get("project_id") or params.get("project_id")
             application_id = config.get("application_id") or params.get("application_id")
+            if not project_id and isinstance(llm_settings, dict):
+                project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
             if not project_id:
                 return "Error: project_id not found in request context"
             if not application_id:
                 return "Error: application_id not found in request context"
 
-            # Create EliteAClient for platform API calls
-            elitea_client = self._get_elitea_client(project_id)
+            # Create EliteAClient for platform API calls (prefers per-request llm_settings creds)
+            elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
             if not elitea_client:
                 return "Error: Platform API URL or token not configured. Check PLATFORM_API_URL and AI_RUN_PLATFORM_TOKEN."
 
@@ -1019,7 +1331,8 @@ class Method:
             # for future platform-level embedding features (e.g. vector store indexing).
 
             log.info(f"Using LLM model: {llm_model}")
-            log.info(f"Inventory settings: {inventory_settings}")
+            # Settings may contain source credentials/connection strings - never log values.
+            log.debug("Inventory settings keys: %s", list(inventory_settings.keys()))
 
             # Ensure graph directory exists
             graph_dir = Path(graph_path).parent
@@ -1285,7 +1598,8 @@ class Method:
         if not application_id:
             return "Error: application_id not found in request context"
 
-        platform_url, platform_token = self._get_platform_connection_settings()
+        llm_settings = params.get("llm_settings") or {}
+        platform_url, platform_token, _ = self._resolve_platform_settings(llm_settings, project_id)
         if not platform_url or not platform_token:
             return "Error: Platform API URL or token not configured. Check platform_api_url and ai_run_platform_token."
 
@@ -1508,7 +1822,7 @@ class Method:
 
         try:
             sync_bucket = result.get("artifact_bucket") or artifact_bucket
-            self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket)
+            self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket, params.get("llm_settings"))
             if graph_path in self.graph_instances:
                 del self.graph_instances[graph_path]
 
@@ -2377,8 +2691,7 @@ class Method:
         import os
         import json as json_module
 
-        log.info(f"[DEBUG] _tool_get_stats called with graph_path: {graph_path}")
-        log.info(f"[DEBUG] params: {params}")
+        log.debug("[get_stats] graph_path=%s param_keys=%s", graph_path, list(params.keys()))
         output_format = params.get("output_format", "text")
 
         if not graph_path:
@@ -2395,12 +2708,12 @@ class Method:
             return "No graph configured"
 
         # Try to get or create wrapper - this will attempt artifact download if graph doesn't exist locally
-        log.info(f"[DEBUG] Getting or creating wrapper for path: {graph_path}")
+        log.debug("[get_stats] getting or creating wrapper for path: %s", graph_path)
         wrapper = self._get_or_create_wrapper(graph_path, request_data)
 
         # Check if graph was loaded successfully (either from local or artifacts)
         if not os.path.exists(graph_path):
-            log.info(f"[DEBUG] Graph file not found at {graph_path} after download attempt, returning empty stats")
+            log.debug("[get_stats] graph file not found at %s after download attempt, returning empty stats", graph_path)
             if output_format == "json":
                 return json_module.dumps({
                     "node_count": 0,
@@ -2414,15 +2727,15 @@ class Method:
                 })
             return "No graph data yet. Run ingestion to populate the knowledge graph."
 
-        log.info(f"[DEBUG] Got wrapper, output_format: {output_format}")
+        log.debug("[get_stats] got wrapper, output_format: %s", output_format)
 
         if output_format == "json":
             stats = wrapper._knowledge_graph.get_stats()
-            log.info(f"[DEBUG] Graph stats: {stats}")
+            log.debug("[get_stats] graph stats: %s", stats)
             return json_module.dumps(stats)
 
         result = wrapper.get_stats()
-        log.info(f"[DEBUG] Text stats result: {result}")
+        log.debug("[get_stats] text stats result computed")
         return result
 
     @web.method()
@@ -2728,7 +3041,7 @@ class Method:
         if not status_file.exists() and project_id and application_id:
             # Try to download from artifacts using EliteAClient
             try:
-                elitea_client = self._get_elitea_client(project_id)
+                elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
                 if elitea_client:
                     status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
                     if status_data and not self._is_artifact_error(status_data):
@@ -3350,7 +3663,7 @@ class Method:
             "gpt-4o-mini"
         )
 
-        elitea_client = self._get_elitea_client(project_id)
+        elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
         if not elitea_client:
             if output_format == "json":
                 return json_module.dumps({"error": "Platform API not configured"})

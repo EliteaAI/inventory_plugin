@@ -647,6 +647,7 @@ class Route:
                         "is_default": model_name == default_model,
                         "context_window": item.get("context_window"),
                         "supports_reasoning": item.get("supports_reasoning", False),
+                        "openai_compatible": str(item.get("openai_compatible", False)).strip().lower() in ("true", "1", "yes"),
                     })
 
             # Sort: default first, then by display name

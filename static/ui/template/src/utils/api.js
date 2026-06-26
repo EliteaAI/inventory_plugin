@@ -327,10 +327,45 @@ export async function invokeToolAsync(projectId, toolkitId, toolName, params) {
 }
 
 /**
- * Get async task status
+ * Get async task status.
+ *
+ * Status-only by default: requesting the result (`result=yes`) while the task is
+ * still running makes the platform endpoint try to serialize a Python Ellipsis
+ * sentinel (get_task_result returns `...` when the result is not ready), which is
+ * not JSON serializable and yields HTTP 500. We only need the status to detect
+ * completion, so we avoid the result body.
  */
-export async function getTaskStatus(projectId, taskId) {
-  return apiRequest(`/api/v2/elitea_core/application_task/prompt_lib/${projectId}/${taskId}?result=yes`);
+export async function getTaskStatus(projectId, taskId, withResult = false) {
+  const query = withResult ? '?result=yes' : '';
+  return apiRequest(`/api/v2/elitea_core/application_task/prompt_lib/${projectId}/${taskId}${query}`);
+}
+
+/**
+ * Cancel a running platform task (e.g. an in-progress ingestion started via
+ * the test_toolkit_tool path). Uses a raw fetch so a 204 No Content response
+ * does not trip the JSON parsing in apiRequest.
+ */
+export async function stopPlatformTask(projectId, taskId) {
+  const headers = {};
+  if (import.meta.env.DEV && import.meta.env.VITE_DEV_TOKEN) {
+    headers['Authorization'] = `Bearer ${import.meta.env.VITE_DEV_TOKEN}`;
+  }
+
+  const response = await fetch(
+    `/api/v2/elitea_core/application_task/prompt_lib/${projectId}/${taskId}`,
+    {
+      method: 'DELETE',
+      headers,
+      credentials: 'include',
+    }
+  );
+
+  if (!response.ok && response.status !== 204) {
+    const errorText = await response.text();
+    throw new Error(`Failed to stop task: HTTP ${response.status} - ${errorText}`);
+  }
+
+  return { success: true };
 }
 
 /**
@@ -559,28 +594,62 @@ export async function runIngestion(projectId, toolkitId, sourceToolkitId, option
 }
 
 /**
- * Poll platform task status until complete
+ * Poll platform task status until the task reaches a terminal state.
+ *
+ * Arbiter task statuses are lowercase: 'pending' | 'running' | 'stopped'
+ * ('stopped' is the terminal state for a finished task). We poll status-only to
+ * avoid the platform's Ellipsis serialization bug while the task runs, and rely on
+ * the provider's own get_ingestion_status (polled separately for the progress UI)
+ * to surface detailed progress/errors.
+ *
+ * @param {string} projectId
+ * @param {string} taskId
+ * @param {number} timeoutMs - Max time to poll. Ingestion can run for a long time,
+ *   so callers should pass a generous value.
+ * @param {AbortSignal} signal - Optional AbortSignal to cancel polling.
  */
-async function pollTaskStatus(projectId, taskId, timeoutMs = 600000) {
+export async function pollTaskStatus(projectId, taskId, timeoutMs = 600000, signal = null) {
   const startTime = Date.now();
   const pollInterval = 2000; // 2 seconds
+  let consecutiveErrors = 0;
 
   while (Date.now() - startTime < timeoutMs) {
-    const status = await getTaskStatus(projectId, taskId);
-
-    if (status.status === 'Completed' || status.status === 'completed') {
-      return parseToolResult(status);
+    // Check if aborted (e.g. user pressed Stop)
+    if (signal?.aborted) {
+      throw new Error('Polling aborted');
     }
 
-    if (status.status === 'Error' || status.status === 'Failed' || status.status === 'error') {
-      throw new Error(status.error || status.result || 'Ingestion failed');
+    let data;
+    try {
+      data = await getTaskStatus(projectId, taskId);
+      consecutiveErrors = 0;
+    } catch (err) {
+      // Tolerate transient errors (e.g. task not yet registered right after start)
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 10) {
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      continue;
     }
 
-    // Wait before next poll
+    const status = String(data?.status || '').toLowerCase();
+
+    // Terminal: the task has finished (arbiter uses 'stopped').
+    if (status === 'stopped' || status === 'done' || status === 'completed' || status === 'finished') {
+      return data;
+    }
+
+    // Explicit failure states (defensive - arbiter normally reports 'stopped').
+    if (status === 'error' || status === 'failed') {
+      throw new Error(data?.error || 'Ingestion failed');
+    }
+
+    // pending / running / unknown -> keep polling
     await new Promise(resolve => setTimeout(resolve, pollInterval));
   }
 
-  throw new Error('Ingestion timed out after 10 minutes');
+  throw new Error('Ingestion timed out');
 }
 
 /**
@@ -618,10 +687,39 @@ export async function updateToolkitSettings(projectId, toolkitId, settings) {
 }
 
 /**
- * Get sources from toolkit configuration
+ * Normalize a source list into an array of toolkit IDs.
+ *
+ * The platform may return the source list as a real array, as a JSON-encoded
+ * string (e.g. "[123, 456]"), or omit it entirely. Callers iterate the result
+ * with .forEach/for..of, so this must always return an array.
+ */
+function normalizeSourceList(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  if (typeof raw === 'object') return Object.values(raw);
+  return [];
+}
+
+/**
+ * Get sources from toolkit configuration.
+ *
+ * Canonical location is settings.sources (List[Integer], persisted by useSources).
+ * Some platform responses expose it as settings.toolkit_configuration_sources,
+ * which can arrive as a JSON string. Always returns an array of toolkit IDs.
  */
 export function getToolkitSources(toolkit) {
-  return toolkit?.settings?.toolkit_configuration_sources || [];
+  const settings = toolkit?.settings || {};
+  const fromSources = normalizeSourceList(settings.sources);
+  if (fromSources.length > 0) return fromSources;
+  return normalizeSourceList(settings.toolkit_configuration_sources);
 }
 
 /**
@@ -903,14 +1001,55 @@ function parseToolResult(response) {
 }
 
 /**
- * Get available chat models from the platform
- * @returns {Promise<Array>} Array of model objects with { id, name, display_name }
+ * Map the platform /configurations/models response into chat model objects.
+ * openai_compatible / supports_reasoning may arrive as a bool or 'true'/'false' string.
+ */
+function mapPlatformModels(data) {
+  const items = (data && data.items) || [];
+  const defaultModel = data && data.default_model_name;
+  const truthy = (v) => v === true || String(v).toLowerCase() === 'true';
+  const models = items
+    .filter((it) => it && it.name)
+    .map((it) => ({
+      name: it.name,
+      display_name: it.display_name || it.name,
+      is_default: it.name === defaultModel,
+      context_window: it.context_window,
+      supports_reasoning: truthy(it.supports_reasoning),
+      openai_compatible: truthy(it.openai_compatible),
+    }));
+  models.sort((a, b) =>
+    a.is_default === b.is_default
+      ? a.display_name.toLowerCase().localeCompare(b.display_name.toLowerCase())
+      : (a.is_default ? -1 : 1)
+  );
+  return models;
+}
+
+/**
+ * Get available chat models.
+ *
+ * Fetches directly from the platform via the user session (config-independent and
+ * works on cold start, before any platform-path call has populated the provider's
+ * credential cache). Falls back to the provider /chat/models route if the platform
+ * call fails.
+ * @returns {Promise<Array>} Array of model objects { name, display_name, is_default, openai_compatible, ... }
  */
 export async function getChatModels() {
   const config = getConfig();
-  const basePath = getProviderBasePath();
 
   try {
+    const data = await apiRequest(
+      `/api/v2/configurations/models/${config.project_id}?include_shared=true`
+    );
+    const models = mapPlatformModels(data);
+    if (models.length > 0) return models;
+  } catch (e) {
+    console.warn('[getChatModels] Platform models fetch failed, falling back to provider route:', e);
+  }
+
+  try {
+    const basePath = getProviderBasePath();
     const response = await apiRequest(`${basePath}/${config.toolkit_id}/chat/models`);
     return response.models || [];
   } catch (e) {
