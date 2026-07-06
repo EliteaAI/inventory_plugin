@@ -7,8 +7,6 @@ import json
 import traceback
 import sys
 import os
-import base64
-import hashlib
 import time
 import queue
 import threading
@@ -22,6 +20,14 @@ from pylon.core.tools import web
 def _is_ingestion_jobs_enabled() -> bool:
     """Check whether run_ingestion should be delegated to K8s Jobs."""
     return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
+
+
+# Platform HTTP request defaults. The internal platform commonly terminates TLS with
+# self-signed certs, so verification defaults off but is env-overridable
+# (``INVENTORY_PLATFORM_VERIFY_SSL=true``); every platform call also carries a timeout so
+# a stalled platform can never hang a worker thread indefinitely.
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
 
 
 def _platform_settings_from_llm_settings(llm_settings):
@@ -54,211 +60,93 @@ def _platform_settings_from_llm_settings(llm_settings):
     return {"base_url": base_url, "api_key": api_key, "project_id": str(project_id)}
 
 
-# Per-project platform credentials derived from ``llm_settings`` on platform-path
-# (agent/``provider_worker``) invocations such as ``run_ingestion``. Direct-path
-# operations -- the UI chat (sio handler) and the model selector route -- carry no
-# ``llm_settings`` of their own yet still need to call the platform (the chat builds
-# its LLM via ``elitea_client.get_llm``). Reusing the most recent project-scoped JWT
-# lets those operations stay config-independent (no deployment token) once any
-# platform-path call has run for the project. In-memory and per-process, which is
-# sufficient for the standalone single-worker provider; refreshed on every
-# platform-path call so the cached token tracks the latest invocation.
-#
-# Scope note: keyed by project_id (project-scoped), so all users of a project share
-# the last token seen. The inventory chat/model list operate on project-level data,
-# so this is acceptable for a project-shared assistant; it is strictly safer than a
-# single deployment-wide static token.
-_PLATFORM_CREDS_CACHE = {}
-_PLATFORM_CREDS_CACHE_LOCK = threading.Lock()
-_PLATFORM_CREDS_TTL_SECONDS = 12 * 60 * 60  # 12h
-# Durable "stamp" of the llm_settings-derived credentials on the provider's /data volume.
-# In-memory alone is wiped on every container restart and is not shared across worker
-# processes, so a direct-path chat or model-selector call (which carries no llm_settings)
-# could not see the token a platform-path ingestion had already resolved -- it fell back to
-# the (empty) deployment token and failed. Persisting to /data (bind-mounted, gitignored
-# under cache/) makes the credentials survive restarts and be visible regardless of which
-# worker handled the ingestion.
-_PLATFORM_CREDS_DISK_DIR = os.environ.get(
-    "INVENTORY_PLATFORM_CREDS_DIR", "/data/cache/platform_creds"
-)
+def _string_list(value):
+    """Normalize descriptor string/list arguments into a clean list of strings."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
 
 
-def _platform_creds_disk_path(project_id):
-    return os.path.join(_PLATFORM_CREDS_DISK_DIR, f"{project_id}.json")
+def _chat_filters_from_params(params):
+    """Build inventory chat filters from tool parameters."""
+    params = params or {}
+    filters = {}
+    for key in ("entity_types", "sources", "layers"):
+        values = _string_list(params.get(key))
+        if values:
+            filters[key] = values
+    filters["depth"] = params.get("depth", 2)
+    filters["max_nodes"] = params.get("max_nodes", 500)
+    return filters
 
 
-# Encrypt the persisted stamp at rest. The entry holds a project-scoped JWT, so writing it
-# as plain JSON would leave a grep-able secret on the (bind-mounted) /data volume. Fernet
-# (AES-128-CBC + HMAC, from the already-present ``cryptography`` package) is cheap for a
-# sub-kilobyte blob and authenticates the ciphertext. The key comes from
-# ``INVENTORY_PLATFORM_CREDS_KEY`` when set -- the only tier that actually protects the file
-# against someone holding just the volume, since the key then lives solely in the container
-# env. Absent that, a key is derived from a static module secret, which only *obfuscates*
-# (the key is recoverable from the code) but still keeps the token out of plaintext. If
-# ``cryptography`` is somehow unavailable the writer falls back to base64 (obfuscation only).
-# The on-disk file stays valid JSON -- ``{"v":2,"enc":...,"data":...}`` -- so the format is
-# self-describing and the reader still loads any legacy plaintext stamp written before this.
-_PLATFORM_CREDS_KEY_ENV = "INVENTORY_PLATFORM_CREDS_KEY"
-_PLATFORM_CREDS_STATIC_SECRET = b"inventory-plugin:platform-creds:v2"
-_PLATFORM_CREDS_CIPHER = None
-_PLATFORM_CREDS_CIPHER_READY = False
-
-
-def _platform_creds_cipher():
-    """Return a cached Fernet cipher, or ``None`` when ``cryptography`` is unavailable."""
-    global _PLATFORM_CREDS_CIPHER, _PLATFORM_CREDS_CIPHER_READY
-    if _PLATFORM_CREDS_CIPHER_READY:
-        return _PLATFORM_CREDS_CIPHER
-    _PLATFORM_CREDS_CIPHER_READY = True
+def _chat_history_from_param(raw_history):
+    """Parse the optional JSON-encoded chat history argument."""
+    if isinstance(raw_history, list):
+        return raw_history
+    if not isinstance(raw_history, str) or not raw_history.strip():
+        return []
     try:
-        from cryptography.fernet import Fernet
-    except Exception as exc:  # pragma: no cover - cryptography is a standard dependency
-        log.debug("cryptography unavailable; platform creds will be base64-obfuscated: %s", exc)
-        return None
-    configured = os.environ.get(_PLATFORM_CREDS_KEY_ENV, "").strip()
-    if configured:
-        try:
-            # Accept a ready-made Fernet key, else derive one from the passphrase.
-            try:
-                cipher = Fernet(configured.encode())
-            except (ValueError, TypeError):
-                derived = base64.urlsafe_b64encode(hashlib.sha256(configured.encode()).digest())
-                cipher = Fernet(derived)
-        except Exception as exc:
-            log.warning("Invalid %s; falling back to derived key: %s", _PLATFORM_CREDS_KEY_ENV, exc)
-            cipher = None
-        if cipher is not None:
-            _PLATFORM_CREDS_CIPHER = cipher
-            return cipher
-    # No (valid) configured key -- derive a deterministic obfuscation key from the static secret.
-    derived = base64.urlsafe_b64encode(hashlib.sha256(_PLATFORM_CREDS_STATIC_SECRET).digest())
-    _PLATFORM_CREDS_CIPHER = Fernet(derived)
-    return _PLATFORM_CREDS_CIPHER
-
-
-def _encode_platform_creds(entry):
-    """Serialize ``entry`` for disk as a self-describing JSON envelope (secret not in plaintext)."""
-    payload = json.dumps(entry, separators=(",", ":")).encode("utf-8")
-    cipher = _platform_creds_cipher()
-    if cipher is not None:
-        token = cipher.encrypt(payload).decode("ascii")
-        return json.dumps({"v": 2, "enc": "fernet", "data": token})
-    return json.dumps({"v": 2, "enc": "b64", "data": base64.b64encode(payload).decode("ascii")})
-
-
-def _decode_platform_creds(raw):
-    """Inverse of :func:`_encode_platform_creds`; tolerates legacy plaintext stamps."""
-    try:
-        blob = json.loads(raw)
+        parsed = json.loads(raw_history)
     except (ValueError, TypeError):
-        return None
-    if not isinstance(blob, dict):
-        return None
-    enc = blob.get("enc")
-    if enc is None:
-        # Legacy plaintext stamp written before encryption was added.
-        return blob if blob.get("api_key") else None
-    data = blob.get("data") or ""
-    try:
-        if enc == "fernet":
-            cipher = _platform_creds_cipher()
-            if cipher is None:
-                return None
-            payload = cipher.decrypt(data.encode("ascii"))
-        elif enc == "b64":
-            payload = base64.b64decode(data.encode("ascii"))
-        else:
-            return None
-        return json.loads(payload.decode("utf-8"))
-    except Exception as exc:  # InvalidToken (wrong/rotated key), bad base64, corrupt JSON
-        log.debug("Could not decode platform creds blob: %s", exc)
-        return None
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
-def _write_platform_creds_disk(project_id, entry):
-    """Persist resolved credentials so sibling workers and post-restart calls can reuse them."""
-    try:
-        os.makedirs(_PLATFORM_CREDS_DISK_DIR, exist_ok=True)
-        path = _platform_creds_disk_path(project_id)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(_encode_platform_creds(entry))
-        os.replace(tmp, path)  # atomic publish
-        try:
-            os.chmod(path, 0o600)  # the entry holds a project-scoped JWT
-        except OSError:
-            pass
-    except Exception as exc:  # best-effort -- never break a request over a cache write
-        log.debug("Could not persist platform creds for %s: %s", project_id, exc)
-
-
-def _read_platform_creds_disk(project_id):
-    """Read persisted credentials for ``project_id``; drop the file if expired or corrupt."""
-    path = _platform_creds_disk_path(project_id)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            entry = _decode_platform_creds(handle.read())
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        log.debug("Could not read platform creds for %s: %s", project_id, exc)
-        return None
-    if not isinstance(entry, dict) or not entry.get("api_key") or not entry.get("base_url"):
-        return None
-    if time.time() - entry.get("ts", 0) > _PLATFORM_CREDS_TTL_SECONDS:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return None
-    return entry
-
-
-def _cache_platform_settings(project_id, derived):
-    """Remember ``llm_settings``-derived platform credentials for later direct-path calls.
-
-    Stored both in-memory (fast path) and on the /data volume (durable across restarts and
-    visible to sibling worker processes), so the direct-path chat and model selector -- which
-    carry no ``llm_settings`` -- can reuse the credentials a platform-path call (e.g.
-    ``run_ingestion``) resolved for the project.
-    """
-    if not project_id or not derived:
-        return
-    entry = {
-        "base_url": derived["base_url"],
-        "api_key": derived["api_key"],
-        "project_id": str(project_id),
-        "ts": time.time(),
+def _tool_node_custom_event(run_id, label, kind, status, args=None, result=None, duration_ms=None):
+    """Return the cross-process custom event consumed by platform agent_on_tool_node."""
+    return {
+        "name": "on_tool_node",
+        "data": {
+            "input_variables": {"tool": label, "kind": kind, "args": args},
+            "tool_result": result,
+            "state": {
+                "run_id": str(run_id) if run_id else None,
+                "status": status,
+                "duration_ms": duration_ms,
+            },
+        },
     }
-    with _PLATFORM_CREDS_CACHE_LOCK:
-        _PLATFORM_CREDS_CACHE[str(project_id)] = entry
-    _write_platform_creds_disk(project_id, entry)
 
 
-def _lookup_cached_platform_settings(project_id):
-    """Return cached platform credentials for ``project_id`` if present and not expired.
-
-    Checks the in-memory cache first, then falls back to the durable /data stamp (repopulating
-    memory on a hit) so a restarted or sibling worker still resolves the per-project token.
-    """
-    if not project_id:
-        return None
-    key = str(project_id)
-    with _PLATFORM_CREDS_CACHE_LOCK:
-        entry = _PLATFORM_CREDS_CACHE.get(key)
-        if entry:
-            if time.time() - entry.get("ts", 0) > _PLATFORM_CREDS_TTL_SECONDS:
-                _PLATFORM_CREDS_CACHE.pop(key, None)
-                entry = None
-            else:
-                return entry
-    # Memory miss (or expired) -- consult the durable stamp.
-    disk_entry = _read_platform_creds_disk(key)
-    if disk_entry:
-        with _PLATFORM_CREDS_CACHE_LOCK:
-            _PLATFORM_CREDS_CACHE[key] = disk_entry
-        return disk_entry
+def _chat_callback_custom_event(event_type, payload):
+    """Map InventoryChatCallback events to platform custom events."""
+    payload = payload or {}
+    run_id = payload.get("run_id")
+    if event_type == "tool_start":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "processing",
+            args=payload.get("input"),
+        )
+    if event_type == "tool_end":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "complete",
+            result=payload.get("output_preview"),
+            duration_ms=payload.get("duration_ms"),
+        )
+    if event_type == "tool_error":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "error",
+            result=payload.get("error"),
+        )
+    if event_type == "llm_start":
+        return _tool_node_custom_event(
+            run_id, payload.get("model") or "LLM", "llm", "processing",
+        )
+    if event_type == "llm_end":
+        return _tool_node_custom_event(
+            run_id, payload.get("model"), "llm", "complete",
+            result=payload.get("output"),
+            duration_ms=payload.get("duration_ms"),
+        )
+    if event_type == "thinking_step" and not payload.get("is_reasoning_token"):
+        message = payload.get("message")
+        if message:
+            return {"name": "thinking_step_update", "data": {"message": message}}
     return None
+
 
 # Add plugin directory to Python path for local inventory module
 plugin_dir = Path(__file__).parent.parent
@@ -359,32 +247,63 @@ class Method:
         }
 
     @web.method()
+    def _invocation_event_sink(self):
+        """Create a thread-safe writer for the current async invocation's event buffer."""
+        try:
+            import tasknode_task
+
+            task_id = tasknode_task.id
+            task_meta = tasknode_task.meta or {}
+            toolkit_name = task_meta.get("toolkit_name", "Toolkit")
+            tool_name = task_meta.get("tool_name", "tool")
+        except Exception:  # pragma: no cover - no task context in direct/unit paths
+            task_id = None
+            toolkit_name = None
+            tool_name = None
+
+        invocation_state = getattr(self, "invocation_state", None)
+        state_lock = getattr(self, "state_lock", None)
+
+        def write_event(name, data):
+            if not task_id or invocation_state is None or state_lock is None:
+                return
+            try:
+                with state_lock:
+                    task_state = (
+                        invocation_state.get(toolkit_name, {})
+                        .get(tool_name, {})
+                        .get(task_id)
+                    )
+                    if task_state is None:
+                        return
+                    task_state.setdefault("custom_events", []).append(
+                        {"name": name, "data": data}
+                    )
+            except Exception:  # pragma: no cover - streaming must never fail the tool
+                pass
+
+        return write_event
+
+    @web.method()
     def _resolve_platform_settings(self, llm_settings=None, project_id=None):
         """Resolve ``(base_url, auth_token, project_id)`` for platform API calls.
 
         Prefers per-request credentials derived from ``llm_settings`` (config-independent --
-        works for any project, including private ones, without a deployment-time token).
-        Falls back to the deployment config (see ``_get_platform_connection_settings``) for
-        call paths that carry no ``llm_settings`` -- notably the inventory UI/REST ingestion
-        path, which posts directly to ``/tools/inventory/.../invoke`` without going through
-        the agent/``provider_worker`` pipeline that injects ``llm_settings``.
+        works for any project, including private ones, without a deployment-time token, and
+        with nothing persisted server-side). Falls back to the deployment config (see
+        ``_get_platform_connection_settings``) only for call paths that carry no
+        ``llm_settings`` -- e.g. scheduled/internal maintenance ops. The interactive UI chat
+        and ingestion both flow through the platform ``test_toolkit_tool`` path, which always
+        injects a per-user ``llm_settings``, so they never depend on the fallback.
         """
         derived = _platform_settings_from_llm_settings(llm_settings)
         if derived:
             resolved_pid = derived["project_id"] or project_id
-            _cache_platform_settings(resolved_pid, derived)
             log.info(
                 "Platform settings resolved from per-request llm_settings (base_url=%s, project_id=%s)",
                 derived["base_url"], resolved_pid,
             )
             return derived["base_url"], derived["api_key"], resolved_pid
-        cached = _lookup_cached_platform_settings(project_id)
-        if cached:
-            log.info(
-                "Platform settings resolved from cached llm_settings (base_url=%s, project_id=%s)",
-                cached["base_url"], cached["project_id"],
-            )
-            return cached["base_url"], cached["api_key"], cached["project_id"] or project_id
         base_url, token = self._get_platform_connection_settings()
         log.info(
             "Platform settings resolved from deployment config (base_url=%s, has_token=%s, llm_settings_present=%s)",
@@ -516,6 +435,8 @@ class Method:
 
         # Tool routing map
         tools = {
+            # Conversational / agentic
+            "ask": self._tool_ask,
             # Ingestion tools
             "run_ingestion": self._tool_run_ingestion,
             "delta_update": self._tool_delta_update,
@@ -588,13 +509,109 @@ class Method:
         if project_id and application_id:
             self.cache_manager.touch(str(project_id), str(application_id))
 
-        # Execute tool
-        result = tools[tool_name](params, graph_path, request_data)
+        # Execute tool. The conversational `ask` tool runs the LLM chat agent,
+        # which derives its own graph path from project/application IDs and consumes
+        # the per-request llm_settings, so it takes a different signature than the
+        # graph_path-based tools.
+        if tool_name == "ask":
+            result = self._tool_ask(params, project_id, application_id, request_data)
+        else:
+            result = tools[tool_name](params, graph_path, request_data)
 
         # Handle tuple returns (result, artifacts)
         if isinstance(result, tuple):
             return self._create_success_response(invocation_id, result[0], result[1])
         return self._create_success_response(invocation_id, result)
+
+    @web.method()
+    def _tool_ask(self, params, project_id, toolkit_id, request_data):
+        """Conversational agent tool — answer a question about the knowledge graph.
+
+        This is the multi-tenant, config-independent chat entrypoint. It runs the
+        same LLM agent as the UI chat (``inventory_chat``) on the platform
+        ``test_toolkit_tool`` path, so the per-request ``llm_settings`` injected by
+        provider_worker (api_key / api_base / organization) authorize both the LLM
+        and graph/artifact access. No credentials are read from or written to disk.
+
+        Inner agent progress (LLM calls plus knowledge-graph tool input/output) is
+        streamed to the UI through ``on_tool_node`` custom events. ``provider_worker``
+        polls those events from the async invocation and re-dispatches them as
+        ``agent_on_tool_node`` socket events. This method returns the final structured
+        result (answer + citations + touched entities + token usage) as a JSON string
+        so the UI can render citations and highlight touched graph nodes.
+        """
+
+        question = params.get("question") or params.get("query") or params.get("prompt")
+        if not question:
+            return json.dumps({
+                "error": "Missing required parameter: question",
+                "answer": "",
+                "citations": [],
+            })
+
+        raw_history = params.get("chat_history")
+        history = _chat_history_from_param(raw_history)
+        if raw_history and not history:
+            log.warning("[ask] Could not parse chat_history JSON; ignoring")
+
+        filters = _chat_filters_from_params(params)
+
+        log.info(
+            "[ask] project_id=%s toolkit_id=%s history=%d question=%r",
+            project_id, toolkit_id, len(history), question[:100],
+        )
+
+        # ── Live agent streaming → chat chips ────────────────────────────────
+        # inventory_chat drives InventoryChatCallback, which calls this emit_fn for
+        # every LLM / tool step. We forward those steps to the UI as ``on_tool_node``
+        # custom events (carrying the tool/model name, its input and its result).
+        # provider_worker polls them and re-dispatches so the platform maps them to
+        # ``agent_on_tool_node`` and delivers them on the chat's test_toolkit_tool
+        # socket — the same channel the final answer already uses.
+        #
+        # The callbacks fire on a worker thread (elitea_sdk runs tool calls off the
+        # task greenlet), so ``tasknode_task`` is NOT in context there. We therefore
+        # resolve the task's event buffer HERE (in the greenlet) and write through a
+        # closure that holds those references directly — thread-safe via state_lock.
+        write_stream_event = self._invocation_event_sink()
+
+        def _ask_emit(event_type, payload):
+            try:
+                event = _chat_callback_custom_event(event_type, payload)
+                if event:
+                    write_stream_event(event["name"], event["data"])
+            except Exception:  # pragma: no cover - streaming must never break the run
+                pass
+
+        try:
+            result = self.inventory_chat(
+                project_id=project_id,
+                toolkit_id=toolkit_id,
+                prompt=question,
+                filters=filters,
+                conversation_id=None,
+                history=history,
+                emit_fn=_ask_emit,  # forward inner agent steps as on_tool_node chips
+                model=None,
+                llm_settings=params.get("llm_settings"),
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            log.exception(f"[ask] Error: {e}")
+            return json.dumps({
+                "error": str(e),
+                "answer": "",
+                "citations": [],
+            })
+
+        return json.dumps({
+            "answer": result.get("answer", ""),
+            "citations": result.get("citations", []),
+            "tool_calls": result.get("tool_calls", []),
+            "touched_entities": result.get("touched_entities", []),
+            "tokens_in": result.get("tokens_in", 0),
+            "tokens_out": result.get("tokens_out", 0),
+            "error": result.get("error"),
+        })
 
     @web.method()
     def _handle_inventory_search_tool(self, invocation_id, tool_name, params, request_data):
@@ -604,9 +621,9 @@ class Method:
         read-only search/query tools for use by other agents.
         """
         log.info(f"[inventory_search] Handling tool: {tool_name}")
-        log.info(f"[inventory_search] params: {params}")
-        log.info(f"[inventory_search] request_data keys: {request_data.keys() if request_data else 'None'}")
-        log.info(f"[inventory_search] configuration: {request_data.get('configuration', {})}")
+        log.debug("[inventory_search] param keys: %s", list((params or {}).keys()))
+        log.debug("[inventory_search] request_data keys: %s", list((request_data or {}).keys()))
+        log.debug("[inventory_search] configuration keys: %s", list((request_data.get('configuration', {}) or {}).keys()))
 
         # Tool name mapping: inventory_search tool names -> internal handler names
         tool_mapping = {
@@ -753,39 +770,15 @@ class Method:
         Returns:
             Structured response with answer, citations, and token usage
         """
-        import json as json_module
-
         # Extract question
         question = params.get("question") or params.get("query") or params.get("prompt")
         if not question:
-            return json_module.dumps({
+            return json.dumps({
                 "error": "Missing required parameter: question",
                 "usage": "Provide a 'question' parameter with your investigation query"
             })
 
-        # Build filters from params
-        filters = {}
-        if params.get("entity_types"):
-            entity_types = params.get("entity_types")
-            if isinstance(entity_types, str):
-                entity_types = [t.strip() for t in entity_types.split(",")]
-            filters["entity_types"] = entity_types
-
-        if params.get("sources"):
-            sources = params.get("sources")
-            if isinstance(sources, str):
-                sources = [s.strip() for s in sources.split(",")]
-            filters["sources"] = sources
-
-        if params.get("layers"):
-            layers = params.get("layers")
-            if isinstance(layers, str):
-                layers = [l.strip() for l in layers.split(",")]
-            filters["layers"] = layers
-
-        # Search scope settings
-        filters["depth"] = params.get("depth", 2)
-        filters["max_nodes"] = params.get("max_nodes", 500)
+        filters = _chat_filters_from_params(params)
 
         log.info(f"[investigate] Question: {question[:100]}...")
         log.info(f"[investigate] Filters: {filters}")
@@ -821,7 +814,7 @@ class Method:
             # Also return as formatted text for better readability
             output_format = params.get("output_format", "text")
             if output_format == "json":
-                return json_module.dumps(response, indent=2)
+                return json.dumps(response, indent=2)
 
             # Text format
             lines = []
@@ -858,7 +851,7 @@ class Method:
 
         except Exception as e:
             log.exception(f"[investigate] Error: {e}")
-            return json_module.dumps({
+            return json.dumps({
                 "error": str(e),
                 "answer": "",
                 "citations": [],
@@ -1254,7 +1247,7 @@ class Method:
                 toolkit_api_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
                 log.info(f"[run_ingestion] Fetching toolkit from: {toolkit_api_url}")
 
-                resp = http_requests.get(toolkit_api_url, headers=elitea_client.headers, verify=False)
+                resp = http_requests.get(toolkit_api_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
                 if not resp.ok:
                     log.error(f"[run_ingestion] Failed to fetch toolkit: {resp.status_code} - {resp.text}")
                     return f"Error: Failed to fetch source toolkit {toolkit_id}: {resp.status_code}"
@@ -1300,7 +1293,7 @@ class Method:
                     # Fetch raw toolkit data from platform API using correct path
                     inventory_toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
                     log.info(f"[run_ingestion] Fetching inventory toolkit from: {inventory_toolkit_url}")
-                    resp = http_requests.get(inventory_toolkit_url, headers=elitea_client.headers, verify=False)
+                    resp = http_requests.get(inventory_toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
                     if resp.ok:
                         inventory_toolkit_data = resp.json()
                         inventory_settings = inventory_toolkit_data.get("settings", {})
@@ -1622,7 +1615,8 @@ class Method:
                 resp = http_requests.get(
                     inventory_toolkit_url,
                     headers={"Authorization": f"Bearer {platform_token}"},
-                    verify=False,
+                    verify=_PLATFORM_VERIFY_SSL,
+                    timeout=_PLATFORM_HTTP_TIMEOUT,
                 )
                 if resp.ok:
                     fetched_settings = resp.json().get("settings", {})

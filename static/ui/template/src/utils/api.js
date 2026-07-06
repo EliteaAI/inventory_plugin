@@ -264,7 +264,7 @@ export async function getToolkit(projectId, toolkitId) {
  * Get toolkit config for tool invocation
  * Uses cached toolkit data if available, otherwise fetches it
  */
-async function getToolkitConfig(projectId, toolkitId) {
+export async function getToolkitConfig(projectId, toolkitId) {
   // Use cached toolkit if available
   let toolkit = toolkitCache;
   const cacheKey = `${projectId}-${toolkitId}`;

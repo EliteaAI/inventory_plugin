@@ -4,145 +4,22 @@
 """
 Inventory Chat Route
 
-HTTP endpoint for inventory chat.
-For streaming responses, use the socket.io event instead.
+Synchronous HTTP endpoint for inventory chat. The interactive UI streams through
+the platform test_toolkit_tool socket path instead.
 """
 
 import flask
 import json
+import os
 import uuid
-import threading
-import time
-from typing import Optional, Dict, Any
 import requests as http_requests
 
 from pylon.core.tools import log, web
 
-
-# Maximum chat session duration in seconds (30 minutes)
-MAX_CHAT_SESSION_DURATION = 30 * 60
-
-# Cleanup interval in seconds (check every 2 minutes)
-CLEANUP_INTERVAL = 2 * 60
-
-# Module-level registry for HTTP streaming sessions (with timeout tracking)
-_http_chat_sessions: Dict[str, Dict[str, Any]] = {}
-_http_chat_sessions_lock = threading.Lock()
-_cleanup_thread_started = False
-_cleanup_stop_event: Optional[threading.Event] = None
-
-
-def _start_cleanup_thread():
-    """Start background thread for cleaning up stale HTTP sessions."""
-    global _cleanup_thread_started, _cleanup_stop_event
-
-    if _cleanup_thread_started:
-        return
-
-    _cleanup_thread_started = True
-    _cleanup_stop_event = threading.Event()
-
-    def cleanup_loop():
-        log.info("[http_chat_cleanup] Cleanup thread started")
-        while not _cleanup_stop_event.is_set():
-            try:
-                _cleanup_stale_sessions()
-            except Exception as e:
-                log.exception(f"[http_chat_cleanup] Error in cleanup: {e}")
-
-            # Wait for next cleanup interval or stop event
-            _cleanup_stop_event.wait(timeout=CLEANUP_INTERVAL)
-
-        log.info("[http_chat_cleanup] Cleanup thread stopped")
-
-    thread = threading.Thread(target=cleanup_loop, daemon=True, name="http_chat_session_cleanup")
-    thread.start()
-
-
-def _cleanup_stale_sessions():
-    """Clean up sessions that have exceeded the maximum duration."""
-    now = time.time()
-    stale_sessions = []
-
-    with _http_chat_sessions_lock:
-        for session_id, session_data in list(_http_chat_sessions.items()):
-            started_at = session_data.get("started_at")
-            if started_at:
-                duration = now - started_at
-                if duration > MAX_CHAT_SESSION_DURATION:
-                    stale_sessions.append(session_id)
-                    # Mark as cancelled so the running thread will stop
-                    session_data["cancelled"].set()
-                    session_data["timed_out"] = True
-
-    if stale_sessions:
-        log.warning(f"[http_chat_cleanup] Marked {len(stale_sessions)} stale sessions for cleanup: {stale_sessions}")
-
-
-def _register_http_session(session_id: str) -> Dict[str, Any]:
-    """Register an HTTP chat session for cancellation and timeout tracking."""
-    # Start cleanup thread if not already running
-    _start_cleanup_thread()
-
-    session_data = {
-        "cancelled": threading.Event(),
-        "started_at": time.time(),
-        "timed_out": False,
-    }
-    with _http_chat_sessions_lock:
-        _http_chat_sessions[session_id] = session_data
-    return session_data
-
-
-def _unregister_http_session(session_id: str):
-    """Unregister an HTTP chat session."""
-    with _http_chat_sessions_lock:
-        _http_chat_sessions.pop(session_id, None)
-
-
-def _cancel_http_session(session_id: str) -> bool:
-    """Cancel an HTTP chat session."""
-    with _http_chat_sessions_lock:
-        session_data = _http_chat_sessions.get(session_id)
-        if session_data:
-            session_data["cancelled"].set()
-            return True
-    return False
-
-
-def _is_session_timed_out(session_id: str) -> bool:
-    """Check if a session has timed out."""
-    with _http_chat_sessions_lock:
-        session_data = _http_chat_sessions.get(session_id)
-        if session_data:
-            # Check explicit timeout flag
-            if session_data.get("timed_out"):
-                return True
-            # Check duration
-            started_at = session_data.get("started_at")
-            if started_at and (time.time() - started_at) > MAX_CHAT_SESSION_DURATION:
-                session_data["timed_out"] = True
-                session_data["cancelled"].set()
-                return True
-    return False
-
-
-def _check_session_valid(session_id: str) -> str:
-    """
-    Check if session is still valid.
-
-    Returns:
-        "ok" if valid
-        "cancelled" if cancelled by user
-        "timeout" if timed out
-    """
-    if _is_session_timed_out(session_id):
-        return "timeout"
-    with _http_chat_sessions_lock:
-        session_data = _http_chat_sessions.get(session_id)
-        if session_data and session_data["cancelled"].is_set():
-            return "cancelled"
-    return "ok"
+# Platform HTTP request defaults (self-signed TLS by default, env-overridable; timeout
+# so a stalled platform never hangs the request thread).
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
 
 
 class Route:
@@ -243,199 +120,6 @@ class Route:
                 "tool_calls": [],
                 "error": str(e),
             }, 500
-
-    # Route for ui_host proxy: /ui/{toolkit_id}/chat/stream
-    @web.route("/ui/<int:toolkit_id>/chat/stream", methods=["POST"], endpoint="chat_stream_route_proxy")
-    # Route for direct access: /ui/{project_id}/{toolkit_id}/chat/stream
-    @web.route("/ui/<int:project_id>/<int:toolkit_id>/chat/stream", methods=["POST"], endpoint="chat_stream_route_direct")
-    def chat_stream_route(self, project_id=None, toolkit_id=None):
-        """
-        Handle streaming chat requests using Server-Sent Events (SSE).
-
-        Request body: { "prompt": str, "filters": {...}, "history": [...], "session_id": str }
-
-        Response: SSE stream of events in real-time.
-        First event includes session_id for cancellation.
-        """
-        import queue
-
-        try:
-            request_data = flask.request.json or {}
-        except Exception:
-            return flask.Response(
-                f"data: {json.dumps({'error': 'Invalid JSON payload'})}\n\n",
-                mimetype='text/event-stream',
-                status=400,
-            )
-
-        # Get project_id from header (ui_host proxy) or path param
-        header_project_id = flask.request.headers.get('X-Project-Id')
-        effective_project_id = header_project_id or project_id or request_data.get("project_id")
-        effective_toolkit_id = toolkit_id or request_data.get("toolkit_id")
-        prompt = request_data.get("prompt", "").strip()
-
-        if not all([effective_project_id, effective_toolkit_id, prompt]):
-            return flask.Response(
-                f"data: {json.dumps({'error': 'project_id, toolkit_id, and prompt are required'})}\n\n",
-                mimetype='text/event-stream',
-                status=400,
-            )
-
-        filters = request_data.get("filters", {})
-        conversation_id = request_data.get("conversation_id")
-        history = request_data.get("history", [])
-        model = request_data.get("model")  # Optional model override
-
-        # Create or use provided session_id for cancellation tracking
-        session_id = request_data.get("session_id") or str(uuid.uuid4())
-
-        # Register session for cancellation and timeout tracking
-        session_data = _register_http_session(session_id)
-
-        # Create cancellation/timeout check function
-        def is_cancelled() -> bool:
-            # Check both cancellation and timeout
-            status = _check_session_valid(session_id)
-            return status != "ok"
-
-        # Use a queue for real-time streaming
-        event_queue = queue.Queue()
-
-        def emit_fn(event_type: str, data: dict):
-            """Callback to push events to queue immediately."""
-            event_queue.put({
-                "event": event_type,
-                "data": {**data, "session_id": session_id},
-            })
-
-        def run_chat():
-            """Run chat in background thread."""
-            try:
-                result = self.inventory_chat(
-                    project_id=int(effective_project_id),
-                    toolkit_id=int(effective_toolkit_id),
-                    prompt=prompt,
-                    filters=filters,
-                    conversation_id=conversation_id,
-                    history=history,
-                    emit_fn=emit_fn,
-                    model=model,
-                    is_cancelled=is_cancelled,
-                )
-
-                # Check session status before emitting result
-                session_status = _check_session_valid(session_id)
-
-                if session_status == "timeout":
-                    log.warning(f"[chat_stream_route] Chat timed out: session_id={session_id}")
-                    event_queue.put({
-                        "event": "chat_timeout",
-                        "data": {
-                            "message": "Chat session timed out after 30 minutes",
-                            "session_id": session_id,
-                        },
-                    })
-                elif session_status == "cancelled" or result.get("cancelled"):
-                    log.info(f"[chat_stream_route] Chat cancelled: session_id={session_id}")
-                    event_queue.put({
-                        "event": "chat_cancelled",
-                        "data": {"message": "Chat cancelled by user", "session_id": session_id},
-                    })
-                else:
-                    # Push final result
-                    event_queue.put({
-                        "event": "chat_result",
-                        "data": {**result, "session_id": session_id},
-                    })
-            except Exception as e:
-                # Check if it was actually a timeout
-                if _is_session_timed_out(session_id):
-                    log.warning(f"[chat_stream_route] Chat timed out: session_id={session_id}")
-                    event_queue.put({
-                        "event": "chat_timeout",
-                        "data": {
-                            "message": "Chat session timed out after 30 minutes",
-                            "session_id": session_id,
-                        },
-                    })
-                else:
-                    log.exception(f"[chat_stream_route] Error in chat thread: {e}")
-                    event_queue.put({
-                        "event": "error",
-                        "data": {"error": str(e), "session_id": session_id},
-                    })
-            finally:
-                # Unregister session and signal end of stream
-                _unregister_http_session(session_id)
-                event_queue.put(None)
-
-        def generate():
-            """Generator function for SSE streaming."""
-            # Emit session start with session_id for client to use for cancellation
-            yield f"event: chat_start\n"
-            yield f"data: {json.dumps({'session_id': session_id, 'message': 'Starting chat...', 'max_duration_seconds': MAX_CHAT_SESSION_DURATION})}\n\n"
-
-            # Start chat in background thread
-            chat_thread = threading.Thread(target=run_chat, daemon=True)
-            chat_thread.start()
-
-            # Yield events as they arrive
-            while True:
-                try:
-                    # Wait for event with timeout to prevent hanging
-                    event = event_queue.get(timeout=120)  # 2 minute timeout
-
-                    if event is None:
-                        # End of stream
-                        yield f"event: done\n"
-                        yield f"data: {json.dumps({'status': 'complete', 'session_id': session_id})}\n\n"
-                        break
-
-                    yield f"event: {event['event']}\n"
-                    yield f"data: {json.dumps(event['data'])}\n\n"
-
-                except queue.Empty:
-                    # Timeout - send keep-alive
-                    yield f": keep-alive\n\n"
-                except Exception as e:
-                    log.exception(f"[chat_stream_route] Error in generator: {e}")
-                    yield f"event: error\n"
-                    yield f"data: {json.dumps({'error': str(e), 'session_id': session_id})}\n\n"
-                    break
-
-        return flask.Response(
-            generate(),
-            mimetype='text/event-stream',
-            headers={
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-            },
-        )
-
-    # Route for cancelling HTTP streaming chat
-    @web.route("/ui/<int:toolkit_id>/chat/cancel", methods=["POST"], endpoint="chat_cancel_route_proxy")
-    @web.route("/ui/<int:project_id>/<int:toolkit_id>/chat/cancel", methods=["POST"], endpoint="chat_cancel_route_direct")
-    def chat_cancel_route(self, project_id=None, toolkit_id=None):
-        """
-        Cancel an active HTTP streaming chat session.
-
-        Request body: { "session_id": str }
-        """
-        try:
-            request_data = flask.request.json or {}
-        except Exception:
-            return {"error": "Invalid JSON payload"}, 400
-
-        session_id = request_data.get("session_id")
-        if not session_id:
-            return {"error": "session_id is required"}, 400
-
-        if _cancel_http_session(session_id):
-            log.info(f"[chat_cancel_route] Cancelled session: {session_id}")
-            return {"status": "cancelled", "session_id": session_id}, 200
-        else:
-            return {"status": "not_found", "session_id": session_id, "message": "Session not found or already completed"}, 404
 
     # Route for ui_host proxy: /ui/{toolkit_id}/chat/history
     @web.route("/ui/<int:toolkit_id>/chat/history", methods=["GET"], endpoint="chat_history_route_proxy")
@@ -625,7 +309,7 @@ class Route:
 
             # Fetch LLM models from platform (includes shared models)
             models_url = f"{elitea_client.base_url}/api/v2/configurations/models/{effective_project_id}?include_shared=true"
-            resp = http_requests.get(models_url, headers=elitea_client.headers, verify=False)
+            resp = http_requests.get(models_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
 
             if not resp.ok:
                 log.warning(f"[chat_models_route] Failed to fetch models: {resp.status_code}")

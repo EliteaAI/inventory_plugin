@@ -12,6 +12,7 @@ Provides a self-contained chat interface for the inventory knowledge graph.
 """
 
 import json
+import os
 import uuid
 import time
 import threading
@@ -48,6 +49,13 @@ from ..utils.langfuse_callback import (
     flush_langfuse_callback,
     langfuse_trace_context,
 )
+
+# Platform HTTP request defaults. The internal platform commonly terminates TLS with
+# self-signed certs, so verification defaults off but is env-overridable
+# (``INVENTORY_PLATFORM_VERIFY_SSL=true``); every platform call also carries a timeout so
+# a stalled platform can never hang a worker thread indefinitely.
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
 
 
 class ChatCancelledException(Exception):
@@ -113,6 +121,7 @@ class InventoryChatCallback:
         # OpenAI-compatible passthrough) to "ChatAnthropic" so the streaming chip matches
         # the provider the user selected. Set by inventory_chat once the model is known.
         self.llm_is_anthropic = False
+        self.llm_display_label = None
 
     def check_cancelled(self):
         """Check if cancelled and raise exception if so."""
@@ -163,7 +172,9 @@ class InventoryChatCallback:
         # In OpenAI-compatible passthrough mode a Claude model is built as ChatOpenAI, so the
         # auto-detected class name reads "ChatOpenAI" -- misleading for a model the user picked
         # as Anthropic (people read it as a bug). Relabel to the provider-consistent name.
-        if self.llm_is_anthropic and (not model_name or model_name == "ChatOpenAI"):
+        if self.llm_display_label:
+            model_name = self.llm_display_label
+        elif self.llm_is_anthropic and (not model_name or model_name == "ChatOpenAI"):
             model_name = "ChatAnthropic"
 
         # Store LLM run info for later
@@ -302,6 +313,7 @@ class InventoryChatCallback:
 
         self.emit("llm_end", {
             "run_id": run_id,
+            "model": llm_info.get("name"),
             "output": output_content[:1000] if output_content else "",  # Truncate output
             "duration_ms": int(duration * 1000),
             "has_thinking": bool(thinking_content),
@@ -444,7 +456,7 @@ class Method:
                 f"{project_id}?include_shared=true"
             )
             resp = http_requests.get(
-                models_url, headers=elitea_client.headers, verify=False, timeout=5
+                models_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=5
             )
             if resp.ok:
                 for item in resp.json().get("items", []):
@@ -467,6 +479,27 @@ class Method:
             "[inventory_chat] openai_compatible(%s) = %s", model_name, result
         )
         return result
+
+    @web.method()
+    def _llm_display_label(self, llm_model=None, llm_settings=None, settings=None):
+        """Return the provider-style chat chip label for the selected model."""
+        parts = [llm_model]
+        for source in (llm_settings, settings):
+            if isinstance(source, dict):
+                parts.extend([
+                    source.get("provider"),
+                    source.get("model_provider"),
+                    source.get("custom_llm_provider"),
+                    source.get("toolkit_configuration_llm_provider"),
+                    source.get("llm_provider"),
+                    source.get("model_name"),
+                ])
+        text = " ".join(str(part).lower() for part in parts if part)
+        if "anthropic" in text or "claude" in text:
+            return "ChatAnthropic"
+        if "openai" in text or "gpt" in text:
+            return "ChatOpenAI"
+        return None
 
     @web.method()
     def inventory_chat(
@@ -600,7 +633,7 @@ class Method:
             # 2. Fetch inventory toolkit settings
             import requests as http_requests
             toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
-            resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+            resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
 
             if not resp.ok:
                 return {
@@ -651,6 +684,7 @@ class Method:
             # "ChatOpenAI" for an Anthropic model. The callback emits "ChatAnthropic" instead.
             _llm_lower = (llm_model or "").lower()
             callback.llm_is_anthropic = ("claude" in _llm_lower or "anthropic" in _llm_lower)
+            callback.llm_display_label = self._llm_display_label(llm_model, llm_settings, settings)
 
             # 4. Get graph path
             graph_path = f"/data/graphs/{project_id}/{toolkit_id}/graph.json"
@@ -2322,10 +2356,16 @@ class Method:
                             tool_args = tc.get("args", {})
                             # Format args nicely
                             if isinstance(tool_args, dict):
-                                # Filter out empty/default args
-                                filtered_args = {k: v for k, v in tool_args.items()
-                                               if v and k != "__arg1"}
-                                input_str = json.dumps(filtered_args, indent=2) if filtered_args else "{}"
+                                # Preserve meaningful single-argument tools; hiding
+                                # __arg1 makes final chips read as an empty input.
+                                filtered_args = {
+                                    key: value for key, value in tool_args.items()
+                                    if value not in (None, "", [], {})
+                                }
+                                if set(filtered_args) == {"__arg1"}:
+                                    input_str = str(filtered_args["__arg1"])
+                                else:
+                                    input_str = json.dumps(filtered_args, indent=2) if filtered_args else "{}"
                             else:
                                 input_str = str(tool_args)
 
@@ -2479,7 +2519,7 @@ class Method:
             try:
                 # Fetch toolkit configuration from platform with expand=true to get expanded credentials
                 toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}?expand=true"
-                resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+                resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
 
                 if not resp.ok:
                     log.warning(f"[_get_source_toolkit_tools] Failed to fetch toolkit {source_toolkit_id}: {resp.status_code}")

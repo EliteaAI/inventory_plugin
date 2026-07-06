@@ -19,6 +19,11 @@ from typing import Any, Dict, Optional
 
 TERMINATION_LOG_PATH = "/dev/termination-log"
 
+# Platform HTTP request defaults (self-signed TLS by default, env-overridable; timeout
+# so a stalled platform never hangs the ingestion job).
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -219,7 +224,7 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
         inventory_url = f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
-        response = http_requests.get(inventory_url, headers=elitea_client.headers, verify=False)
+        response = http_requests.get(inventory_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
         if response.ok:
             inventory_settings = response.json().get("settings", {})
             artifact_bucket = inventory_settings.get("toolkit_configuration_bucket") or artifact_bucket
@@ -233,7 +238,7 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("No LLM model configured for inventory ingestion")
 
     toolkit_url = f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
-    response = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+    response = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
     if not response.ok:
         raise RuntimeError(f"Failed to fetch source toolkit {toolkit_id}: {response.status_code} - {response.text}")
     toolkit_data = response.json()

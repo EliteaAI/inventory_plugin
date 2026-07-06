@@ -97,6 +97,79 @@ class Method:
                         }
                     },
                     "provided_tools": [
+                        # ========== Conversational / Agentic ==========
+                        {
+                            "name": "ask",
+                            "description": "Ask a natural-language question about the ingested knowledge graph. Runs an LLM agent that searches the graph, inspects entities and relationships, and returns a grounded answer with citations. Requires the inventory to be ingested first.",
+                            "args_schema": {
+                                "question": {
+                                    "type": "String",
+                                    "required": True,
+                                    "description": "The natural-language question to ask about the codebase / knowledge graph"
+                                },
+                                "entity_types": {
+                                    "type": "String",
+                                    "required": False,
+                                    "description": "Optional comma-separated entity types to focus the search (e.g. 'class,function')"
+                                },
+                                "sources": {
+                                    "type": "String",
+                                    "required": False,
+                                    "description": "Optional comma-separated source toolkit names/ids to restrict the search"
+                                },
+                                "layers": {
+                                    "type": "String",
+                                    "required": False,
+                                    "description": "Optional comma-separated architectural layers to restrict the search"
+                                },
+                                "depth": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Maximum relationship hops to traverse during graph exploration (default: 2)",
+                                    "default": 2
+                                },
+                                "max_nodes": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Maximum graph nodes/results to inspect per search step (default: 500)",
+                                    "default": 500
+                                },
+                                "chat_history": {
+                                    "type": "String",
+                                    "required": False,
+                                    "description": "Prior conversation turns as a JSON-encoded array of {role, content} objects, for multi-turn context"
+                                },
+                                "project_id": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Target project ID (auto-populated by the UI/platform context; do not set manually)",
+                                    "json_schema_extra": {
+                                        "hidden": True
+                                    }
+                                },
+                                "application_id": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Inventory toolkit (application) ID that owns the knowledge graph (auto-populated by the UI/platform context; do not set manually)",
+                                    "json_schema_extra": {
+                                        "hidden": True
+                                    }
+                                }
+                            },
+                            "tool_metadata": {
+                                "result_composition": "single_object",
+                                "result_objects": [
+                                    {
+                                        "object_type": "answer",
+                                        "result_target": "response",
+                                        "result_encoding": "plain"
+                                    }
+                                ]
+                            },
+                            "tool_result_type": "String",
+                            "sync_invocation_supported": True,
+                            "async_invocation_supported": True
+                        },
                         # ========== Ingestion Tools ==========
                         {
                             "name": "run_ingestion",
@@ -983,6 +1056,12 @@ class Method:
                                     "required": False,
                                     "description": "Max relationship hops to traverse",
                                     "default": 2
+                                },
+                                "max_nodes": {
+                                    "type": "Integer",
+                                    "required": False,
+                                    "description": "Maximum graph nodes/results to inspect per search step",
+                                    "default": 500
                                 },
                                 "output_format": {
                                     "type": "String",
