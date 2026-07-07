@@ -50,7 +50,7 @@ import hashlib
 import re
 import time
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Generator, Callable, TYPE_CHECKING, Tuple
 from datetime import datetime
@@ -756,6 +756,10 @@ class IngestionPipeline(BaseModel):
     # Progress callback (optional)
     # Signature: callback(message: str, phase: str) -> None
     progress_callback: Optional[Callable[[str, str], None]] = None
+    stop_callback: Optional[Callable[[], None]] = Field(
+        default=None,
+        description="Optional callback checked throughout ingestion to stop long-running work early"
+    )
     
     # Private attributes
     _embedding: Optional[Any] = PrivateAttr(default=None)
@@ -919,6 +923,48 @@ class IngestionPipeline(BaseModel):
                     logger.info(f"[{phase}] Task stop requested, interrupting...")
                     raise
                 logger.debug(f"Progress callback failed: {e}")
+
+    def _check_stop(self) -> None:
+        """Cooperatively stop ingestion as soon as the caller requests it."""
+        if self.stop_callback:
+            self.stop_callback()
+
+    def _iter_loader_documents(self, toolkit: Any, loader_args: Dict[str, Any]) -> Generator[Document, None, None]:
+        """Yield toolkit documents while checking for stop requests between files."""
+        self._check_stop()
+        for raw_doc in toolkit.loader(**loader_args):
+            self._check_stop()
+            yield raw_doc
+            self._check_stop()
+
+    def _iter_completed_futures(
+        self,
+        futures: List[Any],
+        poll_interval: float = 0.2,
+    ) -> Generator[Any, None, None]:
+        """Yield completed futures while polling for stop requests."""
+        pending = set(futures)
+        while pending:
+            self._check_stop()
+            done, pending = wait(
+                pending,
+                timeout=poll_interval,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+
+            for future in done:
+                self._check_stop()
+                yield future
+
+    @staticmethod
+    def _shutdown_executor(executor: ThreadPoolExecutor, interrupted: bool) -> None:
+        """Shutdown helper that avoids waiting on stop-requested work when possible."""
+        try:
+            executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
+        except TypeError:
+            executor.shutdown(wait=not interrupted)
     
     def _auto_save(self) -> None:
         """Auto-save graph after mutations."""
@@ -1030,6 +1076,7 @@ class IngestionPipeline(BaseModel):
         if not HAS_IGRAPH:
             logger.info("igraph not installed, using NetworkX fallback for community detection")
 
+        self._check_stop()
         self._log_progress("🔍 Detecting communities...", "communities")
         cd_start = time.time()
 
@@ -1052,6 +1099,7 @@ class IngestionPipeline(BaseModel):
 
             # Generate LLM labels and summaries for each community (parallel)
             if self.llm and num_c > 0:
+                self._check_stop()
                 self._log_progress(
                     f"🏷️ Generating labels for {num_c} communities...",
                     "communities"
@@ -1086,6 +1134,7 @@ class IngestionPipeline(BaseModel):
                 except Exception as e:
                     logger.warning(f"Community label generation failed (non-fatal): {e}")
 
+                self._check_stop()
                 self._log_progress(
                     f"📝 Generating summaries for {num_c} communities...",
                     "communities"
@@ -1334,6 +1383,7 @@ class IngestionPipeline(BaseModel):
         file_path = (doc.metadata.get('file_path') or 
                     doc.metadata.get('file_name') or 
                     doc.metadata.get('source', 'unknown'))
+        self._check_stop()
         
         entities = []
         parser_relationships = []
@@ -1350,6 +1400,7 @@ class IngestionPipeline(BaseModel):
         
         if parser and _is_code_file(file_path):
             try:
+                self._check_stop()
                 # Parse file content with language-specific parser
                 parse_result = parser_parse_file(file_path, content=doc.page_content)
                 
@@ -1448,10 +1499,12 @@ class IngestionPipeline(BaseModel):
         
         if self._entity_extractor:
             try:
+                self._check_stop()
                 # Extract entities - skip_on_error=True returns (entities, failed_docs)
                 extracted, llm_failed_docs = self._entity_extractor.extract_batch(
                     [doc], schema=schema, skip_on_error=True
                 )
+                self._check_stop()
                 failed_docs.extend(llm_failed_docs)
                 
                 for entity in extracted:
@@ -1517,6 +1570,7 @@ class IngestionPipeline(BaseModel):
         # =====================================================================
         if self.llm:
             try:
+                self._check_stop()
                 fact_extractor = FactExtractor(self.llm)
                 is_code = _is_code_file(file_path) or _is_code_like_file(file_path)
                 
@@ -1525,6 +1579,7 @@ class IngestionPipeline(BaseModel):
                     facts = fact_extractor.extract_code(doc)
                 else:
                     facts = fact_extractor.extract(doc)
+                self._check_stop()
                 
                 for fact in facts:
                     # Skip facts with missing or generic subjects
@@ -1596,42 +1651,53 @@ class IngestionPipeline(BaseModel):
         failed_files = []
         file_hashes = {}
         all_parser_relationships = []
-        
-        # Use ThreadPoolExecutor for parallel extraction
-        with ThreadPoolExecutor(max_workers=self.max_parallel_extractions) as executor:
+
+        self._check_stop()
+        executor = ThreadPoolExecutor(max_workers=self.max_parallel_extractions)
+        future_to_doc = {}
+        interrupted = False
+        try:
             # Submit all extraction tasks
             future_to_doc = {
                 executor.submit(self._extract_entities_from_doc, doc, source_toolkit, schema): doc
                 for doc in documents
             }
-            
+
             # Process completed tasks as they finish
-            for future in as_completed(future_to_doc):
+            for future in self._iter_completed_futures(list(future_to_doc.keys())):
                 doc = future_to_doc[future]
                 file_path = (doc.metadata.get('file_path') or 
                             doc.metadata.get('file_name') or 
                             doc.metadata.get('source', 'unknown'))
-                
+
                 try:
                     entities, extraction_failures, parser_relationships = future.result()
-                    
+
                     # Track content hash
                     content_hash = hashlib.sha256(doc.page_content.encode()).hexdigest()
                     file_hashes[file_path] = content_hash
-                    
+
                     # Add entities to batch results
                     all_entities.extend(entities)
-                    
+
                     # Collect parser relationships
                     all_parser_relationships.extend(parser_relationships)
-                    
+
                     # Track failures
                     if extraction_failures:
                         failed_files.extend(extraction_failures)
-                        
+
                 except Exception as e:
                     logger.warning(f"Failed to process document '{file_path}': {e}")
                     failed_files.append(file_path)
+        except BaseException as e:
+            interrupted = e.__class__.__name__ == 'InterruptTaskThread'
+            raise
+        finally:
+            if interrupted:
+                for future in future_to_doc:
+                    future.cancel()
+            self._shutdown_executor(executor, interrupted)
         
         return all_entities, failed_files, file_hashes, all_parser_relationships
     
@@ -1729,8 +1795,12 @@ class IngestionPipeline(BaseModel):
         # Process files in parallel
         batch_start_time = time.time()
         logger.info(f"⏱️ [TIMING] Batch start: {len(file_batch)} files")
-        
-        with ThreadPoolExecutor(max_workers=self.max_parallel_extractions) as executor:
+
+        self._check_stop()
+        executor = ThreadPoolExecutor(max_workers=self.max_parallel_extractions)
+        future_to_file = {}
+        interrupted = False
+        try:
             future_to_file = {
                 executor.submit(
                     self._process_file_with_chunks, 
@@ -1738,13 +1808,13 @@ class IngestionPipeline(BaseModel):
                 ): file_path
                 for file_path, chunks, raw_doc in file_batch
             }
-            
-            for future in as_completed(future_to_file):
+
+            for future in self._iter_completed_futures(list(future_to_file.keys())):
                 file_path = future_to_file[future]
-                
+
                 try:
                     file_entities, parser_rels, content_hash = future.result()
-                    
+
                     # Update graph with file results (sequential - graph is not thread-safe)
                     for entity in file_entities:
                         self._knowledge_graph.add_entity(
@@ -1756,20 +1826,28 @@ class IngestionPipeline(BaseModel):
                         )
                         result.entities_added += 1
                         all_entities.append(entity)
-                    
+
                     # Collect parser relationships
                     all_parser_relationships.extend(parser_rels)
-                    
+
                     # Mark file as processed
                     checkpoint.mark_file_processed(file_path, content_hash)
                     result.documents_processed += 1
-                    
+
                 except Exception as e:
                     logger.warning(f"Failed to process file '{file_path}': {e}")
                     checkpoint.mark_file_failed(file_path, str(e))
                     if file_path not in result.failed_documents:
                         result.failed_documents.append(file_path)
                     result.documents_processed += 1
+        except BaseException as e:
+            interrupted = e.__class__.__name__ == 'InterruptTaskThread'
+            raise
+        finally:
+            if interrupted:
+                for future in future_to_file:
+                    future.cancel()
+            self._shutdown_executor(executor, interrupted)
         
         batch_duration = time.time() - batch_start_time
         logger.info(f"⏱️ [TIMING] Batch complete: {len(file_batch)} files in {batch_duration:.3f}s ({batch_duration/len(file_batch):.3f}s/file avg)")
@@ -1795,6 +1873,7 @@ class IngestionPipeline(BaseModel):
         Returns:
             Tuple of (deduplicated_entities, parser_relationships, content_hash)
         """
+        self._check_stop()
         all_entities = []
         parser_relationships = []
         content_hash = hashlib.sha256(raw_doc.page_content.encode()).hexdigest()
@@ -1863,6 +1942,7 @@ class IngestionPipeline(BaseModel):
         
         if parser and _is_code_file(file_path):
             try:
+                self._check_stop()
                 parse_result = parser_parse_file(file_path, content=raw_doc.page_content)
                 
                 # Build symbol name to entity ID mapping for containment edges
@@ -1939,6 +2019,7 @@ class IngestionPipeline(BaseModel):
         # Helper functions for parallel execution
         def extract_entities():
             """Extract entities from chunks - runs in parallel thread."""
+            self._check_stop()
             entities = []
             if not self._entity_extractor or not chunks:
                 return entities, 0.0
@@ -1948,6 +2029,7 @@ class IngestionPipeline(BaseModel):
                 extracted, _ = self._entity_extractor.extract_batch(
                     chunks, schema=schema, skip_on_error=True
                 )
+                self._check_stop()
                 
                 for entity in extracted:
                     entity_name = entity.get('name', '').lower()
@@ -1995,6 +2077,7 @@ class IngestionPipeline(BaseModel):
         
         def extract_facts():
             """Extract facts from chunks - runs in parallel thread."""
+            self._check_stop()
             facts = []
             if not self.llm or not chunks:
                 return facts, 0.0
@@ -2008,6 +2091,7 @@ class IngestionPipeline(BaseModel):
                     all_facts = fact_extractor.extract_batch_code(chunks)
                 else:
                     all_facts = fact_extractor.extract_batch(chunks)
+                self._check_stop()
                 
                 for fact in all_facts:
                     # Skip facts with missing or generic subjects
@@ -2054,12 +2138,30 @@ class IngestionPipeline(BaseModel):
         # Run entity and fact extraction in PARALLEL (skip for trivial files)
         llm_start = time.time()
         if chunks and not skip_llm:
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            self._check_stop()
+            executor = ThreadPoolExecutor(max_workers=2)
+            entity_future = None
+            fact_future = None
+            interrupted = False
+            try:
                 entity_future = executor.submit(extract_entities)
                 fact_future = executor.submit(extract_facts)
-                
-                chunk_entities, entity_llm_duration = entity_future.result()
-                chunk_facts, fact_llm_duration = fact_future.result()
+
+                for future in self._iter_completed_futures([entity_future, fact_future]):
+                    if future is entity_future:
+                        chunk_entities, entity_llm_duration = future.result()
+                    elif future is fact_future:
+                        chunk_facts, fact_llm_duration = future.result()
+            except BaseException as e:
+                interrupted = e.__class__.__name__ == 'InterruptTaskThread'
+                raise
+            finally:
+                if interrupted:
+                    if entity_future is not None:
+                        entity_future.cancel()
+                    if fact_future is not None:
+                        fact_future.cancel()
+                self._shutdown_executor(executor, interrupted)
             
             llm_total = time.time() - llm_start
             logger.info(f"⏱️ [TIMING] LLM parallel: {llm_total:.3f}s (entity: {entity_llm_duration:.3f}s, fact: {fact_llm_duration:.3f}s, {len(chunks)} chunks) for {Path(file_path).name}")
@@ -2210,6 +2312,7 @@ class IngestionPipeline(BaseModel):
             Tuple of (relations_list, error_message)
             error_message is None on success
         """
+        self._check_stop()
         # Use first entity's doc for context
         doc = file_entities[0].get('source_doc')
         if not doc or not doc.page_content:
@@ -2247,11 +2350,13 @@ class IngestionPipeline(BaseModel):
         # Retry logic with exponential backoff
         last_error = None
         for attempt in range(max_retries):
+            self._check_stop()
             try:
                 file_relations = self._relation_extractor.extract(
                     doc, entity_dicts, schema=schema, confidence_threshold=0.5,
                     all_entities=all_entity_dicts
                 )
+                self._check_stop()
                 
                 # Add source tracking to each relation
                 source_toolkit = file_entities[0].get('source_toolkit') if file_entities else None
@@ -2275,6 +2380,7 @@ class IngestionPipeline(BaseModel):
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
                     time.sleep(wait_time)
+                    self._check_stop()
         
         # All retries failed
         logger.error(f"Failed to extract relations from '{file_path}' after {max_retries} attempts: {last_error}")
@@ -2345,8 +2451,12 @@ class IngestionPipeline(BaseModel):
         
         # Use ThreadPoolExecutor for parallel relation extraction
         completed_files = 0
-        
-        with ThreadPoolExecutor(max_workers=self.max_parallel_extractions) as executor:
+
+        self._check_stop()
+        executor = ThreadPoolExecutor(max_workers=self.max_parallel_extractions)
+        future_to_file = {}
+        interrupted = False
+        try:
             # Submit all extraction tasks
             future_to_file = {
                 executor.submit(
@@ -2358,15 +2468,15 @@ class IngestionPipeline(BaseModel):
                 ): (file_path, file_entities)
                 for file_path, file_entities in files_to_process
             }
-            
+
             # Process completed tasks as they finish
-            for future in as_completed(future_to_file):
+            for future in self._iter_completed_futures(list(future_to_file.keys())):
                 file_path, file_entities = future_to_file[future]
                 completed_files += 1
-                
+
                 try:
                     file_relations, error = future.result()
-                    
+
                     if error:
                         # Log failed file but continue processing
                         failed_files.append({
@@ -2376,7 +2486,7 @@ class IngestionPipeline(BaseModel):
                         })
                     else:
                         relations.extend(file_relations)
-                    
+
                 except Exception as e:
                     # Unexpected error (shouldn't happen since we catch in _extract_relations_from_file)
                     logger.error(f"Unexpected error processing '{file_path}': {e}")
@@ -2385,7 +2495,7 @@ class IngestionPipeline(BaseModel):
                         'error': f"Unexpected error: {str(e)}",
                         'entity_count': len(file_entities)
                     })
-                
+
                 # Log progress periodically
                 if completed_files % 10 == 0 or completed_files == total_files or completed_files == 1:
                     pct = (completed_files / total_files) * 100
@@ -2393,6 +2503,14 @@ class IngestionPipeline(BaseModel):
                     if failed_files:
                         status_msg += f" | {len(failed_files)} files failed"
                     self._log_progress(status_msg, "relations")
+        except BaseException as e:
+            interrupted = e.__class__.__name__ == 'InterruptTaskThread'
+            raise
+        finally:
+            if interrupted:
+                for future in future_to_file:
+                    future.cancel()
+            self._shutdown_executor(executor, interrupted)
         
         # Log summary of failures if any
         if failed_files:
@@ -2412,6 +2530,7 @@ class IngestionPipeline(BaseModel):
         logger.info(f"⏱️ [TIMING] Per-file relation extraction: {file_rel_duration:.3f}s for {total_files} files")
         
         # Phase 2: Extract cross-file relations (imports, dependencies between modules)
+        self._check_stop()
         cross_file_start = time.time()
         cross_file_relations = self._extract_cross_file_relations(entities, all_entity_dicts, by_file)
         if cross_file_relations:
@@ -3132,7 +3251,8 @@ class IngestionPipeline(BaseModel):
             
             # Stream raw documents (read once)
             loader_args['chunked'] = False
-            for raw_doc in toolkit.loader(**loader_args):
+            for raw_doc in self._iter_loader_documents(toolkit, loader_args):
+                self._check_stop()
                 file_path = (raw_doc.metadata.get('file_path') or 
                             raw_doc.metadata.get('file_name') or 
                             raw_doc.metadata.get('source', 'unknown'))
@@ -3156,6 +3276,7 @@ class IngestionPipeline(BaseModel):
                 normalized = self._normalize_document(raw_doc, source)
                 if not normalized:
                     continue
+                self._check_stop()
                 
                 # For incremental updates, check if file changed
                 if is_incremental_update:
@@ -3183,6 +3304,7 @@ class IngestionPipeline(BaseModel):
                 else:
                     # No chunker - use raw doc as single chunk
                     chunks = [normalized]
+                self._check_stop()
                 chunk_time = time.time() - chunk_start
                 total_chunk_time += chunk_time
                 if chunk_time > 0.1:  # Log if chunking takes > 100ms
@@ -3203,6 +3325,7 @@ class IngestionPipeline(BaseModel):
                         file_batch, {}, source, schema, checkpoint, result, 
                         all_entities, all_parser_relationships, is_incremental_update
                     )
+                    self._check_stop()
                     
                     total_batches_processed += 1
                     file_batch = []  # Reset batch
@@ -3230,6 +3353,7 @@ class IngestionPipeline(BaseModel):
                     file_batch, {}, source, schema, checkpoint, result, 
                     all_entities, all_parser_relationships, is_incremental_update
                 )
+                self._check_stop()
             
             streaming_duration = time.time() - streaming_start
             logger.info(f"⏱️ [TIMING] Streaming phase complete: {streaming_duration:.3f}s total, {total_chunk_time:.3f}s chunking, {total_batches_processed + 1} batches")
@@ -3255,6 +3379,7 @@ class IngestionPipeline(BaseModel):
             
             # Extract relations
             if extract_relations and all_entities:
+                self._check_stop()
                 checkpoint.phase = "relations"
                 self._save_checkpoint(checkpoint)
                 relations_phase_start = time.time()
@@ -3488,7 +3613,9 @@ class IngestionPipeline(BaseModel):
         all_entities = []
         
         try:
+            self._check_stop()
             for doc in documents:
+                self._check_stop()
                 normalized = self._normalize_document(doc, source)
                 if not normalized:
                     continue
@@ -3520,6 +3647,7 @@ class IngestionPipeline(BaseModel):
                     )
             
             if extract_relations and all_entities:
+                self._check_stop()
                 graph_entities = self._knowledge_graph.get_all_entities()
                 self._log_progress(
                     f"🔗 Extracting relations from {len(all_entities)} new entities "
@@ -3599,6 +3727,7 @@ class IngestionPipeline(BaseModel):
         
         # Remove stale entities
         for file_path in file_paths:
+            self._check_stop()
             removed = self._knowledge_graph.remove_entities_by_file(file_path)
             result.entities_removed += removed
         
@@ -3695,6 +3824,7 @@ class IngestionPipeline(BaseModel):
         docs = []
         
         for file_path in sample_file_paths[:10]:
+            self._check_stop()
             try:
                 content = Path(file_path).read_text(encoding='utf-8')
                 docs.append(Document(

@@ -1414,6 +1414,7 @@ class Method:
                 graph_path=graph_path,
                 auto_generate_embeddings=ingestion_config.get("generate_embeddings", True),
                 progress_callback=progress_callback,
+                stop_callback=self.invocation_stop_checkpoint,
                 # Parallelization settings from config
                 max_parallel_extractions=ingestion_config.get("max_parallel_extractions", 10),
                 batch_size=ingestion_config.get("batch_size", 10),
