@@ -66,7 +66,7 @@ export default function SourcesList({
         updateSource(toolkitId, { status: 'done', last_ingested: new Date().toISOString() });
       } catch (err) {
         if (err?.message === 'Polling aborted') {
-          updateSource(toolkitId, { status: 'pending' });
+          updateSource(toolkitId, { status: 'stopped' });
         } else {
           console.error('Ingestion failed:', err);
           updateSource(toolkitId, { status: 'error' });

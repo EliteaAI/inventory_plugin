@@ -8,7 +8,7 @@ Tracks the status and last update time for each source toolkit added to a knowle
 Status is stored in sources_status.json alongside the graph.json file.
 
 This enables:
-- UI to show status badges on source cards (pending, in_progress, completed, error)
+- UI to show status badges on source cards (pending, in_progress, completed, stopped, error)
 - Tracking when each source was last updated
 - Showing entity/relation counts per source
 """
@@ -33,6 +33,7 @@ class SourceStatus:
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+    STOPPED = "stopped"
     ERROR = "error"
 
 
@@ -304,6 +305,54 @@ class SourceStatusManager:
             self._write_status(status)
             log.warning(f"Source ingestion failed: toolkit_id={toolkit_id}, error={error_message}")
 
+    def stop_ingestion(
+        self,
+        toolkit_id: str,
+        message: str = "Ingestion stopped by user",
+        documents_processed: Optional[int] = None,
+    ) -> None:
+        """
+        Mark a source ingestion as stopped by user action.
+
+        Preserves the previously known entity/relation counters so a stopped rerun does not
+        look like data loss for already-ingested sources.
+
+        Args:
+            toolkit_id: Toolkit ID
+            message: Human-readable stop reason
+            documents_processed: Optional number of processed documents for the interrupted run
+        """
+        with self._lock:
+            status = self._read_status()
+            sources = status.get("sources", {})
+            source_key = str(toolkit_id)
+
+            if source_key not in sources:
+                sources[source_key] = {
+                    "toolkit_id": str(toolkit_id),
+                    "toolkit_name": f"toolkit_{toolkit_id}",
+                    "toolkit_type": "",
+                    "entities_count": 0,
+                    "relations_count": 0,
+                    "documents_processed": 0,
+                }
+
+            current = sources[source_key]
+            current.update({
+                "status": SourceStatus.STOPPED,
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "documents_processed": (
+                    current.get("documents_processed", 0)
+                    if documents_processed is None else documents_processed
+                ),
+                "error_message": None,
+                "progress_message": message,
+            })
+
+            status["sources"] = sources
+            self._write_status(status)
+            log.info("Source ingestion stopped: toolkit_id=%s, message=%s", toolkit_id, message)
+
     def remove_source(self, toolkit_id: str) -> bool:
         """
         Remove a source from status tracking.
@@ -343,6 +392,7 @@ class SourceStatusManager:
                 SourceStatus.PENDING: 0,
                 SourceStatus.IN_PROGRESS: 0,
                 SourceStatus.COMPLETED: 0,
+                SourceStatus.STOPPED: 0,
                 SourceStatus.ERROR: 0,
             }
 

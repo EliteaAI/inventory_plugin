@@ -42,6 +42,7 @@ const STATUS_CONFIG = {
   pending: { color: 'warning', label: 'Pending' },
   in_progress: { color: 'info', label: 'Ingesting...' },
   completed: { color: 'success', label: 'Done' },
+  stopped: { color: 'warning', label: 'Stopped' },
   error: { color: 'error', label: 'Error' },
   // Legacy/UI status values for backwards compatibility
   ingesting: { color: 'info', label: 'Ingesting...' },

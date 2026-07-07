@@ -30,6 +30,11 @@ _PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").
 _PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
 
 
+def _is_task_interruption(exception) -> bool:
+    """Return True when the exception represents a user-requested task stop."""
+    return exception.__class__.__name__ == "InterruptTaskThread"
+
+
 def _platform_settings_from_llm_settings(llm_settings):
     """Derive platform base URL, auth token and project_id from per-request ``llm_settings``.
 
@@ -1552,6 +1557,29 @@ class Method:
                 return error_msg
 
         except Exception as e:
+            if _is_task_interruption(e):
+                log.info("Inventory ingestion stopped by user for toolkit %s", toolkit_id)
+                try:
+                    if 'status_manager' in locals():
+                        status_manager.stop_ingestion(
+                            toolkit_id=str(toolkit_id),
+                            documents_processed=0,
+                        )
+                        if 'elitea_client' in locals():
+                            status_file = os.path.join(str(graph_dir), "sources_status.json")
+                            if os.path.exists(status_file):
+                                with open(status_file, 'rb') as f:
+                                    status_data = f.read()
+                                stopped_artifact_bucket = resolve_inventory_artifact_bucket(
+                                    inventory_settings.get("toolkit_configuration_bucket"),
+                                )
+                                elitea_client.artifact(stopped_artifact_bucket).create(
+                                    "sources_status.json", status_data
+                                )
+                except Exception as status_error:
+                    log.warning("Failed to update source status on stop: %s", status_error)
+                raise
+
             log.exception(f"Ingestion failed for toolkit {toolkit_id}")
             # Try to mark source status as error if status_manager was initialized
             try:
@@ -1845,7 +1873,15 @@ class Method:
                     return f"Error: Job {job_id} not found"
                 time.sleep(poll_interval)
                 elapsed += poll_interval
-        except Exception:
+        except Exception as e:
+            if _is_task_interruption(e):
+                try:
+                    from ..utils.source_status import SourceStatusManager
+
+                    status_manager = SourceStatusManager(graph_dir)
+                    status_manager.stop_ingestion(toolkit_id=str(toolkit_id))
+                except Exception as status_error:
+                    log.warning("Failed to update K8s source status on stop: %s", status_error)
             self.invocation_thinking(f"Stopping inventory ingestion job {job_id}...")
             job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
             release_tracking_slot()
