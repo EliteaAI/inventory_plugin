@@ -54,6 +54,7 @@ export default function SourceCard({
   onIngest,
   onRemove,
   onConfigChange,
+  disableIngest = false,
 }) {
   const {
     toolkit_id,
@@ -92,6 +93,12 @@ export default function SourceCard({
   };
 
   const isIngesting = status === 'ingesting' || status === 'in_progress';
+  const ingestDisabled = disableIngest || isIngesting;
+  const ingestTooltip = isIngesting
+    ? 'Ingesting...'
+    : disableIngest
+      ? 'Another ingestion is already running'
+      : 'Ingest';
 
   return (
     <Paper
@@ -130,12 +137,12 @@ export default function SourceCard({
             <SettingsIcon fontSize="small" />
           </IconButton>
         </Tooltip>
-        <Tooltip title={isIngesting ? 'Ingesting...' : 'Ingest'}>
+        <Tooltip title={ingestTooltip}>
           <span>
             <IconButton
               size="small"
               onClick={() => onIngest?.(toolkit_id)}
-              disabled={isIngesting}
+              disabled={ingestDisabled}
               sx={{
                 bgcolor: 'primary.main',
                 color: 'white',

@@ -156,8 +156,16 @@ if str(plugin_dir) not in sys.path:
 # Import CANONICAL_TYPES for smart normalization
 try:
     from ..constants import CANONICAL_TYPES
+    from ..utils.artifact_bucket import (
+        get_inventory_artifact_read_candidates,
+        resolve_inventory_artifact_bucket,
+    )
 except ImportError:
     from plugins.inventory_plugin.constants import CANONICAL_TYPES
+    from plugins.inventory_plugin.utils.artifact_bucket import (
+        get_inventory_artifact_read_candidates,
+        resolve_inventory_artifact_bucket,
+    )
 
 
 class Method:
@@ -1043,56 +1051,53 @@ class Method:
             return False
 
         graph_dir = os.path.dirname(graph_path)
+        artifact_buckets = get_inventory_artifact_read_candidates(artifact_bucket)
 
         try:
-            # Download main graph file
             artifact_name = "graph.json"
-            log.info(f"Downloading graph from artifacts: {artifact_bucket}/{artifact_name}")
-            graph_data = elitea_client.artifact(artifact_bucket).get(artifact_name)
+            for candidate_bucket in artifact_buckets:
+                log.info("Downloading graph from artifacts: %s/%s", candidate_bucket, artifact_name)
+                graph_data = elitea_client.artifact(candidate_bucket).get(artifact_name)
 
-            if graph_data and not self._is_artifact_error(graph_data):
-                # Create directory if needed
+                if not graph_data or self._is_artifact_error(graph_data):
+                    log.debug("Graph not found in artifact bucket %s: %s", candidate_bucket, graph_data)
+                    continue
+
                 Path(graph_dir).mkdir(parents=True, exist_ok=True)
-
-                # Write graph file
                 with open(graph_path, 'w', encoding='utf-8') as f:
                     f.write(graph_data)
-                log.info(f"Downloaded graph to {graph_path}")
+                log.info("Downloaded graph to %s from artifact bucket %s", graph_path, candidate_bucket)
 
-                # Try to download sources_status.json
                 try:
-                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
+                    status_data = elitea_client.artifact(candidate_bucket).get("sources_status.json")
                     if status_data and not self._is_artifact_error(status_data):
                         status_file = os.path.join(graph_dir, "sources_status.json")
                         with open(status_file, 'w', encoding='utf-8') as f:
                             f.write(status_data)
-                        log.info(f"Downloaded sources_status.json to {status_file}")
+                        log.info("Downloaded sources_status.json to %s", status_file)
                 except Exception as e:
-                    log.debug(f"No sources_status.json found or error downloading: {e}")
+                    log.debug("No sources_status.json found or error downloading: %s", e)
 
-                # Try to download checkpoints (they may or may not exist)
                 try:
-                    # List all artifacts in the bucket to find checkpoints
-                    artifacts = elitea_client.artifact(artifact_bucket).list(return_as_string=False)
+                    artifacts = elitea_client.artifact(candidate_bucket).list(return_as_string=False)
                     checkpoint_prefix = ".ingestion-checkpoint-"
 
                     for artifact_info in artifacts:
                         if isinstance(artifact_info, dict):
                             artifact_path = artifact_info.get('name', '')
                             if artifact_path.startswith(checkpoint_prefix):
-                                checkpoint_data = elitea_client.artifact(artifact_bucket).get(artifact_path)
+                                checkpoint_data = elitea_client.artifact(candidate_bucket).get(artifact_path)
                                 if checkpoint_data and not self._is_artifact_error(checkpoint_data):
                                     checkpoint_file = os.path.join(graph_dir, os.path.basename(artifact_path))
                                     with open(checkpoint_file, 'w', encoding='utf-8') as f:
                                         f.write(checkpoint_data)
-                                    log.info(f"Downloaded checkpoint: {checkpoint_file}")
+                                    log.info("Downloaded checkpoint: %s", checkpoint_file)
                 except Exception as e:
-                    log.debug(f"No checkpoints found or error downloading checkpoints: {e}")
-                
+                    log.debug("No checkpoints found or error downloading checkpoints: %s", e)
+
                 return True
-            else:
-                log.info(f"Graph not found in artifacts: {graph_data}")
-                return False
+
+            return False
                 
         except Exception as e:
             log.warning(f"Failed to download graph from artifacts: {e}")
@@ -1121,7 +1126,9 @@ class Method:
             application_id = config.get("application_id")
             # Get artifact bucket from toolkit settings
             settings = config.get("settings", {})
-            artifact_bucket = settings.get("toolkit_configuration_bucket", "graphs")
+            artifact_bucket = resolve_inventory_artifact_bucket(
+                settings.get("toolkit_configuration_bucket"),
+            )
             # Per-request platform creds expanded by the platform under parameters.llm_settings
             llm_settings = config.get("parameters", {}).get("llm_settings")
 
@@ -1167,7 +1174,7 @@ class Method:
             return "Error: toolkit_id is required"
 
         if not graph_path:
-            return "Error: No graph path configured. Set bucket and graph_name in toolkit configuration."
+            return "Error: No graph path configured. Save the inventory toolkit configuration first."
 
         if _is_ingestion_jobs_enabled():
             return self._run_ingestion_job(params, graph_path, request_data)
@@ -1477,7 +1484,9 @@ class Method:
 
             # Upload graph, checkpoints, and status to artifact bucket
             # Get bucket name from toolkit settings
-            artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+            artifact_bucket = resolve_inventory_artifact_bucket(
+                inventory_settings.get("toolkit_configuration_bucket"),
+            )
             try:
                 # Upload main graph file if exists and ingestion succeeded
                 if result.success and os.path.exists(graph_path):
@@ -1558,7 +1567,9 @@ class Method:
                         if os.path.exists(status_file):
                             with open(status_file, 'rb') as f:
                                 status_data = f.read()
-                            error_artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+                            error_artifact_bucket = resolve_inventory_artifact_bucket(
+                                inventory_settings.get("toolkit_configuration_bucket"),
+                            )
                             elitea_client.artifact(error_artifact_bucket).create("sources_status.json", status_data)
             except Exception as status_error:
                 log.warning(f"Failed to update source status on error: {status_error}")
@@ -1601,7 +1612,7 @@ class Method:
         # merged ``params``), not configuration.settings, so config.get("settings") is
         # normally empty on the agent path. Mirror the standalone path and fetch the saved
         # settings from the platform API when they are absent -- otherwise the worker
-        # receives empty settings and falls back to the default "graphs" bucket with no
+        # receives empty settings and falls back to the canonical artifact bucket with no
         # per-source configuration (file patterns, branch).
         inventory_settings = config.get("settings", {}) or {}
         if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
@@ -1634,7 +1645,9 @@ class Method:
             except Exception as fetch_err:
                 log.warning("[run_ingestion_job] Could not fetch inventory settings: %s", fetch_err)
 
-        artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+        artifact_bucket = resolve_inventory_artifact_bucket(
+            inventory_settings.get("toolkit_configuration_bucket"),
+        )
         graph_dir = str(Path(graph_path).parent)
         ingestion_config = self.descriptor.config.get("ingestion", {})
         runtime_base_path = self.descriptor.config.get("base_path", "/data/inventory")
@@ -1851,7 +1864,10 @@ class Method:
             return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
 
         try:
-            sync_bucket = result.get("artifact_bucket") or artifact_bucket
+            sync_bucket = resolve_inventory_artifact_bucket(
+                result.get("artifact_bucket"),
+                artifact_bucket,
+            )
             self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket, params.get("llm_settings"))
             if graph_path in self.graph_instances:
                 del self.graph_instances[graph_path]
@@ -1954,7 +1970,7 @@ class Method:
         if not graph_path:
             if output_format == "json":
                 return json_module.dumps({"sources": [], "error": "No graph configured"})
-            return "No graph configured. Please set bucket and graph_name in toolkit configuration."
+            return "No graph configured yet. Run ingestion to create the inventory graph."
 
         wrapper = self._get_or_create_wrapper(graph_path, request_data)
         stats = wrapper._knowledge_graph.get_stats()
@@ -3054,7 +3070,7 @@ class Method:
                     "total_sources": 0,
                     "error": "No graph configured"
                 })
-            return "No graph configured. Please set bucket and graph_name in toolkit configuration."
+            return "No graph configured yet. Run ingestion to create the inventory graph."
 
         # Get graph directory
         graph_dir = Path(graph_path).parent
@@ -3063,9 +3079,10 @@ class Method:
         config = request_data.get("configuration", {})
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
-        # Get artifact bucket from toolkit settings
         settings = config.get("settings", {})
-        artifact_bucket = settings.get("toolkit_configuration_bucket", "graphs")
+        artifact_bucket = resolve_inventory_artifact_bucket(
+            settings.get("toolkit_configuration_bucket"),
+        )
 
         status_file = graph_dir / "sources_status.json"
         if not status_file.exists() and project_id and application_id:
@@ -3073,12 +3090,14 @@ class Method:
             try:
                 elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
                 if elitea_client:
-                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
-                    if status_data and not self._is_artifact_error(status_data):
-                        graph_dir.mkdir(parents=True, exist_ok=True)
-                        with open(status_file, 'w', encoding='utf-8') as f:
-                            f.write(status_data)
-                        log.info(f"Downloaded sources_status.json from artifacts")
+                    for candidate_bucket in get_inventory_artifact_read_candidates(artifact_bucket):
+                        status_data = elitea_client.artifact(candidate_bucket).get("sources_status.json")
+                        if status_data and not self._is_artifact_error(status_data):
+                            graph_dir.mkdir(parents=True, exist_ok=True)
+                            with open(status_file, 'w', encoding='utf-8') as f:
+                                f.write(status_data)
+                            log.info("Downloaded sources_status.json from artifacts")
+                            break
             except Exception as e:
                 log.debug(f"Could not download sources_status.json from artifacts: {e}")
 

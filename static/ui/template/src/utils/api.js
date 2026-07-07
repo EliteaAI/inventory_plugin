@@ -7,6 +7,8 @@
 let toolkitCache = null;
 let toolkitCacheKey = null;
 
+export const INVENTORY_ARTIFACT_BUCKET = 'inventory-graphs';
+
 /**
  * Set toolkit data in cache (call this from App after initial fetch)
  * This prevents duplicate API requests
@@ -568,7 +570,7 @@ export async function runIngestion(projectId, toolkitId, sourceToolkitId, option
 
   // Build toolkit configuration for the provider
   const toolkitConfig = {
-    bucket: settings.toolkit_configuration_bucket || 'graphs',
+    bucket: INVENTORY_ARTIFACT_BUCKET,
     graph_name: settings.toolkit_configuration_graph_name || 'main',
     llm_model: settings.toolkit_configuration_llm_model || '',
     embedding_model: settings.toolkit_configuration_embedding_model || '',
@@ -726,7 +728,7 @@ export function getToolkitSources(toolkit) {
  * Save ingestion status - currently no-op
  * TODO: Implement proper persistence via ELITEA artifacts API when available
  */
-export async function saveIngestionStatus(projectId, bucket, graphName, status) {
+export async function saveIngestionStatus(_projectId, _status) {
   // No-op for now - status is tracked in component state
   return Promise.resolve();
 }

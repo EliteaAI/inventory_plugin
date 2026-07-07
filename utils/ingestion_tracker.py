@@ -174,15 +174,26 @@ class IngestionTracker:
         def do_acquire(state):
             in_progress = state.get("ingestions", {}).get("in_progress", [])
 
-            # Check if we have capacity
-            if enforce_limit and len(in_progress) >= self.max_parallel:
-                # Return current state and False to indicate failure
-                return state, False
-
             # Check if this task is already tracked (idempotency)
             for ing in in_progress:
                 if ing.get("task_id") == task_id:
-                    return state, True  # Already tracked
+                    return state, {"acquired": True, "reason": "already_tracked"}
+
+            if project_id and application_id:
+                for ing in in_progress:
+                    if (
+                        str(ing.get("project_id")) == str(project_id)
+                        and str(ing.get("application_id")) == str(application_id)
+                    ):
+                        return state, {
+                            "acquired": False,
+                            "reason": "application_busy",
+                            "active_ingestion": ing,
+                        }
+
+            # Check if we have capacity
+            if enforce_limit and len(in_progress) >= self.max_parallel:
+                return state, {"acquired": False, "reason": "capacity"}
 
             # Add new ingestion
             in_progress.append({
@@ -194,11 +205,20 @@ class IngestionTracker:
             })
 
             state["ingestions"] = {"in_progress": in_progress}
-            return state, True
+            return state, {"acquired": True, "reason": "acquired"}
 
         result = self._atomic_update(do_acquire)
 
-        if not result:
+        if not result.get("acquired"):
+            if result.get("reason") == "application_busy":
+                active = result.get("active_ingestion") or {}
+                raise IngestionSlotError(
+                    f"An ingestion is already running for project {project_id}, inventory {application_id}. "
+                    "Stop it or wait for it to finish.\n\n"
+                    f"Currently running source: Toolkit {active.get('toolkit_id', 'unknown')} "
+                    f"(started {active.get('started_at', 'unknown')})"
+                )
+
             active = self.get_active_ingestions()
             raise IngestionSlotError(
                 f"All ingestion workers are currently busy ({self.max_parallel} active). "

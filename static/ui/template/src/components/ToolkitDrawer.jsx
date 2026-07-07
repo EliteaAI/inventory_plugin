@@ -12,6 +12,7 @@ import {
   invokeToolAsync,
   pollTaskStatus,
   stopPlatformTask,
+  stopProviderTask,
   getToolkitSources,
   getIngestionStatus,
   saveIngestionStatus,
@@ -34,12 +35,29 @@ function ToolkitDrawer({
   const [activeIngestion, setActiveIngestion] = useState(null);
   const [ingestionInfo, setIngestionInfo] = useState(null);
   const ingestionAbortRef = useRef(false);
-  const currentInvocationRef = useRef(null);
+  const currentPlatformTaskRef = useRef(null);
+  const currentProviderInvocationRef = useRef(null);
   const abortControllerRef = useRef(null);
   const statusPollIntervalRef = useRef(null);
 
   // Get configured sources from toolkit settings
   const configuredSources = getToolkitSources(toolkit);
+  const stopStatusPolling = useCallback(() => {
+    if (statusPollIntervalRef.current) {
+      clearInterval(statusPollIntervalRef.current);
+      statusPollIntervalRef.current = null;
+    }
+  }, []);
+
+  const clearIngestionUiState = useCallback(() => {
+    stopStatusPolling();
+    currentPlatformTaskRef.current = null;
+    currentProviderInvocationRef.current = null;
+    abortControllerRef.current = null;
+    setIsIngesting(false);
+    setActiveIngestion(null);
+    setIngestionInfo(null);
+  }, [stopStatusPolling]);
 
   // Check for active ingestion - returns true if there's an active ingestion
   const checkIngestionStatus = useCallback(async () => {
@@ -53,9 +71,9 @@ function ToolkitDrawer({
         setActiveIngestion(status.current_ingestion);
         setIsIngesting(true);
 
-        // Store the task_id for potential stop operation
+        // current_ingestion.task_id is the provider invocation ID stored by the tracker.
         if (status.current_ingestion.task_id) {
-          currentInvocationRef.current = status.current_ingestion.task_id;
+          currentProviderInvocationRef.current = status.current_ingestion.task_id;
         }
 
         setIngestionInfo({
@@ -67,8 +85,15 @@ function ToolkitDrawer({
         return true; // Has active ingestion
       } else {
         setActiveIngestion(null);
-        // Only set isIngesting to false if we're not currently running our own ingestion
-        if (!ingestionAbortRef.current && !abortControllerRef.current) {
+        if (!abortControllerRef.current) {
+          currentPlatformTaskRef.current = null;
+          currentProviderInvocationRef.current = null;
+        }
+        if (
+          !currentPlatformTaskRef.current &&
+          !currentProviderInvocationRef.current &&
+          !abortControllerRef.current
+        ) {
           setIsIngesting(false);
         }
         setIngestionInfo(null);
@@ -79,20 +104,51 @@ function ToolkitDrawer({
       // Don't spam console with errors when graph doesn't exist yet
       console.debug('[ToolkitDrawer] Ingestion status check skipped:', err.message);
       setActiveIngestion(null);
+      if (!abortControllerRef.current) {
+        currentPlatformTaskRef.current = null;
+        currentProviderInvocationRef.current = null;
+      }
+      if (
+        !currentPlatformTaskRef.current &&
+        !currentProviderInvocationRef.current &&
+        !abortControllerRef.current
+      ) {
+        setIsIngesting(false);
+      }
       setIngestionInfo(null);
       return false;
     }
   }, [projectId, toolkitId]);
+
+  const resolveProviderInvocationId = useCallback(async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (currentProviderInvocationRef.current) {
+        return currentProviderInvocationRef.current;
+      }
+
+      const hasActiveIngestion = await checkIngestionStatus();
+      if (currentProviderInvocationRef.current) {
+        return currentProviderInvocationRef.current;
+      }
+
+      if (!hasActiveIngestion && !currentPlatformTaskRef.current) {
+        return null;
+      }
+
+      if (attempt < 4) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+
+    return currentProviderInvocationRef.current;
+  }, [checkIngestionStatus]);
 
   // Check for active ingestion once when drawer opens
   // Only poll if there's an active ingestion
   useEffect(() => {
     if (!open) {
       // Clear polling when drawer closes
-      if (statusPollIntervalRef.current) {
-        clearInterval(statusPollIntervalRef.current);
-        statusPollIntervalRef.current = null;
-      }
+      stopStatusPolling();
       return;
     }
 
@@ -108,8 +164,7 @@ function ToolkitDrawer({
           // Stop polling when ingestion completes
           if (!stillActive && statusPollIntervalRef.current) {
             console.log('[ToolkitDrawer] Ingestion completed, stopping polling');
-            clearInterval(statusPollIntervalRef.current);
-            statusPollIntervalRef.current = null;
+            stopStatusPolling();
           }
         }, 5000);
       }
@@ -118,14 +173,9 @@ function ToolkitDrawer({
     initCheck();
 
     return () => {
-      if (statusPollIntervalRef.current) {
-        clearInterval(statusPollIntervalRef.current);
-        statusPollIntervalRef.current = null;
-      }
+      stopStatusPolling();
     };
-  }, [open, checkIngestionStatus]);
-  const bucket = toolkit?.settings?.toolkit_configuration_bucket || 'graphs';
-  const graphName = toolkit?.settings?.toolkit_configuration_graph_name || 'main';
+  }, [open, checkIngestionStatus, stopStatusPolling]);
 
   // Parse error to check for specific error types
   const parseIngestionError = useCallback((err) => {
@@ -160,6 +210,17 @@ function ToolkitDrawer({
       // Not JSON, use original message
     }
 
+    if (
+      message.includes('already running for project') ||
+      message.includes('already has an ingestion in progress')
+    ) {
+      return {
+        type: 'already_ingesting',
+        message: 'This inventory already has an ingestion in progress. Stop it or wait for it to finish.',
+        details: message,
+      };
+    }
+
     return {
       type: 'general',
       message: `Ingestion failed: ${message}`,
@@ -176,11 +237,10 @@ function ToolkitDrawer({
       const stillActive = await checkIngestionStatus();
       if (!stillActive && statusPollIntervalRef.current) {
         console.log('[ToolkitDrawer] Ingestion completed, stopping polling');
-        clearInterval(statusPollIntervalRef.current);
-        statusPollIntervalRef.current = null;
+        stopStatusPolling();
       }
     }, 5000);
-  }, [checkIngestionStatus]);
+  }, [checkIngestionStatus, stopStatusPolling]);
 
   // Run ingestion for a single source with tracking.
   // Routes through the platform's test_toolkit_tool path (invokeToolAsync) so pylon_main
@@ -208,9 +268,10 @@ function ToolkitDrawer({
       throw new Error('No task_id returned from server');
     }
 
-    // Track the current task
-    currentInvocationRef.current = taskId;
-    console.log(`[Ingestion] Started task: ${taskId}`);
+    // Track the platform wrapper task separately from the provider invocation.
+    currentPlatformTaskRef.current = taskId;
+    currentProviderInvocationRef.current = null;
+    console.log(`[Ingestion] Started platform task: ${taskId}`);
 
     // Poll for completion (with abort support)
     try {
@@ -222,7 +283,7 @@ function ToolkitDrawer({
       );
       return result;
     } finally {
-      currentInvocationRef.current = null;
+      currentPlatformTaskRef.current = null;
       abortControllerRef.current = null;
     }
   }, [projectId, toolkitId]);
@@ -231,6 +292,10 @@ function ToolkitDrawer({
   // Uses runIngestionWithTracking to properly track invocation_id for stop support
   const handleTriggerIngestion = useCallback(async (sourceToolkitId) => {
     if (!projectId || !toolkitId) return;
+    if (isIngesting) {
+      setError('This inventory already has an ingestion in progress. Stop it or wait for it to finish.');
+      return;
+    }
 
     setError(null);
     setIsIngesting(true);
@@ -240,7 +305,7 @@ function ToolkitDrawer({
     startStatusPolling();
 
     try {
-      // Use runIngestionWithTracking to properly set currentInvocationRef for stop support
+      // Use runIngestionWithTracking to properly set stop targets for this run.
       await runIngestionWithTracking(sourceToolkitId);
 
       if (onReindexComplete) {
@@ -250,6 +315,7 @@ function ToolkitDrawer({
       // Don't show error if it was intentionally stopped
       if (err.message === 'Polling aborted' || ingestionAbortRef.current) {
         console.log(`[Ingestion] Stopped for source ${sourceToolkitId}`);
+        throw err;
       } else {
         console.error(`Ingestion failed for source ${sourceToolkitId}:`, err);
         const parsedError = parseIngestionError(err);
@@ -258,14 +324,19 @@ function ToolkitDrawer({
         throw err;
       }
     } finally {
-      // Check status one more time to update UI
-      await checkIngestionStatus();
+      if (!ingestionAbortRef.current) {
+        await checkIngestionStatus();
+      }
     }
-  }, [projectId, toolkitId, onReindexComplete, parseIngestionError, startStatusPolling, checkIngestionStatus, runIngestionWithTracking]);
+  }, [projectId, toolkitId, isIngesting, onReindexComplete, parseIngestionError, startStatusPolling, checkIngestionStatus, runIngestionWithTracking]);
 
   // Handle Update All - sequential ingestion of all sources
   const handleUpdateAll = useCallback(async () => {
     if (!projectId || !toolkitId || configuredSources.length === 0) return;
+    if (isIngesting) {
+      setError('This inventory already has an ingestion in progress. Stop it or wait for it to finish.');
+      return;
+    }
 
     ingestionAbortRef.current = false;
     setIsIngesting(true);
@@ -280,7 +351,7 @@ function ToolkitDrawer({
       statusMap[sourceId] = 'waiting';
     });
 
-    await saveIngestionStatus(projectId, bucket, graphName, {
+    await saveIngestionStatus(projectId, {
       sources: statusMap,
       lastUpdated: new Date().toISOString(),
     });
@@ -290,7 +361,7 @@ function ToolkitDrawer({
       if (ingestionAbortRef.current) break;
 
       statusMap[sourceId] = 'ingesting';
-      await saveIngestionStatus(projectId, bucket, graphName, {
+      await saveIngestionStatus(projectId, {
         sources: statusMap,
         lastUpdated: new Date().toISOString(),
       });
@@ -309,14 +380,14 @@ function ToolkitDrawer({
           const parsedError = parseIngestionError(err);
           setError(parsedError.message);
           // If slots are busy, stop the batch process
-          if (parsedError.type === 'slots_busy') {
+          if (parsedError.type === 'slots_busy' || parsedError.type === 'already_ingesting') {
             ingestionAbortRef.current = true;
             break;
           }
         }
       }
 
-      await saveIngestionStatus(projectId, bucket, graphName, {
+      await saveIngestionStatus(projectId, {
         sources: statusMap,
         lastUpdated: new Date().toISOString(),
       });
@@ -325,36 +396,72 @@ function ToolkitDrawer({
       if (ingestionAbortRef.current) break;
     }
 
-    setIsIngesting(false);
-    currentInvocationRef.current = null;
+    const wasStopped = ingestionAbortRef.current;
+    stopStatusPolling();
+    currentPlatformTaskRef.current = null;
+    currentProviderInvocationRef.current = null;
     abortControllerRef.current = null;
+    if (!wasStopped) {
+      setIsIngesting(false);
+    }
 
-    if (onReindexComplete) {
+    if (!wasStopped && onReindexComplete) {
       onReindexComplete();
     }
-  }, [projectId, toolkitId, configuredSources, bucket, graphName, onReindexComplete, runIngestionWithTracking, startStatusPolling, parseIngestionError]);
+    if (!wasStopped) {
+      await checkIngestionStatus();
+    }
+  }, [projectId, toolkitId, configuredSources, isIngesting, onReindexComplete, runIngestionWithTracking, startStatusPolling, parseIngestionError, stopStatusPolling, checkIngestionStatus]);
 
-  // Stop ingestion - abort polling and cancel the platform task
+  // Stop ingestion - cancel the provider invocation directly and stop the platform task as cleanup.
   const handleStopIngestion = useCallback(async () => {
     console.log('[Ingestion] Stop requested');
     ingestionAbortRef.current = true;
+    const platformTaskId = currentPlatformTaskRef.current;
 
     // Abort the polling
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
 
-    // Cancel the platform task if we have a task_id
-    if (currentInvocationRef.current) {
-      console.log(`[Ingestion] Stopping task: ${currentInvocationRef.current}`);
-      try {
-        await stopPlatformTask(projectId, currentInvocationRef.current);
-        console.log('[Ingestion] Task stopped successfully');
-      } catch (err) {
-        console.error('[Ingestion] Failed to stop task:', err);
+    const providerInvocationId = (
+      currentProviderInvocationRef.current ||
+      activeIngestion?.task_id ||
+      await resolveProviderInvocationId()
+    );
+
+    let stopRequested = false;
+    const stopErrors = [];
+
+    if (providerInvocationId) {
+      console.log(`[Ingestion] Stopping provider invocation: ${providerInvocationId}`);
+      const result = await stopProviderTask(providerInvocationId);
+      if (result.success) {
+        stopRequested = true;
+      } else if (result.error) {
+        stopErrors.push(result.error);
       }
     }
-  }, [projectId]);
+
+    if (platformTaskId) {
+      console.log(`[Ingestion] Stopping platform task: ${platformTaskId}`);
+      try {
+        await stopPlatformTask(projectId, platformTaskId);
+        stopRequested = true;
+      } catch (err) {
+        console.error('[Ingestion] Failed to stop platform task:', err);
+        stopErrors.push(err.message);
+      }
+    }
+
+    if (stopRequested || (!providerInvocationId && !platformTaskId)) {
+      console.log('[Ingestion] Stop request sent successfully');
+      clearIngestionUiState();
+      return;
+    }
+
+    setError(`Failed to stop ingestion: ${stopErrors.join('; ') || 'unknown error'}`);
+  }, [projectId, activeIngestion, clearIngestionUiState, resolveProviderInvocationId]);
 
   return (
     <Drawer

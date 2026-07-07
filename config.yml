@@ -2,7 +2,7 @@
 # These can be overridden in configs/inventory_plugin.yml
 
 service_location_url: http://127.0.0.1:8091
-default_bucket: inventory_graphs
+default_bucket: inventory-graphs
 
 # Cache configuration for local graph storage
 # Graphs can be 100MB+ each, so be conservative with limits

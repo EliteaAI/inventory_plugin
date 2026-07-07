@@ -65,9 +65,12 @@ export default function SourcesList({
         // Update status on success
         updateSource(toolkitId, { status: 'done', last_ingested: new Date().toISOString() });
       } catch (err) {
-        // Update status on error
-        console.error('Ingestion failed:', err);
-        updateSource(toolkitId, { status: 'error' });
+        if (err?.message === 'Polling aborted') {
+          updateSource(toolkitId, { status: 'pending' });
+        } else {
+          console.error('Ingestion failed:', err);
+          updateSource(toolkitId, { status: 'error' });
+        }
       }
     }
   }, [updateSource, onTriggerIngestion]);
@@ -191,6 +194,7 @@ export default function SourcesList({
                 onIngest={handleIngest}
                 onRemove={handleRemoveSource}
                 onConfigChange={handleConfigChange}
+                disableIngest={isIngesting}
               />
             ))}
           </Box>

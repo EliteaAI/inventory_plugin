@@ -20,10 +20,21 @@ except ModuleNotFoundError as exc:
     IngestionTracker = None
     IngestionSlotError = None
 
+from .artifact_bucket import (
+    INVENTORY_ARTIFACT_BUCKET,
+    LEGACY_INVENTORY_ARTIFACT_BUCKETS,
+    get_inventory_artifact_read_candidates,
+    resolve_inventory_artifact_bucket,
+)
+
 __all__ = [
     'GraphCacheManager',
     'IngestionTracker',
     'IngestionSlotError',
+    'INVENTORY_ARTIFACT_BUCKET',
+    'LEGACY_INVENTORY_ARTIFACT_BUCKETS',
+    'get_inventory_artifact_read_candidates',
+    'resolve_inventory_artifact_bucket',
     'SourceStatusManager',
     'SourceStatus',
 ]

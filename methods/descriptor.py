@@ -48,23 +48,18 @@ class Method:
                         "type": "Inventory Knowledge Graph Configuration",
                         "description": "Configure your knowledge graph storage and processing settings. Data sources (repositories, wikis, etc.) are added after creation through the UI or tools.",
                         "fields_order": [
-                            "bucket",
                             "llm_model",
                             "embedding_model",
                             "sources"
                         ],
                         "parameters": {
-                            "bucket": {
-                                "type": "String",
-                                "required": True,
-                                "description": "Storage bucket for knowledge graph data and configurations"
-                            },
                             "llm_model": {
                                 "type": "String",
                                 "required": True,
                                 "description": "LLM model for entity and relation extraction",
                                 "json_schema_extra": {
-                                    "configuration_model": "llm"
+                                    "configuration_model": "llm",
+                                    "compact_label": True
                                 }
                             },
                             "embedding_model": {
@@ -82,7 +77,8 @@ class Method:
                                 "description": "List of source toolkit IDs for data ingestion",
                                 "default": [],
                                 "json_schema_extra": {
-                                    "toolkit_types": ["github", "ado_repos", "gitlab", "bitbucket"]
+                                    "toolkit_types": ["github", "ado_repos", "gitlab", "bitbucket"],
+                                    "compact_label": True
                                 }
                             },
                             "source_configs": {
