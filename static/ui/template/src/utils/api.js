@@ -98,7 +98,7 @@ export async function apiRequest(path, options = {}) {
     throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorText}`);
   }
 
-  return response.json();
+  return parseResponseBody(response);
 }
 
 /**
@@ -128,7 +128,29 @@ export async function providerRequest(path, options = {}) {
     throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorText}`);
   }
 
-  return response.json();
+  return parseResponseBody(response);
+}
+
+async function parseResponseBody(response) {
+  if (response.status === 204 || response.status === 205) {
+    return null;
+  }
+
+  const responseText = await response.text();
+  if (!responseText) {
+    return null;
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return JSON.parse(responseText);
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return responseText;
+  }
 }
 
 /**

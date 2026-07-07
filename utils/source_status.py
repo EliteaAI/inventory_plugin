@@ -37,6 +37,53 @@ class SourceStatus:
     ERROR = "error"
 
 
+TERMINAL_SOURCE_STATUSES = {
+    SourceStatus.COMPLETED,
+    SourceStatus.STOPPED,
+    SourceStatus.ERROR,
+}
+
+
+def _parse_status_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO timestamps from source status / tracker payloads."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def should_clear_tracked_ingestion(
+    source_info: Optional[Dict[str, Any]],
+    tracked_ingestion: Dict[str, Any],
+) -> bool:
+    """Return True when tracker data is older than a terminal source status.
+
+    The ingestion tracker is written before the source status flips to
+    ``in_progress``. A new ingestion can therefore briefly coexist with an older
+    terminal status from the previous run. Only clear tracker entries when the
+    terminal status was written at or after the tracked ingestion start time.
+    """
+    if not source_info or source_info.get("status") not in TERMINAL_SOURCE_STATUSES:
+        return False
+
+    tracked_started_at = _parse_status_timestamp(tracked_ingestion.get("started_at"))
+    source_last_updated = _parse_status_timestamp(source_info.get("last_updated"))
+    source_started_at = _parse_status_timestamp(source_info.get("started_at"))
+
+    if tracked_started_at and source_last_updated:
+        return source_last_updated >= tracked_started_at
+
+    if tracked_started_at and source_started_at:
+        return source_started_at > tracked_started_at
+
+    # Fall back to clearing only when we do not have a trustworthy tracker start
+    # timestamp. When a tracked start exists but the source metadata is missing
+    # timestamps, keep the entry to avoid dropping a brand-new ingestion.
+    return tracked_started_at is None
+
+
 class SourceStatusManager:
     """
     Manages source status tracking for a knowledge graph.

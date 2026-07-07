@@ -3342,7 +3342,60 @@ class Method:
 
         # Get all active ingestions
         active_ingestions = self.ingestion_tracker.get_active_ingestions()
-        tracker_status = self.ingestion_tracker.get_status()
+        sources_status = {}
+        stale_task_ids = []
+
+        # Reconcile the tracker with sources_status.json for this inventory. A stop can
+        # update the source status before the tracker slot is cleaned up, which makes the
+        # drawer show a ghost "in progress" banner after refresh.
+        if graph_path and project_id and application_id:
+            try:
+                from ..utils.source_status import (
+                    SourceStatusManager,
+                    should_clear_tracked_ingestion,
+                )
+
+                graph_dir = str(Path(graph_path).parent)
+                status_manager = SourceStatusManager(graph_dir)
+                sources_status = status_manager.get_sources()
+
+                for ing in active_ingestions:
+                    if (
+                        str(ing.get("project_id")) != str(project_id)
+                        or str(ing.get("application_id")) != str(application_id)
+                    ):
+                        continue
+
+                    source_info = sources_status.get(str(ing.get("toolkit_id")))
+                    if should_clear_tracked_ingestion(source_info, ing):
+                        task_id = ing.get("task_id")
+                        if task_id:
+                            stale_task_ids.append(task_id)
+
+                for task_id in stale_task_ids:
+                    self.ingestion_tracker.release_slot(task_id)
+
+                if stale_task_ids:
+                    stale_task_ids_set = set(stale_task_ids)
+                    active_ingestions = [
+                        ing for ing in active_ingestions
+                        if ing.get("task_id") not in stale_task_ids_set
+                    ]
+                    log.info(
+                        "Cleared stale ingestion tracker entries for project=%s application=%s: %s",
+                        project_id,
+                        application_id,
+                        stale_task_ids,
+                    )
+            except Exception as reconcile_error:
+                log.debug("Could not reconcile tracker against source status: %s", reconcile_error)
+
+        tracker_status = {
+            "max_parallel": self.ingestion_tracker.max_parallel,
+            "active_count": len(active_ingestions),
+            "available_slots": max(0, self.ingestion_tracker.max_parallel - len(active_ingestions)),
+            "active_ingestions": active_ingestions,
+        }
         if _is_ingestion_jobs_enabled():
             try:
                 from inventory.k8s_ingestion_job_manager import get_ingestion_job_manager
@@ -3369,12 +3422,14 @@ class Method:
         # If tracker progress is not available, fall back to sources_status.json.
         if current_ingestion and graph_path and not current_ingestion.get("progress_message"):
             try:
-                from pathlib import Path
-                from ..utils.source_status import SourceStatusManager
-                # graph_path is the full path to graph.json, but SourceStatusManager expects directory
-                graph_dir = str(Path(graph_path).parent)
-                status_manager = SourceStatusManager(graph_dir)
-                sources_status = status_manager.get_sources()
+                if not sources_status:
+                    from ..utils.source_status import SourceStatusManager
+
+                    # graph_path is the full path to graph.json, but SourceStatusManager expects directory
+                    graph_dir = str(Path(graph_path).parent)
+                    status_manager = SourceStatusManager(graph_dir)
+                    sources_status = status_manager.get_sources()
+
                 toolkit_id = str(current_ingestion.get("toolkit_id"))
                 if toolkit_id in sources_status:
                     source_info = sources_status[toolkit_id]
