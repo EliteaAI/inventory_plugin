@@ -61,6 +61,14 @@ export const sioEvents = {
   chat_leave_rooms: 'chat_leave_rooms',
   chat_enter_room: 'chat_enter_room',
   socket_validation_error: 'socket_validation_error',
+  // Multi-tenant toolkit-tool transport (deepwiki parity). Every emit carries
+  // its own per-user llm_settings (provider_worker-injected) so nothing is
+  // persisted server-side. `test_toolkit_tool` runs a single tool invocation
+  // (e.g. the inventory `ask` tool) inside a `stream_id`-keyed sio room.
+  test_toolkit_tool: 'test_toolkit_tool',
+  test_toolkit_enter_room: 'test_toolkit_enter_room',
+  test_toolkit_leave_room: 'test_toolkit_leave_room',
+  application_predict: 'application_predict',
 };
 
 /**
@@ -75,6 +83,7 @@ export const SocketMessageType = {
   AgentToolStart: 'agent_tool_start',
   AgentToolEnd: 'agent_tool_end',
   AgentToolError: 'agent_tool_error',
+  AgentOnToolNode: 'agent_on_tool_node',
   AgentLlmStart: 'agent_llm_start',
   AgentLlmChunk: 'agent_llm_chunk',
   AgentLlmEnd: 'agent_llm_end',
@@ -82,6 +91,8 @@ export const SocketMessageType = {
   AgentThinkingStepUpdate: 'agent_thinking_step_update',
   AgentException: 'agent_exception',
   References: 'references',
+  FullMessage: 'full_message',
+  PartialMessage: 'partial_message',
   Error: 'error',
   LlmError: 'llm_error',
 };

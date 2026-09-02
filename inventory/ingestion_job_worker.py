@@ -17,7 +17,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from utils.artifact_bucket import (
+    get_inventory_artifact_read_candidates,
+    resolve_inventory_artifact_bucket,
+)
+
 TERMINATION_LOG_PATH = "/dev/termination-log"
+
+# Platform HTTP request defaults (self-signed TLS by default, env-overridable; timeout
+# so a stalled platform never hangs the ingestion job).
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,38 +135,45 @@ def _is_artifact_error(data: str) -> bool:
 def _download_existing_artifacts(elitea_client, artifact_bucket: str, graph_dir: str, graph_path: str) -> None:
     """Warm the worker emptyDir from previously uploaded graph artifacts."""
     Path(graph_dir).mkdir(parents=True, exist_ok=True)
-    try:
-        graph_data = elitea_client.artifact(artifact_bucket).get("graph.json")
-        if graph_data and not _is_artifact_error(graph_data):
-            with open(graph_path, "w", encoding="utf-8") as f:
-                f.write(graph_data)
-            log.info("Downloaded existing graph.json from artifact bucket")
-    except Exception as exc:
-        log.info("No existing graph.json available: %s", exc)
+    artifact_buckets = get_inventory_artifact_read_candidates(artifact_bucket)
+
+    for candidate_bucket in artifact_buckets:
+        try:
+            graph_data = elitea_client.artifact(candidate_bucket).get("graph.json")
+            if graph_data and not _is_artifact_error(graph_data):
+                with open(graph_path, "w", encoding="utf-8") as f:
+                    f.write(graph_data)
+                log.info("Downloaded existing graph.json from artifact bucket %s", candidate_bucket)
+                break
+        except Exception as exc:
+            log.info("No existing graph.json available in %s: %s", candidate_bucket, exc)
 
     for artifact_name in ("sources_status.json",):
-        try:
-            data = elitea_client.artifact(artifact_bucket).get(artifact_name)
-            if data and not _is_artifact_error(data):
-                with open(os.path.join(graph_dir, artifact_name), "w", encoding="utf-8") as f:
-                    f.write(data)
-                log.info("Downloaded existing %s", artifact_name)
-        except Exception:
-            pass
+        for candidate_bucket in artifact_buckets:
+            try:
+                data = elitea_client.artifact(candidate_bucket).get(artifact_name)
+                if data and not _is_artifact_error(data):
+                    with open(os.path.join(graph_dir, artifact_name), "w", encoding="utf-8") as f:
+                        f.write(data)
+                    log.info("Downloaded existing %s from %s", artifact_name, candidate_bucket)
+                    break
+            except Exception:
+                pass
 
-    try:
-        artifacts = elitea_client.artifact(artifact_bucket).list(return_as_string=False)
-        for artifact_info in artifacts or []:
-            if isinstance(artifact_info, dict):
-                name = artifact_info.get("name", "")
-                if name.startswith(".ingestion-checkpoint-"):
-                    data = elitea_client.artifact(artifact_bucket).get(name)
-                    if data and not _is_artifact_error(data):
-                        with open(os.path.join(graph_dir, os.path.basename(name)), "w", encoding="utf-8") as f:
-                            f.write(data)
-                        log.info("Downloaded existing checkpoint %s", name)
-    except Exception as exc:
-        log.debug("No checkpoint artifacts available: %s", exc)
+    for candidate_bucket in artifact_buckets:
+        try:
+            artifacts = elitea_client.artifact(candidate_bucket).list(return_as_string=False)
+            for artifact_info in artifacts or []:
+                if isinstance(artifact_info, dict):
+                    name = artifact_info.get("name", "")
+                    if name.startswith(".ingestion-checkpoint-"):
+                        data = elitea_client.artifact(candidate_bucket).get(name)
+                        if data and not _is_artifact_error(data):
+                            with open(os.path.join(graph_dir, os.path.basename(name)), "w", encoding="utf-8") as f:
+                                f.write(data)
+                            log.info("Downloaded existing checkpoint %s from %s", name, candidate_bucket)
+        except Exception as exc:
+            log.debug("No checkpoint artifacts available in %s: %s", candidate_bucket, exc)
 
 
 def _upload_output_artifacts(elitea_client, artifact_bucket: str, graph_dir: str, graph_path: str, toolkit_name: str, success: bool) -> Dict[str, bool]:
@@ -204,7 +221,10 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
     platform_token = os.environ.get("AI_RUN_PLATFORM_TOKEN", "") or input_data.get("platform_token", "")
     inventory_settings = input_data.get("inventory_settings") or {}
     ingestion_config = input_data.get("ingestion_config") or {}
-    artifact_bucket = input_data.get("artifact_bucket") or inventory_settings.get("toolkit_configuration_bucket") or "graphs"
+    artifact_bucket = resolve_inventory_artifact_bucket(
+        input_data.get("artifact_bucket"),
+        inventory_settings.get("toolkit_configuration_bucket"),
+    )
 
     if not graph_path or not graph_dir:
         raise ValueError("graph_path is required")
@@ -219,10 +239,13 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
         inventory_url = f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
-        response = http_requests.get(inventory_url, headers=elitea_client.headers, verify=False)
+        response = http_requests.get(inventory_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
         if response.ok:
             inventory_settings = response.json().get("settings", {})
-            artifact_bucket = inventory_settings.get("toolkit_configuration_bucket") or artifact_bucket
+            artifact_bucket = resolve_inventory_artifact_bucket(
+                inventory_settings.get("toolkit_configuration_bucket"),
+                artifact_bucket,
+            )
 
     llm_model = (
         inventory_settings.get("toolkit_configuration_llm_model")
@@ -233,7 +256,7 @@ def run_ingestion(job_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("No LLM model configured for inventory ingestion")
 
     toolkit_url = f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
-    response = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+    response = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
     if not response.ok:
         raise RuntimeError(f"Failed to fetch source toolkit {toolkit_id}: {response.status_code} - {response.text}")
     toolkit_data = response.json()

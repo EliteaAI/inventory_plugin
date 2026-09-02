@@ -12,8 +12,10 @@ Provides a self-contained chat interface for the inventory knowledge graph.
 """
 
 import json
+import os
 import uuid
 import time
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,10 +50,35 @@ from ..utils.langfuse_callback import (
     langfuse_trace_context,
 )
 
+# Platform HTTP request defaults. The internal platform commonly terminates TLS with
+# self-signed certs, so verification defaults off but is env-overridable
+# (``INVENTORY_PLATFORM_VERIFY_SSL=true``); every platform call also carries a timeout so
+# a stalled platform can never hang a worker thread indefinitely.
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
+
 
 class ChatCancelledException(Exception):
     """Raised when a chat session is cancelled by the user."""
     pass
+
+
+# Per-(project_id, model_name) cache of the platform's ``openai_compatible`` flag.
+# A Claude model served via a LiteLLM OpenAI-passthrough backend must be built with
+# ChatOpenAI (not ChatAnthropic): against the passthrough the Anthropic-native
+# /v1/messages dialect drops tool_use blocks (the model narrates "I'll search..." but
+# never actually calls the tool). The platform stamps this flag into ``llm_settings``
+# on the agent path (pylon_main ``test_toolkit_tool_sio``); the inventory chat runs on
+# the DIRECT path (sio handler) with no llm_settings, so it must resolve the flag
+# itself from the platform model registry. Flags are effectively static, so cache
+# until restart.
+_OPENAI_COMPAT_CACHE = {}
+_OPENAI_COMPAT_CACHE_LOCK = threading.Lock()
+
+
+def _coerce_openai_compatible(value):
+    """Normalize the platform's openai_compatible value (bool OR 'true'/'false' string)."""
+    return value is True or str(value).strip().lower() in ("true", "1", "yes")
 
 
 class InventoryChatCallback:
@@ -90,6 +117,11 @@ class InventoryChatCallback:
         # Token tracking - accumulate across all LLM calls
         self.total_tokens_in = 0
         self.total_tokens_out = 0
+        # When True, relabel a "ChatOpenAI" LLM step (a Claude model built via the
+        # OpenAI-compatible passthrough) to "ChatAnthropic" so the streaming chip matches
+        # the provider the user selected. Set by inventory_chat once the model is known.
+        self.llm_is_anthropic = False
+        self.llm_display_label = None
 
     def check_cancelled(self):
         """Check if cancelled and raise exception if so."""
@@ -136,6 +168,14 @@ class InventoryChatCallback:
         invocation_params = kwargs.get("invocation_params", {})
         if not model_name and invocation_params:
             model_name = invocation_params.get("model_name") or invocation_params.get("model")
+
+        # In OpenAI-compatible passthrough mode a Claude model is built as ChatOpenAI, so the
+        # auto-detected class name reads "ChatOpenAI" -- misleading for a model the user picked
+        # as Anthropic (people read it as a bug). Relabel to the provider-consistent name.
+        if self.llm_display_label:
+            model_name = self.llm_display_label
+        elif self.llm_is_anthropic and (not model_name or model_name == "ChatOpenAI"):
+            model_name = "ChatAnthropic"
 
         # Store LLM run info for later
         self.tool_runs[run_id] = {
@@ -273,6 +313,7 @@ class InventoryChatCallback:
 
         self.emit("llm_end", {
             "run_id": run_id,
+            "model": llm_info.get("name"),
             "output": output_content[:1000] if output_content else "",  # Truncate output
             "duration_ms": int(duration * 1000),
             "has_thinking": bool(thinking_content),
@@ -391,6 +432,76 @@ class Method:
     """
 
     @web.method()
+    def _resolve_openai_compatible(self, elitea_client, model_name):
+        """Return whether ``model_name`` is an OpenAI-compatible model for this project.
+
+        Mirrors pylon_main ``test_toolkit_tool_sio``: match the model in the platform's
+        configurations model list (private + shared) and read its ``openai_compatible``
+        flag. The flag decides whether the SDK's ``get_llm`` builds ChatOpenAI (correct
+        for Claude-via-LiteLLM-passthrough) or ChatAnthropic. Best-effort and cached per
+        (project_id, model_name); on any failure returns False (the SDK default).
+        """
+        if not model_name or elitea_client is None:
+            return False
+        project_id = getattr(elitea_client, "project_id", None)
+        key = (str(project_id), str(model_name))
+        with _OPENAI_COMPAT_CACHE_LOCK:
+            if key in _OPENAI_COMPAT_CACHE:
+                return _OPENAI_COMPAT_CACHE[key]
+        result = False
+        try:
+            import requests as http_requests
+            models_url = (
+                f"{elitea_client.base_url}/api/v2/configurations/models/"
+                f"{project_id}?include_shared=true"
+            )
+            resp = http_requests.get(
+                models_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=5
+            )
+            if resp.ok:
+                for item in resp.json().get("items", []):
+                    if item.get("name") == model_name:
+                        result = _coerce_openai_compatible(item.get("openai_compatible", False))
+                        break
+            else:
+                log.warning(
+                    "[inventory_chat] models fetch for openai_compatible returned %s",
+                    resp.status_code,
+                )
+        except Exception as e:
+            log.warning(
+                "[inventory_chat] Failed to resolve openai_compatible for %s: %s",
+                model_name, e,
+            )
+        with _OPENAI_COMPAT_CACHE_LOCK:
+            _OPENAI_COMPAT_CACHE[key] = result
+        log.info(
+            "[inventory_chat] openai_compatible(%s) = %s", model_name, result
+        )
+        return result
+
+    @web.method()
+    def _llm_display_label(self, llm_model=None, llm_settings=None, settings=None):
+        """Return the provider-style chat chip label for the selected model."""
+        parts = [llm_model]
+        for source in (llm_settings, settings):
+            if isinstance(source, dict):
+                parts.extend([
+                    source.get("provider"),
+                    source.get("model_provider"),
+                    source.get("custom_llm_provider"),
+                    source.get("toolkit_configuration_llm_provider"),
+                    source.get("llm_provider"),
+                    source.get("model_name"),
+                ])
+        text = " ".join(str(part).lower() for part in parts if part)
+        if "anthropic" in text or "claude" in text:
+            return "ChatAnthropic"
+        if "openai" in text or "gpt" in text:
+            return "ChatOpenAI"
+        return None
+
+    @web.method()
     def inventory_chat(
         self,
         project_id: int,
@@ -403,6 +514,7 @@ class Method:
         model: Optional[str] = None,
         user_id: Optional[str] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        llm_settings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute a chat query against the inventory knowledge graph.
@@ -440,7 +552,11 @@ class Method:
         log.info(f"[inventory_chat] Starting chat session {session_id}")
         log.info(f"[inventory_chat] project_id={project_id}, toolkit_id={toolkit_id}")
         log.info(f"[inventory_chat] prompt: {prompt[:100]}...")
-        log.info(f"[inventory_chat] filters: {filters}")
+        filter_summary = {
+            key: len(value) if isinstance(value, list) else value
+            for key, value in filters.items()
+        }
+        log.info("[inventory_chat] filter summary: %s", filter_summary)
 
         # Track entities accessed during execution (shared across all tracking)
         touched_entities = []
@@ -504,7 +620,12 @@ class Method:
 
         try:
             # 1. Get EliteAClient for platform API
-            elitea_client = self._get_elitea_client(project_id)
+            #
+            # Prefer per-request ``llm_settings`` (agent/provider_worker path); on the
+            # direct UI path (chat/stream SSE, sio) these are absent, so the client is
+            # resolved from the durable per-project credential stamp a prior ingestion
+            # persisted. Either way no deployment-time token is required.
+            elitea_client = self._get_elitea_client(project_id, llm_settings)
             if not elitea_client:
                 return {
                     "answer": "",
@@ -516,7 +637,7 @@ class Method:
             # 2. Fetch inventory toolkit settings
             import requests as http_requests
             toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}"
-            resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+            resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
 
             if not resp.ok:
                 return {
@@ -556,6 +677,18 @@ class Method:
                 "gpt-4o-mini"
             )
             log.info(f"[inventory_chat] Using LLM model: {llm_model} (requested: {model})")
+
+            # Resolve whether this model is OpenAI-compatible (Claude-via-LiteLLM
+            # passthrough). Drives ChatOpenAI vs ChatAnthropic in get_llm; without it
+            # such models build ChatAnthropic and tool calls silently fail.
+            openai_compat = self._resolve_openai_compatible(elitea_client, llm_model)
+
+            # Relabel the streaming step to the provider-consistent class name: in passthrough
+            # mode a Claude model is built as ChatOpenAI, so the chip would otherwise read
+            # "ChatOpenAI" for an Anthropic model. The callback emits "ChatAnthropic" instead.
+            _llm_lower = (llm_model or "").lower()
+            callback.llm_is_anthropic = ("claude" in _llm_lower or "anthropic" in _llm_lower)
+            callback.llm_display_label = self._llm_display_label(llm_model, llm_settings, settings)
 
             # 4. Get graph path
             graph_path = f"/data/graphs/{project_id}/{toolkit_id}/graph.json"
@@ -608,7 +741,7 @@ class Method:
             try:
                 routing_llm = elitea_client.get_llm(
                     model_name=llm_model,
-                    model_config={"temperature": 0, "max_tokens": 20},
+                    model_config={"temperature": 0, "max_tokens": 20, "openai_compatible": openai_compat},
                 )
             except Exception:
                 routing_llm = None
@@ -644,12 +777,14 @@ class Method:
             model_config = {
                 "temperature": DEFAULT_LLM_TEMPERATURE,
                 "max_tokens": DEFAULT_LLM_MAX_TOKENS,
+                "openai_compatible": openai_compat,
             }
 
-            # Enable extended thinking for Claude models that support it
-            # Claude 3.5 Sonnet and Claude 3 Opus support extended thinking
+            # Enable extended thinking for native Claude models that support it (Claude
+            # 3.5 Sonnet / Claude 3 Opus). Skip for OpenAI-compatible models: the
+            # Anthropic-native `thinking` param is built as ChatOpenAI there and rejected.
             llm_model_lower = llm_model.lower()
-            if "claude" in llm_model_lower and ("sonnet" in llm_model_lower or "opus" in llm_model_lower):
+            if (not openai_compat) and "claude" in llm_model_lower and ("sonnet" in llm_model_lower or "opus" in llm_model_lower):
                 log.info(f"[inventory_chat] Enabling extended thinking for {llm_model}")
                 model_config["thinking"] = {
                     "type": "enabled",
@@ -2225,10 +2360,16 @@ class Method:
                             tool_args = tc.get("args", {})
                             # Format args nicely
                             if isinstance(tool_args, dict):
-                                # Filter out empty/default args
-                                filtered_args = {k: v for k, v in tool_args.items()
-                                               if v and k != "__arg1"}
-                                input_str = json.dumps(filtered_args, indent=2) if filtered_args else "{}"
+                                # Preserve meaningful single-argument tools; hiding
+                                # __arg1 makes final chips read as an empty input.
+                                filtered_args = {
+                                    key: value for key, value in tool_args.items()
+                                    if value not in (None, "", [], {})
+                                }
+                                if set(filtered_args) == {"__arg1"}:
+                                    input_str = str(filtered_args["__arg1"])
+                                else:
+                                    input_str = json.dumps(filtered_args, indent=2) if filtered_args else "{}"
                             else:
                                 input_str = str(tool_args)
 
@@ -2382,7 +2523,7 @@ class Method:
             try:
                 # Fetch toolkit configuration from platform with expand=true to get expanded credentials
                 toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{source_toolkit_id}?expand=true"
-                resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=False)
+                resp = http_requests.get(toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
 
                 if not resp.ok:
                     log.warning(f"[_get_source_toolkit_tools] Failed to fetch toolkit {source_toolkit_id}: {resp.status_code}")
@@ -2413,7 +2554,11 @@ class Method:
                 # Get LLM for tools that need it
                 llm = elitea_client.get_llm(
                     model_name=llm_model,
-                    model_config={"temperature": DEFAULT_LLM_TEMPERATURE, "max_tokens": DEFAULT_TOOL_LLM_MAX_TOKENS},
+                    model_config={
+                        "temperature": DEFAULT_LLM_TEMPERATURE,
+                        "max_tokens": DEFAULT_TOOL_LLM_MAX_TOKENS,
+                        "openai_compatible": self._resolve_openai_compatible(elitea_client, llm_model),
+                    },
                 )
 
                 # Instantiate toolkit tools using elitea-sdk

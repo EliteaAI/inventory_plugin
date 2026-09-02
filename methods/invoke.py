@@ -21,6 +21,144 @@ def _is_ingestion_jobs_enabled() -> bool:
     """Check whether run_ingestion should be delegated to K8s Jobs."""
     return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
 
+
+# Platform HTTP request defaults. The internal platform commonly terminates TLS with
+# self-signed certs, so verification defaults off but is env-overridable
+# (``INVENTORY_PLATFORM_VERIFY_SSL=true``); every platform call also carries a timeout so
+# a stalled platform can never hang a worker thread indefinitely.
+_PLATFORM_VERIFY_SSL = os.environ.get("INVENTORY_PLATFORM_VERIFY_SSL", "false").lower() == "true"
+_PLATFORM_HTTP_TIMEOUT = int(os.environ.get("INVENTORY_PLATFORM_HTTP_TIMEOUT", "30"))
+
+
+def _is_task_interruption(exception) -> bool:
+    """Return True when the exception represents a user-requested task stop."""
+    return exception.__class__.__name__ == "InterruptTaskThread"
+
+
+def _platform_settings_from_llm_settings(llm_settings):
+    """Derive platform base URL, auth token and project_id from per-request ``llm_settings``.
+
+    The platform (``provider_worker`` in ``pylon_indexer``) injects an ``llm_settings``
+    dict into every tool invocation. The JWT it carries (``api_key``) authorizes not only
+    LLM calls but the platform's artifact/toolkit REST APIs as well, and the platform base
+    URL can be recovered by stripping the ``/llm[/api][/vN]`` suffix from ``api_base``.
+    Building the EliteAClient from this dict -- instead of a deployment-time token -- is what
+    lets the inventory provider operate against any project (including private ones) with no
+    per-deployment configuration, mirroring the deepwiki provider's ``extract_artifact_settings``.
+
+    Returns ``{"base_url", "api_key", "project_id"}`` or ``None`` when the dict does not
+    carry a usable ``api_base``/``api_key`` pair.
+    """
+    if not isinstance(llm_settings, dict):
+        return None
+    api_base = llm_settings.get("api_base") or llm_settings.get("openai_api_base") or ""
+    api_key = llm_settings.get("api_key") or llm_settings.get("openai_api_key") or ""
+    if not api_base or not api_key:
+        return None
+    project_id = (
+        llm_settings.get("organization")
+        or llm_settings.get("openai_organization")
+        or llm_settings.get("project_id")
+        or ""
+    )
+    base_url = re.sub(r"/llm(/api)?(/v\d+)?/?$", "", api_base).rstrip("/")
+    return {"base_url": base_url, "api_key": api_key, "project_id": str(project_id)}
+
+
+def _string_list(value):
+    """Normalize descriptor string/list arguments into a clean list of strings."""
+    if isinstance(value, list):
+        return [
+            str(item).strip()
+            for item in value
+            if isinstance(item, (str, int, float))
+            and not isinstance(item, bool)
+            and str(item).strip()
+        ]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _chat_filters_from_params(params):
+    """Build inventory chat filters from tool parameters."""
+    params = params or {}
+    filters = {}
+    for key in ("entity_types", "sources", "layers"):
+        values = _string_list(params.get(key))
+        if values:
+            filters[key] = values
+    filters["depth"] = params.get("depth", 2)
+    filters["max_nodes"] = params.get("max_nodes", 500)
+    return filters
+
+
+def _chat_history_from_param(raw_history):
+    """Parse the optional JSON-encoded chat history argument."""
+    if isinstance(raw_history, list):
+        return raw_history
+    if not isinstance(raw_history, str) or not raw_history.strip():
+        return []
+    try:
+        parsed = json.loads(raw_history)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _tool_node_custom_event(run_id, label, kind, status, args=None, result=None, duration_ms=None):
+    """Return the cross-process custom event consumed by platform agent_on_tool_node."""
+    return {
+        "name": "on_tool_node",
+        "data": {
+            "input_variables": {"tool": label, "kind": kind, "args": args},
+            "tool_result": result,
+            "state": {
+                "run_id": str(run_id) if run_id else None,
+                "status": status,
+                "duration_ms": duration_ms,
+            },
+        },
+    }
+
+
+def _chat_callback_custom_event(event_type, payload):
+    """Map InventoryChatCallback events to platform custom events."""
+    payload = payload or {}
+    run_id = payload.get("run_id")
+    if event_type == "tool_start":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "processing",
+            args=payload.get("input"),
+        )
+    if event_type == "tool_end":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "complete",
+            result=payload.get("output_preview"),
+            duration_ms=payload.get("duration_ms"),
+        )
+    if event_type == "tool_error":
+        return _tool_node_custom_event(
+            run_id, payload.get("tool_name") or "tool", "tool", "error",
+            result=payload.get("error"),
+        )
+    if event_type == "llm_start":
+        return _tool_node_custom_event(
+            run_id, payload.get("model") or "LLM", "llm", "processing",
+        )
+    if event_type == "llm_end":
+        return _tool_node_custom_event(
+            run_id, payload.get("model"), "llm", "complete",
+            result=payload.get("output"),
+            duration_ms=payload.get("duration_ms"),
+        )
+    if event_type == "thinking_step" and not payload.get("is_reasoning_token"):
+        message = payload.get("message")
+        if message:
+            return {"name": "thinking_step_update", "data": {"message": message}}
+    return None
+
+
 # Add plugin directory to Python path for local inventory module
 plugin_dir = Path(__file__).parent.parent
 if str(plugin_dir) not in sys.path:
@@ -29,8 +167,16 @@ if str(plugin_dir) not in sys.path:
 # Import CANONICAL_TYPES for smart normalization
 try:
     from ..constants import CANONICAL_TYPES
+    from ..utils.artifact_bucket import (
+        get_inventory_artifact_read_candidates,
+        resolve_inventory_artifact_bucket,
+    )
 except ImportError:
     from plugins.inventory_plugin.constants import CANONICAL_TYPES
+    from plugins.inventory_plugin.utils.artifact_bucket import (
+        get_inventory_artifact_read_candidates,
+        resolve_inventory_artifact_bucket,
+    )
 
 
 class Method:
@@ -120,49 +266,134 @@ class Method:
         }
 
     @web.method()
-    def _get_elitea_client(self, project_id: int):
-        """Create EliteAClient instance for platform API calls.
+    def _invocation_event_sink(self):
+        """Create a thread-safe writer for the current async invocation's event buffer."""
+        try:
+            import tasknode_task
+
+            task_id = tasknode_task.id
+            task_meta = tasknode_task.meta or {}
+            toolkit_name = task_meta.get("toolkit_name", "Toolkit")
+            tool_name = task_meta.get("tool_name", "tool")
+        except Exception:  # pragma: no cover - no task context in direct/unit paths
+            task_id = None
+            toolkit_name = None
+            tool_name = None
+
+        invocation_state = getattr(self, "invocation_state", None)
+        state_lock = getattr(self, "state_lock", None)
+
+        def write_event(name, data):
+            if not task_id or invocation_state is None or state_lock is None:
+                return
+            try:
+                with state_lock:
+                    task_state = (
+                        invocation_state.get(toolkit_name, {})
+                        .get(tool_name, {})
+                        .get(task_id)
+                    )
+                    if task_state is None:
+                        return
+                    task_state.setdefault("custom_events", []).append(
+                        {"name": name, "data": data}
+                    )
+            except Exception:  # pragma: no cover - streaming must never fail the tool
+                pass
+
+        return write_event
+
+    @web.method()
+    def _resolve_platform_settings(self, llm_settings=None, project_id=None):
+        """Resolve ``(base_url, auth_token, project_id)`` for platform API calls.
+
+        Prefers per-request credentials derived from ``llm_settings`` (config-independent --
+        works for any project, including private ones, without a deployment-time token, and
+        with nothing persisted server-side). Falls back to the deployment config (see
+        ``_get_platform_connection_settings``) only for call paths that carry no
+        ``llm_settings`` -- e.g. scheduled/internal maintenance ops. The interactive UI chat
+        and ingestion both flow through the platform ``test_toolkit_tool`` path, which always
+        injects a per-user ``llm_settings``, so they never depend on the fallback.
+        """
+        derived = _platform_settings_from_llm_settings(llm_settings)
+        if derived:
+            resolved_pid = derived["project_id"] or project_id
+            log.info(
+                "Platform settings resolved from per-request llm_settings (base_url=%s, project_id=%s)",
+                derived["base_url"], resolved_pid,
+            )
+            return derived["base_url"], derived["api_key"], resolved_pid
+        base_url, token = self._get_platform_connection_settings()
+        log.info(
+            "Platform settings resolved from deployment config (base_url=%s, has_token=%s, llm_settings_present=%s)",
+            base_url, bool(token), bool(isinstance(llm_settings, dict) and llm_settings),
+        )
+        return base_url, token, project_id
+
+    @web.method()
+    def _get_elitea_client(self, project_id, llm_settings=None):
+        """Create an EliteAClient instance for platform API calls.
+
+        When ``llm_settings`` (injected by the platform on every tool invocation) carries a
+        usable JWT and base URL, the client is scoped to the calling user/project and no
+        deployment-time token is required. Otherwise falls back to the deployment
+        ``platform_api_url`` / ``ai_run_platform_token`` config.
 
         Args:
-            project_id: The project ID to use for the client
+            project_id: The project ID to use for the client.
+            llm_settings: Per-request LLM settings dict expanded by the platform.
 
         Returns:
-            EliteAClient instance or None if platform config is missing
+            EliteAClient instance or None if no credentials could be resolved.
         """
         from elitea_sdk.runtime.clients.client import EliteAClient
 
-        platform_api_url = self.descriptor.config.get("platform_api_url", "")
-        platform_token = self.descriptor.config.get("ai_run_platform_token", "")
+        base_url, auth_token, resolved_project_id = self._resolve_platform_settings(
+            llm_settings, project_id
+        )
 
-        # Fallback: derive platform URL from app_url if platform_api_url not set
-        if not platform_api_url:
-            app_url = self.descriptor.config.get("app_url", "")
-            if app_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(app_url)
-                platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
-
-        if not platform_api_url or not platform_token:
+        if not base_url or not auth_token:
             log.warning("Platform API URL or token not configured")
+            return None
+        if not resolved_project_id:
+            log.warning("Cannot construct EliteAClient: project_id is missing")
             return None
 
         return EliteAClient(
-            base_url=platform_api_url.rstrip("/"),
-            project_id=int(project_id),
-            auth_token=platform_token,
+            base_url=base_url.rstrip("/"),
+            project_id=int(resolved_project_id),
+            auth_token=auth_token,
         )
 
     @web.method()
     def _get_platform_connection_settings(self):
-        """Return platform URL/token from plugin config with app_url fallback."""
-        platform_api_url = self.descriptor.config.get("platform_api_url", "")
-        platform_token = self.descriptor.config.get("ai_run_platform_token", "")
+        """Return platform base URL/token from plugin config.
+
+        The EliteA API base URL is resolved from the first available config source:
+        explicit ``platform_api_url``, else the host of ``ai_run_platform_url`` (the
+        descriptor-registration endpoint), else the host of ``service_location_url`` /
+        ``app_url``. The token comes from ``ai_run_platform_token``. Inventory configs
+        commonly leave ``platform_api_url`` unset and only provide ``service_location_url``
+        (``${APP_URL}``) plus ``ai_run_platform_url`` (``${AI_RUN_PLATFORM_URL}``), so this
+        host-derivation fallback is required for the UI/REST path (which carries no
+        per-request ``llm_settings``) to build an EliteAClient.
+        """
+        from urllib.parse import urlparse
+
+        config = self.descriptor.config
+        platform_api_url = config.get("platform_api_url", "")
+        platform_token = config.get("ai_run_platform_token", "")
+
         if not platform_api_url:
-            app_url = self.descriptor.config.get("app_url", "")
-            if app_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(app_url)
-                platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
+            for key in ("ai_run_platform_url", "service_location_url", "app_url"):
+                candidate = config.get(key, "")
+                if not candidate:
+                    continue
+                parsed = urlparse(candidate)
+                if parsed.scheme and parsed.hostname:
+                    platform_api_url = f"{parsed.scheme}://{parsed.hostname}"
+                    break
+
         return platform_api_url.rstrip("/"), platform_token
 
     @web.method()
@@ -190,14 +421,16 @@ class Method:
             toolkit_params = request_data.get("configuration", {}).get("parameters", {})
             tool_params = request_data.get("parameters", {})
 
-            log.info(f"Toolkit params: {toolkit_params}")
-            log.info(f"Tool params: {tool_params}")
-
             # Merge parameters (tool params override toolkit params)
             params = toolkit_params.copy()
             for key, value in tool_params.items():
                 if key not in params or value:
                     params[key] = value
+
+            # Key-only at debug level: these dicts carry secrets (LLM JWT, source
+            # credentials, DB connection strings) and must never be logged verbatim.
+            log.debug("Toolkit param keys: %s", list(toolkit_params.keys()))
+            log.debug("Tool param keys: %s", list(tool_params.keys()))
 
             # Route to appropriate handler based on toolkit type
             if toolkit_name == "inventory_search":
@@ -217,12 +450,12 @@ class Method:
     @web.method()
     def _handle_inventory_tool(self, invocation_id, tool_name, params, request_data):
         """Handle all inventory toolkit tools"""
-        log.info(f"[DEBUG] _handle_inventory_tool called: tool_name={tool_name}")
-        log.info(f"[DEBUG] params: {params}")
-        log.info(f"[DEBUG] config keys: {request_data.get('configuration', {}).keys()}")
-        
+        log.debug("[inventory] handling tool: %s", tool_name)
+
         # Tool routing map
         tools = {
+            # Conversational / agentic
+            "ask": self._tool_ask,
             # Ingestion tools
             "run_ingestion": self._tool_run_ingestion,
             "delta_update": self._tool_delta_update,
@@ -271,31 +504,138 @@ class Method:
                 include_traceback=False,
             )
 
-        # Get graph path from project and application IDs
+        # Resolve project/application context. The direct UI REST path supplies
+        # project_id/application_id under "configuration"; the platform
+        # (test_toolkit_tool) path supplies them only as tool params and carries
+        # per-request credentials under configuration.parameters.llm_settings, from
+        # whose "organization" claim project_id can also be derived.
         config = request_data.get("configuration", {})
+        llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
-
-        log.info(f"[DEBUG] Extracted project_id={project_id}, application_id={application_id}")
+        if not project_id and isinstance(llm_settings, dict):
+            project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
         # Construct graph path: /data/graphs/<project_id>/<application_id>/graph.json
         graph_path = None
         if project_id and application_id:
             graph_path = f"/data/graphs/{project_id}/{application_id}/graph.json"
 
-        log.info(f"[DEBUG] Constructed graph_path: {graph_path}")
+        log.debug("[inventory] tool=%s project_id=%s application_id=%s graph_path=%s",
+                  tool_name, project_id, application_id, graph_path)
 
         # Track cache access for this graph (using project_id and application_id as keys)
         if project_id and application_id:
             self.cache_manager.touch(str(project_id), str(application_id))
 
-        # Execute tool
-        result = tools[tool_name](params, graph_path, request_data)
+        # Execute tool. The conversational `ask` tool runs the LLM chat agent,
+        # which derives its own graph path from project/application IDs and consumes
+        # the per-request llm_settings, so it takes a different signature than the
+        # graph_path-based tools.
+        if tool_name == "ask":
+            result = self._tool_ask(params, project_id, application_id, request_data)
+        else:
+            result = tools[tool_name](params, graph_path, request_data)
 
         # Handle tuple returns (result, artifacts)
         if isinstance(result, tuple):
             return self._create_success_response(invocation_id, result[0], result[1])
         return self._create_success_response(invocation_id, result)
+
+    @web.method()
+    def _tool_ask(self, params, project_id, toolkit_id, request_data):
+        """Conversational agent tool — answer a question about the knowledge graph.
+
+        This is the multi-tenant, config-independent chat entrypoint. It runs the
+        same LLM agent as the UI chat (``inventory_chat``) on the platform
+        ``test_toolkit_tool`` path, so the per-request ``llm_settings`` injected by
+        provider_worker (api_key / api_base / organization) authorize both the LLM
+        and graph/artifact access. No credentials are read from or written to disk.
+
+        Inner agent progress (LLM calls plus knowledge-graph tool input/output) is
+        streamed to the UI through ``on_tool_node`` custom events. ``provider_worker``
+        polls those events from the async invocation and re-dispatches them as
+        ``agent_on_tool_node`` socket events. This method returns the final structured
+        result (answer + citations + touched entities + token usage) as a JSON string
+        so the UI can render citations and highlight touched graph nodes.
+        """
+
+        question = params.get("question") or params.get("query") or params.get("prompt")
+        if not question:
+            return json.dumps({
+                "error": "Missing required parameter: question",
+                "answer": "",
+                "citations": [],
+            })
+
+        raw_history = params.get("chat_history")
+        history = _chat_history_from_param(raw_history)
+        if raw_history and not history:
+            log.warning("[ask] Could not parse chat_history JSON; ignoring")
+
+        # Search filters are tool invocation arguments, not toolkit configuration.
+        # The platform expands the inventory toolkit's configured ``sources`` IDs
+        # into full toolkit objects under configuration.parameters. Reading filters
+        # from the merged ``params`` namespace would stringify those objects and
+        # filter every graph result out because citations contain source names only.
+        filters = _chat_filters_from_params(request_data.get("parameters", {}))
+
+        log.info(
+            "[ask] project_id=%s toolkit_id=%s history=%d question=%r",
+            project_id, toolkit_id, len(history), question[:100],
+        )
+
+        # ── Live agent streaming → chat chips ────────────────────────────────
+        # inventory_chat drives InventoryChatCallback, which calls this emit_fn for
+        # every LLM / tool step. We forward those steps to the UI as ``on_tool_node``
+        # custom events (carrying the tool/model name, its input and its result).
+        # provider_worker polls them and re-dispatches so the platform maps them to
+        # ``agent_on_tool_node`` and delivers them on the chat's test_toolkit_tool
+        # socket — the same channel the final answer already uses.
+        #
+        # The callbacks fire on a worker thread (elitea_sdk runs tool calls off the
+        # task greenlet), so ``tasknode_task`` is NOT in context there. We therefore
+        # resolve the task's event buffer HERE (in the greenlet) and write through a
+        # closure that holds those references directly — thread-safe via state_lock.
+        write_stream_event = self._invocation_event_sink()
+
+        def _ask_emit(event_type, payload):
+            try:
+                event = _chat_callback_custom_event(event_type, payload)
+                if event:
+                    write_stream_event(event["name"], event["data"])
+            except Exception:  # pragma: no cover - streaming must never break the run
+                pass
+
+        try:
+            result = self.inventory_chat(
+                project_id=project_id,
+                toolkit_id=toolkit_id,
+                prompt=question,
+                filters=filters,
+                conversation_id=None,
+                history=history,
+                emit_fn=_ask_emit,  # forward inner agent steps as on_tool_node chips
+                model=None,
+                llm_settings=params.get("llm_settings"),
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            log.exception(f"[ask] Error: {e}")
+            return json.dumps({
+                "error": str(e),
+                "answer": "",
+                "citations": [],
+            })
+
+        return json.dumps({
+            "answer": result.get("answer", ""),
+            "citations": result.get("citations", []),
+            "tool_calls": result.get("tool_calls", []),
+            "touched_entities": result.get("touched_entities", []),
+            "tokens_in": result.get("tokens_in", 0),
+            "tokens_out": result.get("tokens_out", 0),
+            "error": result.get("error"),
+        })
 
     @web.method()
     def _handle_inventory_search_tool(self, invocation_id, tool_name, params, request_data):
@@ -305,9 +645,9 @@ class Method:
         read-only search/query tools for use by other agents.
         """
         log.info(f"[inventory_search] Handling tool: {tool_name}")
-        log.info(f"[inventory_search] params: {params}")
-        log.info(f"[inventory_search] request_data keys: {request_data.keys() if request_data else 'None'}")
-        log.info(f"[inventory_search] configuration: {request_data.get('configuration', {})}")
+        log.debug("[inventory_search] param keys: %s", list((params or {}).keys()))
+        log.debug("[inventory_search] request_data keys: %s", list((request_data or {}).keys()))
+        log.debug("[inventory_search] configuration keys: %s", list((request_data.get('configuration', {}) or {}).keys()))
 
         # Tool name mapping: inventory_search tool names -> internal handler names
         tool_mapping = {
@@ -454,39 +794,15 @@ class Method:
         Returns:
             Structured response with answer, citations, and token usage
         """
-        import json as json_module
-
         # Extract question
         question = params.get("question") or params.get("query") or params.get("prompt")
         if not question:
-            return json_module.dumps({
+            return json.dumps({
                 "error": "Missing required parameter: question",
                 "usage": "Provide a 'question' parameter with your investigation query"
             })
 
-        # Build filters from params
-        filters = {}
-        if params.get("entity_types"):
-            entity_types = params.get("entity_types")
-            if isinstance(entity_types, str):
-                entity_types = [t.strip() for t in entity_types.split(",")]
-            filters["entity_types"] = entity_types
-
-        if params.get("sources"):
-            sources = params.get("sources")
-            if isinstance(sources, str):
-                sources = [s.strip() for s in sources.split(",")]
-            filters["sources"] = sources
-
-        if params.get("layers"):
-            layers = params.get("layers")
-            if isinstance(layers, str):
-                layers = [l.strip() for l in layers.split(",")]
-            filters["layers"] = layers
-
-        # Search scope settings
-        filters["depth"] = params.get("depth", 2)
-        filters["max_nodes"] = params.get("max_nodes", 500)
+        filters = _chat_filters_from_params(params)
 
         log.info(f"[investigate] Question: {question[:100]}...")
         log.info(f"[investigate] Filters: {filters}")
@@ -503,6 +819,7 @@ class Method:
                 history=[],  # No history for single-shot queries
                 emit_fn=None,  # No streaming
                 model=None,  # Use toolkit's configured model
+                llm_settings=params.get("llm_settings"),  # per-request creds (config-independent)
             )
 
             # Format response
@@ -521,7 +838,7 @@ class Method:
             # Also return as formatted text for better readability
             output_format = params.get("output_format", "text")
             if output_format == "json":
-                return json_module.dumps(response, indent=2)
+                return json.dumps(response, indent=2)
 
             # Text format
             lines = []
@@ -558,7 +875,7 @@ class Method:
 
         except Exception as e:
             log.exception(f"[investigate] Error: {e}")
-            return json_module.dumps({
+            return json.dumps({
                 "error": str(e),
                 "answer": "",
                 "citations": [],
@@ -738,68 +1055,65 @@ class Method:
         return False
 
     @web.method()
-    def _download_graph_from_artifacts(self, graph_path, project_id, application_id, artifact_bucket):
+    def _download_graph_from_artifacts(self, graph_path, project_id, application_id, artifact_bucket, llm_settings=None):
         """Download graph and checkpoints from artifact bucket if not present locally"""
         import os
         from pathlib import Path
 
-        # Create EliteAClient using helper method
-        elitea_client = self._get_elitea_client(project_id)
+        # Create EliteAClient using helper method (prefers per-request llm_settings creds)
+        elitea_client = self._get_elitea_client(project_id, llm_settings)
         if not elitea_client:
             log.warning("Cannot download from artifacts: Platform API URL or token not configured")
             return False
 
         graph_dir = os.path.dirname(graph_path)
+        artifact_buckets = get_inventory_artifact_read_candidates(artifact_bucket)
 
         try:
-            # Download main graph file
             artifact_name = "graph.json"
-            log.info(f"Downloading graph from artifacts: {artifact_bucket}/{artifact_name}")
-            graph_data = elitea_client.artifact(artifact_bucket).get(artifact_name)
+            for candidate_bucket in artifact_buckets:
+                log.info("Downloading graph from artifacts: %s/%s", candidate_bucket, artifact_name)
+                graph_data = elitea_client.artifact(candidate_bucket).get(artifact_name)
 
-            if graph_data and not self._is_artifact_error(graph_data):
-                # Create directory if needed
+                if not graph_data or self._is_artifact_error(graph_data):
+                    log.debug("Graph not found in artifact bucket %s: %s", candidate_bucket, graph_data)
+                    continue
+
                 Path(graph_dir).mkdir(parents=True, exist_ok=True)
-
-                # Write graph file
                 with open(graph_path, 'w', encoding='utf-8') as f:
                     f.write(graph_data)
-                log.info(f"Downloaded graph to {graph_path}")
+                log.info("Downloaded graph to %s from artifact bucket %s", graph_path, candidate_bucket)
 
-                # Try to download sources_status.json
                 try:
-                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
+                    status_data = elitea_client.artifact(candidate_bucket).get("sources_status.json")
                     if status_data and not self._is_artifact_error(status_data):
                         status_file = os.path.join(graph_dir, "sources_status.json")
                         with open(status_file, 'w', encoding='utf-8') as f:
                             f.write(status_data)
-                        log.info(f"Downloaded sources_status.json to {status_file}")
+                        log.info("Downloaded sources_status.json to %s", status_file)
                 except Exception as e:
-                    log.debug(f"No sources_status.json found or error downloading: {e}")
+                    log.debug("No sources_status.json found or error downloading: %s", e)
 
-                # Try to download checkpoints (they may or may not exist)
                 try:
-                    # List all artifacts in the bucket to find checkpoints
-                    artifacts = elitea_client.artifact(artifact_bucket).list(return_as_string=False)
+                    artifacts = elitea_client.artifact(candidate_bucket).list(return_as_string=False)
                     checkpoint_prefix = ".ingestion-checkpoint-"
 
                     for artifact_info in artifacts:
                         if isinstance(artifact_info, dict):
                             artifact_path = artifact_info.get('name', '')
                             if artifact_path.startswith(checkpoint_prefix):
-                                checkpoint_data = elitea_client.artifact(artifact_bucket).get(artifact_path)
+                                checkpoint_data = elitea_client.artifact(candidate_bucket).get(artifact_path)
                                 if checkpoint_data and not self._is_artifact_error(checkpoint_data):
                                     checkpoint_file = os.path.join(graph_dir, os.path.basename(artifact_path))
                                     with open(checkpoint_file, 'w', encoding='utf-8') as f:
                                         f.write(checkpoint_data)
-                                    log.info(f"Downloaded checkpoint: {checkpoint_file}")
+                                    log.info("Downloaded checkpoint: %s", checkpoint_file)
                 except Exception as e:
-                    log.debug(f"No checkpoints found or error downloading checkpoints: {e}")
-                
+                    log.debug("No checkpoints found or error downloading checkpoints: %s", e)
+
                 return True
-            else:
-                log.info(f"Graph not found in artifacts: {graph_data}")
-                return False
+
+            return False
                 
         except Exception as e:
             log.warning(f"Failed to download graph from artifacts: {e}")
@@ -816,11 +1130,11 @@ class Method:
         import os
         from inventory import InventoryRetrievalApiWrapper
 
-        log.info(f"[_get_or_create_wrapper] graph_path={graph_path}, has_request_data={request_data is not None}")
+        log.debug("[_get_or_create_wrapper] graph_path=%s, has_request_data=%s", graph_path, request_data is not None)
 
         # Check if graph exists locally, if not try to download from artifacts
         if graph_path and not os.path.exists(graph_path) and request_data:
-            log.info(f"[_get_or_create_wrapper] Graph not found at {graph_path}, attempting to download from artifacts")
+            log.debug("[_get_or_create_wrapper] Graph not found at %s, attempting to download from artifacts", graph_path)
 
             # Get project and application IDs from request
             config = request_data.get("configuration", {})
@@ -828,15 +1142,19 @@ class Method:
             application_id = config.get("application_id")
             # Get artifact bucket from toolkit settings
             settings = config.get("settings", {})
-            artifact_bucket = settings.get("toolkit_configuration_bucket", "graphs")
+            artifact_bucket = resolve_inventory_artifact_bucket(
+                settings.get("toolkit_configuration_bucket"),
+            )
+            # Per-request platform creds expanded by the platform under parameters.llm_settings
+            llm_settings = config.get("parameters", {}).get("llm_settings")
 
-            log.info(f"[_get_or_create_wrapper] project_id={project_id}, application_id={application_id}, artifact_bucket={artifact_bucket}")
+            log.debug("[_get_or_create_wrapper] project_id=%s, application_id=%s, artifact_bucket=%s", project_id, application_id, artifact_bucket)
 
             if project_id and application_id:
                 download_result = self._download_graph_from_artifacts(
-                    graph_path, project_id, application_id, artifact_bucket
+                    graph_path, project_id, application_id, artifact_bucket, llm_settings
                 )
-                log.info(f"[_get_or_create_wrapper] Download result: {download_result}")
+                log.debug("[_get_or_create_wrapper] Download result: %s", download_result)
             else:
                 log.warning(f"[_get_or_create_wrapper] Cannot download from artifacts: project_id={project_id}, application_id={application_id}")
 
@@ -872,16 +1190,22 @@ class Method:
             return "Error: toolkit_id is required"
 
         if not graph_path:
-            return "Error: No graph path configured. Set bucket and graph_name in toolkit configuration."
+            return "Error: No graph path configured. Save the inventory toolkit configuration first."
 
         if _is_ingestion_jobs_enabled():
             return self._run_ingestion_job(params, graph_path, request_data)
 
-        # Get context for slot tracking
+        # Get context for slot tracking. The platform (test_toolkit_tool) path carries
+        # credentials under configuration.parameters.llm_settings but supplies project/
+        # application ids only as tool params; project_id can also be derived from the
+        # llm_settings "organization" claim.
         task_id = tasknode_task.id
         config = request_data.get("configuration", {})
+        llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
+        if not project_id and isinstance(llm_settings, dict):
+            project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
         # Try to acquire an ingestion slot
         slot_acquired = False
@@ -909,19 +1233,23 @@ class Method:
         log.info(f"[run_ingestion] ===== Starting ingestion for toolkit {toolkit_id} =====")
 
         try:
-            # Get project_id and application_id from request context
+            # Get project_id and application_id from request context (same resolution as
+            # the slot-tracking block above: config -> tool params -> llm_settings claim).
             config = request_data.get("configuration", {})
-            log.info(f"[run_ingestion] config keys: {list(config.keys())}")
+            log.debug("[run_ingestion] config keys: %s", list(config.keys()))
+            llm_settings = config.get("parameters", {}).get("llm_settings") or params.get("llm_settings")
             project_id = config.get("project_id") or params.get("project_id")
             application_id = config.get("application_id") or params.get("application_id")
+            if not project_id and isinstance(llm_settings, dict):
+                project_id = llm_settings.get("organization") or llm_settings.get("project_id")
 
             if not project_id:
                 return "Error: project_id not found in request context"
             if not application_id:
                 return "Error: application_id not found in request context"
 
-            # Create EliteAClient for platform API calls
-            elitea_client = self._get_elitea_client(project_id)
+            # Create EliteAClient for platform API calls (prefers per-request llm_settings creds)
+            elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
             if not elitea_client:
                 return "Error: Platform API URL or token not configured. Check PLATFORM_API_URL and AI_RUN_PLATFORM_TOKEN."
 
@@ -942,7 +1270,7 @@ class Method:
                 toolkit_api_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{toolkit_id}?expand=true"
                 log.info(f"[run_ingestion] Fetching toolkit from: {toolkit_api_url}")
 
-                resp = http_requests.get(toolkit_api_url, headers=elitea_client.headers, verify=False)
+                resp = http_requests.get(toolkit_api_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
                 if not resp.ok:
                     log.error(f"[run_ingestion] Failed to fetch toolkit: {resp.status_code} - {resp.text}")
                     return f"Error: Failed to fetch source toolkit {toolkit_id}: {resp.status_code}"
@@ -988,7 +1316,7 @@ class Method:
                     # Fetch raw toolkit data from platform API using correct path
                     inventory_toolkit_url = f"{elitea_client.base_url}/api/v2/elitea_core/tool/prompt_lib/{project_id}/{application_id}"
                     log.info(f"[run_ingestion] Fetching inventory toolkit from: {inventory_toolkit_url}")
-                    resp = http_requests.get(inventory_toolkit_url, headers=elitea_client.headers, verify=False)
+                    resp = http_requests.get(inventory_toolkit_url, headers=elitea_client.headers, verify=_PLATFORM_VERIFY_SSL, timeout=_PLATFORM_HTTP_TIMEOUT)
                     if resp.ok:
                         inventory_toolkit_data = resp.json()
                         inventory_settings = inventory_toolkit_data.get("settings", {})
@@ -1019,7 +1347,8 @@ class Method:
             # for future platform-level embedding features (e.g. vector store indexing).
 
             log.info(f"Using LLM model: {llm_model}")
-            log.info(f"Inventory settings: {inventory_settings}")
+            # Settings may contain source credentials/connection strings - never log values.
+            log.debug("Inventory settings keys: %s", list(inventory_settings.keys()))
 
             # Ensure graph directory exists
             graph_dir = Path(graph_path).parent
@@ -1096,6 +1425,7 @@ class Method:
                 graph_path=graph_path,
                 auto_generate_embeddings=ingestion_config.get("generate_embeddings", True),
                 progress_callback=progress_callback,
+                stop_callback=self.invocation_stop_checkpoint,
                 # Parallelization settings from config
                 max_parallel_extractions=ingestion_config.get("max_parallel_extractions", 10),
                 batch_size=ingestion_config.get("batch_size", 10),
@@ -1171,7 +1501,9 @@ class Method:
 
             # Upload graph, checkpoints, and status to artifact bucket
             # Get bucket name from toolkit settings
-            artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+            artifact_bucket = resolve_inventory_artifact_bucket(
+                inventory_settings.get("toolkit_configuration_bucket"),
+            )
             try:
                 # Upload main graph file if exists and ingestion succeeded
                 if result.success and os.path.exists(graph_path):
@@ -1237,6 +1569,29 @@ class Method:
                 return error_msg
 
         except Exception as e:
+            if _is_task_interruption(e):
+                log.info("Inventory ingestion stopped by user for toolkit %s", toolkit_id)
+                try:
+                    if 'status_manager' in locals():
+                        status_manager.stop_ingestion(
+                            toolkit_id=str(toolkit_id),
+                            documents_processed=0,
+                        )
+                        if 'elitea_client' in locals():
+                            status_file = os.path.join(str(graph_dir), "sources_status.json")
+                            if os.path.exists(status_file):
+                                with open(status_file, 'rb') as f:
+                                    status_data = f.read()
+                                stopped_artifact_bucket = resolve_inventory_artifact_bucket(
+                                    inventory_settings.get("toolkit_configuration_bucket"),
+                                )
+                                elitea_client.artifact(stopped_artifact_bucket).create(
+                                    "sources_status.json", status_data
+                                )
+                except Exception as status_error:
+                    log.warning("Failed to update source status on stop: %s", status_error)
+                raise
+
             log.exception(f"Ingestion failed for toolkit {toolkit_id}")
             # Try to mark source status as error if status_manager was initialized
             try:
@@ -1252,7 +1607,9 @@ class Method:
                         if os.path.exists(status_file):
                             with open(status_file, 'rb') as f:
                                 status_data = f.read()
-                            error_artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+                            error_artifact_bucket = resolve_inventory_artifact_bucket(
+                                inventory_settings.get("toolkit_configuration_bucket"),
+                            )
                             elitea_client.artifact(error_artifact_bucket).create("sources_status.json", status_data)
             except Exception as status_error:
                 log.warning(f"Failed to update source status on error: {status_error}")
@@ -1285,12 +1642,52 @@ class Method:
         if not application_id:
             return "Error: application_id not found in request context"
 
-        platform_url, platform_token = self._get_platform_connection_settings()
+        llm_settings = params.get("llm_settings") or {}
+        platform_url, platform_token, _ = self._resolve_platform_settings(llm_settings, project_id)
         if not platform_url or not platform_token:
             return "Error: Platform API URL or token not configured. Check platform_api_url and ai_run_platform_token."
 
+        # Resolve the inventory toolkit settings before dispatching to the worker. The
+        # platform delivers the toolkit configuration under configuration.parameters (the
+        # merged ``params``), not configuration.settings, so config.get("settings") is
+        # normally empty on the agent path. Mirror the standalone path and fetch the saved
+        # settings from the platform API when they are absent -- otherwise the worker
+        # receives empty settings and falls back to the canonical artifact bucket with no
+        # per-source configuration (file patterns, branch).
         inventory_settings = config.get("settings", {}) or {}
-        artifact_bucket = inventory_settings.get("toolkit_configuration_bucket", "graphs")
+        if not inventory_settings or not inventory_settings.get("toolkit_configuration_llm_model"):
+            try:
+                import requests as http_requests
+
+                inventory_toolkit_url = (
+                    f"{platform_url.rstrip('/')}/api/v2/elitea_core/tool/prompt_lib/"
+                    f"{project_id}/{application_id}"
+                )
+                resp = http_requests.get(
+                    inventory_toolkit_url,
+                    headers={"Authorization": f"Bearer {platform_token}"},
+                    verify=_PLATFORM_VERIFY_SSL,
+                    timeout=_PLATFORM_HTTP_TIMEOUT,
+                )
+                if resp.ok:
+                    fetched_settings = resp.json().get("settings", {})
+                    if fetched_settings:
+                        inventory_settings = fetched_settings
+                    log.info(
+                        "[run_ingestion_job] Fetched inventory settings keys: %s",
+                        list(inventory_settings.keys()),
+                    )
+                else:
+                    log.warning(
+                        "[run_ingestion_job] Failed to fetch inventory settings: %s - %s",
+                        resp.status_code, resp.text,
+                    )
+            except Exception as fetch_err:
+                log.warning("[run_ingestion_job] Could not fetch inventory settings: %s", fetch_err)
+
+        artifact_bucket = resolve_inventory_artifact_bucket(
+            inventory_settings.get("toolkit_configuration_bucket"),
+        )
         graph_dir = str(Path(graph_path).parent)
         ingestion_config = self.descriptor.config.get("ingestion", {})
         runtime_base_path = self.descriptor.config.get("base_path", "/data/inventory")
@@ -1488,7 +1885,15 @@ class Method:
                     return f"Error: Job {job_id} not found"
                 time.sleep(poll_interval)
                 elapsed += poll_interval
-        except Exception:
+        except Exception as e:
+            if _is_task_interruption(e):
+                try:
+                    from ..utils.source_status import SourceStatusManager
+
+                    status_manager = SourceStatusManager(graph_dir)
+                    status_manager.stop_ingestion(toolkit_id=str(toolkit_id))
+                except Exception as status_error:
+                    log.warning("Failed to update K8s source status on stop: %s", status_error)
             self.invocation_thinking(f"Stopping inventory ingestion job {job_id}...")
             job_manager.cleanup_job(job_id, payload, delete_k8s_job=True)
             release_tracking_slot()
@@ -1507,8 +1912,11 @@ class Method:
             return f"Error: Job completed but no result found: {failure_info.get('error', 'unknown failure')}"
 
         try:
-            sync_bucket = result.get("artifact_bucket") or artifact_bucket
-            self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket)
+            sync_bucket = resolve_inventory_artifact_bucket(
+                result.get("artifact_bucket"),
+                artifact_bucket,
+            )
+            self._download_graph_from_artifacts(graph_path, project_id, application_id, sync_bucket, params.get("llm_settings"))
             if graph_path in self.graph_instances:
                 del self.graph_instances[graph_path]
 
@@ -1610,7 +2018,7 @@ class Method:
         if not graph_path:
             if output_format == "json":
                 return json_module.dumps({"sources": [], "error": "No graph configured"})
-            return "No graph configured. Please set bucket and graph_name in toolkit configuration."
+            return "No graph configured yet. Run ingestion to create the inventory graph."
 
         wrapper = self._get_or_create_wrapper(graph_path, request_data)
         stats = wrapper._knowledge_graph.get_stats()
@@ -2377,8 +2785,7 @@ class Method:
         import os
         import json as json_module
 
-        log.info(f"[DEBUG] _tool_get_stats called with graph_path: {graph_path}")
-        log.info(f"[DEBUG] params: {params}")
+        log.debug("[get_stats] graph_path=%s param_keys=%s", graph_path, list(params.keys()))
         output_format = params.get("output_format", "text")
 
         if not graph_path:
@@ -2395,12 +2802,12 @@ class Method:
             return "No graph configured"
 
         # Try to get or create wrapper - this will attempt artifact download if graph doesn't exist locally
-        log.info(f"[DEBUG] Getting or creating wrapper for path: {graph_path}")
+        log.debug("[get_stats] getting or creating wrapper for path: %s", graph_path)
         wrapper = self._get_or_create_wrapper(graph_path, request_data)
 
         # Check if graph was loaded successfully (either from local or artifacts)
         if not os.path.exists(graph_path):
-            log.info(f"[DEBUG] Graph file not found at {graph_path} after download attempt, returning empty stats")
+            log.debug("[get_stats] graph file not found at %s after download attempt, returning empty stats", graph_path)
             if output_format == "json":
                 return json_module.dumps({
                     "node_count": 0,
@@ -2414,15 +2821,15 @@ class Method:
                 })
             return "No graph data yet. Run ingestion to populate the knowledge graph."
 
-        log.info(f"[DEBUG] Got wrapper, output_format: {output_format}")
+        log.debug("[get_stats] got wrapper, output_format: %s", output_format)
 
         if output_format == "json":
             stats = wrapper._knowledge_graph.get_stats()
-            log.info(f"[DEBUG] Graph stats: {stats}")
+            log.debug("[get_stats] graph stats: %s", stats)
             return json_module.dumps(stats)
 
         result = wrapper.get_stats()
-        log.info(f"[DEBUG] Text stats result: {result}")
+        log.debug("[get_stats] text stats result computed")
         return result
 
     @web.method()
@@ -2711,7 +3118,7 @@ class Method:
                     "total_sources": 0,
                     "error": "No graph configured"
                 })
-            return "No graph configured. Please set bucket and graph_name in toolkit configuration."
+            return "No graph configured yet. Run ingestion to create the inventory graph."
 
         # Get graph directory
         graph_dir = Path(graph_path).parent
@@ -2720,22 +3127,25 @@ class Method:
         config = request_data.get("configuration", {})
         project_id = config.get("project_id") or params.get("project_id")
         application_id = config.get("application_id") or params.get("application_id")
-        # Get artifact bucket from toolkit settings
         settings = config.get("settings", {})
-        artifact_bucket = settings.get("toolkit_configuration_bucket", "graphs")
+        artifact_bucket = resolve_inventory_artifact_bucket(
+            settings.get("toolkit_configuration_bucket"),
+        )
 
         status_file = graph_dir / "sources_status.json"
         if not status_file.exists() and project_id and application_id:
             # Try to download from artifacts using EliteAClient
             try:
-                elitea_client = self._get_elitea_client(project_id)
+                elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
                 if elitea_client:
-                    status_data = elitea_client.artifact(artifact_bucket).get("sources_status.json")
-                    if status_data and not self._is_artifact_error(status_data):
-                        graph_dir.mkdir(parents=True, exist_ok=True)
-                        with open(status_file, 'w', encoding='utf-8') as f:
-                            f.write(status_data)
-                        log.info(f"Downloaded sources_status.json from artifacts")
+                    for candidate_bucket in get_inventory_artifact_read_candidates(artifact_bucket):
+                        status_data = elitea_client.artifact(candidate_bucket).get("sources_status.json")
+                        if status_data and not self._is_artifact_error(status_data):
+                            graph_dir.mkdir(parents=True, exist_ok=True)
+                            with open(status_file, 'w', encoding='utf-8') as f:
+                                f.write(status_data)
+                            log.info("Downloaded sources_status.json from artifacts")
+                            break
             except Exception as e:
                 log.debug(f"Could not download sources_status.json from artifacts: {e}")
 
@@ -2944,7 +3354,60 @@ class Method:
 
         # Get all active ingestions
         active_ingestions = self.ingestion_tracker.get_active_ingestions()
-        tracker_status = self.ingestion_tracker.get_status()
+        sources_status = {}
+        stale_task_ids = []
+
+        # Reconcile the tracker with sources_status.json for this inventory. A stop can
+        # update the source status before the tracker slot is cleaned up, which makes the
+        # drawer show a ghost "in progress" banner after refresh.
+        if graph_path and project_id and application_id:
+            try:
+                from ..utils.source_status import (
+                    SourceStatusManager,
+                    should_clear_tracked_ingestion,
+                )
+
+                graph_dir = str(Path(graph_path).parent)
+                status_manager = SourceStatusManager(graph_dir)
+                sources_status = status_manager.get_sources()
+
+                for ing in active_ingestions:
+                    if (
+                        str(ing.get("project_id")) != str(project_id)
+                        or str(ing.get("application_id")) != str(application_id)
+                    ):
+                        continue
+
+                    source_info = sources_status.get(str(ing.get("toolkit_id")))
+                    if should_clear_tracked_ingestion(source_info, ing):
+                        task_id = ing.get("task_id")
+                        if task_id:
+                            stale_task_ids.append(task_id)
+
+                for task_id in stale_task_ids:
+                    self.ingestion_tracker.release_slot(task_id)
+
+                if stale_task_ids:
+                    stale_task_ids_set = set(stale_task_ids)
+                    active_ingestions = [
+                        ing for ing in active_ingestions
+                        if ing.get("task_id") not in stale_task_ids_set
+                    ]
+                    log.info(
+                        "Cleared stale ingestion tracker entries for project=%s application=%s: %s",
+                        project_id,
+                        application_id,
+                        stale_task_ids,
+                    )
+            except Exception as reconcile_error:
+                log.debug("Could not reconcile tracker against source status: %s", reconcile_error)
+
+        tracker_status = {
+            "max_parallel": self.ingestion_tracker.max_parallel,
+            "active_count": len(active_ingestions),
+            "available_slots": max(0, self.ingestion_tracker.max_parallel - len(active_ingestions)),
+            "active_ingestions": active_ingestions,
+        }
         if _is_ingestion_jobs_enabled():
             try:
                 from inventory.k8s_ingestion_job_manager import get_ingestion_job_manager
@@ -2971,12 +3434,14 @@ class Method:
         # If tracker progress is not available, fall back to sources_status.json.
         if current_ingestion and graph_path and not current_ingestion.get("progress_message"):
             try:
-                from pathlib import Path
-                from ..utils.source_status import SourceStatusManager
-                # graph_path is the full path to graph.json, but SourceStatusManager expects directory
-                graph_dir = str(Path(graph_path).parent)
-                status_manager = SourceStatusManager(graph_dir)
-                sources_status = status_manager.get_sources()
+                if not sources_status:
+                    from ..utils.source_status import SourceStatusManager
+
+                    # graph_path is the full path to graph.json, but SourceStatusManager expects directory
+                    graph_dir = str(Path(graph_path).parent)
+                    status_manager = SourceStatusManager(graph_dir)
+                    sources_status = status_manager.get_sources()
+
                 toolkit_id = str(current_ingestion.get("toolkit_id"))
                 if toolkit_id in sources_status:
                     source_info = sources_status[toolkit_id]
@@ -3350,7 +3815,7 @@ class Method:
             "gpt-4o-mini"
         )
 
-        elitea_client = self._get_elitea_client(project_id)
+        elitea_client = self._get_elitea_client(project_id, params.get("llm_settings"))
         if not elitea_client:
             if output_format == "json":
                 return json_module.dumps({"error": "Platform API not configured"})

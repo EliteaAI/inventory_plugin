@@ -1,3 +1,5 @@
+import pytest
+
 from types import SimpleNamespace
 
 from inventory.k8s_ingestion_job_manager import (
@@ -11,7 +13,8 @@ from inventory.k8s_ingestion_job_manager import (
     job_progress_key,
     job_result_key,
 )
-from utils.ingestion_tracker import IngestionTracker
+from utils.artifact_bucket import get_inventory_artifact_read_candidates
+from utils.ingestion_tracker import IngestionSlotError, IngestionTracker
 
 
 def test_job_artifact_keys_use_dedicated_prefix():
@@ -21,13 +24,21 @@ def test_job_artifact_keys_use_dedicated_prefix():
 
 
 def test_job_artifact_bucket_uses_payload_then_env(monkeypatch):
-    assert get_job_artifact_bucket({"artifact_bucket": "payload-graphs"}) == "payload-graphs"
+    assert get_job_artifact_bucket({"artifact_bucket": "graphs"}) == DEFAULT_ARTIFACT_BUCKET
 
-    monkeypatch.setenv(JOB_ARTIFACT_BUCKET_ENV, "env-graphs")
-    assert get_job_artifact_bucket() == "env-graphs"
+    monkeypatch.setenv(JOB_ARTIFACT_BUCKET_ENV, "inventory_graphs")
+    assert get_job_artifact_bucket() == DEFAULT_ARTIFACT_BUCKET
 
     monkeypatch.delenv(JOB_ARTIFACT_BUCKET_ENV)
     assert get_job_artifact_bucket() == DEFAULT_ARTIFACT_BUCKET
+
+
+def test_inventory_artifact_read_candidates_include_legacy_buckets():
+    assert get_inventory_artifact_read_candidates("graphs") == [
+        DEFAULT_ARTIFACT_BUCKET,
+        "graphs",
+        "inventory_graphs",
+    ]
 
 
 def test_platform_api_url_uses_payload_then_env(monkeypatch):
@@ -77,7 +88,7 @@ def test_create_job_passes_platform_api_url_to_worker_env(monkeypatch, tmp_path)
             "project_id": "7",
             "platform_url": "https://elitea.example.com/api",
             "platform_token": "token",
-            "artifact_bucket": "graphs",
+            "artifact_bucket": DEFAULT_ARTIFACT_BUCKET,
         },
     )
 
@@ -119,7 +130,7 @@ def test_read_job_progress_downloads_latest_artifact(tmp_path):
 
     class FakeClient:
         def artifact(self, bucket):
-            assert bucket == "graphs"
+            assert bucket == DEFAULT_ARTIFACT_BUCKET
             return FakeArtifact()
 
     manager = K8sIngestionJobManager(base_path=str(tmp_path))
@@ -139,6 +150,7 @@ def test_read_job_progress_returns_none_when_artifact_missing(tmp_path):
 
     class FakeClient:
         def artifact(self, bucket):
+            assert bucket == DEFAULT_ARTIFACT_BUCKET
             return FakeArtifact()
 
     manager = K8sIngestionJobManager(base_path=str(tmp_path))
@@ -157,6 +169,7 @@ def test_read_job_progress_ignores_non_object_json(tmp_path):
 
     class FakeClient:
         def artifact(self, bucket):
+            assert bucket == DEFAULT_ARTIFACT_BUCKET
             return FakeArtifact()
 
     manager = K8sIngestionJobManager(base_path=str(tmp_path))
@@ -190,7 +203,7 @@ def test_cleanup_platform_job_objects_removes_progress_artifact(monkeypatch, tmp
 
     class FakeClient:
         def artifact(self, bucket):
-            assert bucket == "graphs"
+            assert bucket == DEFAULT_ARTIFACT_BUCKET
             return FakeArtifact()
 
     manager = K8sIngestionJobManager(base_path=str(tmp_path))
@@ -231,3 +244,18 @@ def test_ingestion_tracker_updates_progress(tmp_path):
     assert active[0]["progress_message"] == "Processed 10 files"
     assert active[0]["progress_phase"] == "progress"
     assert active[0]["last_updated"]
+
+
+def test_ingestion_tracker_blocks_parallel_ingestion_for_same_inventory(tmp_path):
+    tracker = IngestionTracker(base_path=str(tmp_path), max_parallel=3)
+    tracker.acquire_slot(task_id="task1", project_id=2, toolkit_id=1, application_id=9)
+
+    with pytest.raises(IngestionSlotError, match="already running for project 2, inventory 9"):
+        tracker.acquire_slot(task_id="task2", project_id=2, toolkit_id=2, application_id=9)
+
+
+def test_ingestion_tracker_allows_parallel_ingestion_for_different_inventories(tmp_path):
+    tracker = IngestionTracker(base_path=str(tmp_path), max_parallel=3)
+    tracker.acquire_slot(task_id="task1", project_id=2, toolkit_id=1, application_id=9)
+
+    assert tracker.acquire_slot(task_id="task2", project_id=2, toolkit_id=2, application_id=10) is True
