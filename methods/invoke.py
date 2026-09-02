@@ -68,7 +68,13 @@ def _platform_settings_from_llm_settings(llm_settings):
 def _string_list(value):
     """Normalize descriptor string/list arguments into a clean list of strings."""
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
+        return [
+            str(item).strip()
+            for item in value
+            if isinstance(item, (str, int, float))
+            and not isinstance(item, bool)
+            and str(item).strip()
+        ]
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
     return []
@@ -567,7 +573,12 @@ class Method:
         if raw_history and not history:
             log.warning("[ask] Could not parse chat_history JSON; ignoring")
 
-        filters = _chat_filters_from_params(params)
+        # Search filters are tool invocation arguments, not toolkit configuration.
+        # The platform expands the inventory toolkit's configured ``sources`` IDs
+        # into full toolkit objects under configuration.parameters. Reading filters
+        # from the merged ``params`` namespace would stringify those objects and
+        # filter every graph result out because citations contain source names only.
+        filters = _chat_filters_from_params(request_data.get("parameters", {}))
 
         log.info(
             "[ask] project_id=%s toolkit_id=%s history=%d question=%r",

@@ -552,7 +552,11 @@ class Method:
         log.info(f"[inventory_chat] Starting chat session {session_id}")
         log.info(f"[inventory_chat] project_id={project_id}, toolkit_id={toolkit_id}")
         log.info(f"[inventory_chat] prompt: {prompt[:100]}...")
-        log.info(f"[inventory_chat] filters: {filters}")
+        filter_summary = {
+            key: len(value) if isinstance(value, list) else value
+            for key, value in filters.items()
+        }
+        log.info("[inventory_chat] filter summary: %s", filter_summary)
 
         # Track entities accessed during execution (shared across all tracking)
         touched_entities = []

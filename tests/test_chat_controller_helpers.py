@@ -71,6 +71,81 @@ def test_chat_filters_accept_comma_strings_and_lists():
     }
 
 
+def test_chat_filters_ignore_expanded_toolkit_objects():
+    filters = invoke_module._chat_filters_from_params({
+        "sources": [{
+            "id": 7,
+            "toolkit_name": "github-source",
+            "settings": {"access_token": "must-not-be-stringified"},
+        }],
+    })
+
+    assert filters == {
+        "depth": 2,
+        "max_nodes": 500,
+    }
+
+
+def test_ask_uses_raw_tool_arguments_for_filters():
+    captured = {}
+    method = invoke_module.Method()
+    method._invocation_event_sink = lambda: lambda *_args, **_kwargs: None
+    method.inventory_chat = lambda **kwargs: captured.update(kwargs) or {}
+
+    method._tool_ask(
+        {
+            "question": "Where is authentication handled?",
+            "sources": [{
+                "id": 7,
+                "toolkit_name": "github-source",
+                "settings": {"access_token": "expanded-configuration-secret"},
+            }],
+            "llm_settings": {"model_name": "test-model"},
+        },
+        project_id=2,
+        toolkit_id=30,
+        request_data={
+            "parameters": {
+                "question": "Where is authentication handled?",
+            },
+        },
+    )
+
+    assert captured["filters"] == {
+        "depth": 2,
+        "max_nodes": 500,
+    }
+
+
+def test_ask_preserves_explicit_source_filter_from_raw_tool_arguments():
+    captured = {}
+    method = invoke_module.Method()
+    method._invocation_event_sink = lambda: lambda *_args, **_kwargs: None
+    method.inventory_chat = lambda **kwargs: captured.update(kwargs) or {}
+
+    method._tool_ask(
+        {
+            "question": "Where is authentication handled?",
+            "sources": "github-source",
+            "llm_settings": {"model_name": "test-model"},
+        },
+        project_id=2,
+        toolkit_id=30,
+        request_data={
+            "parameters": {
+                "question": "Where is authentication handled?",
+                "sources": "github-source",
+            },
+        },
+    )
+
+    assert captured["filters"] == {
+        "sources": ["github-source"],
+        "depth": 2,
+        "max_nodes": 500,
+    }
+
+
 def test_chat_history_from_json_array():
     history = [{"role": "user", "content": "hello"}]
 
