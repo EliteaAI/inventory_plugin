@@ -79,6 +79,9 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(config, items):
     """Auto-skip tests marked ``requires_embeddings`` when the model is missing."""
+    if not any("requires_embeddings" in item.keywords for item in items):
+        return
+
     if _probe_embedding_model():
         return  # model loaded — nothing to skip
 

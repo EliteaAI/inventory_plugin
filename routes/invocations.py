@@ -128,7 +128,7 @@ class Route:
                 if stale_ingestion:
                     log.info(f"[STOP_DELETE] Found stale task {invocation_id} in IngestionTracker, releasing slot")
 
-                    # Update source status to mark as stopped/error
+                    # Update source status to mark as stopped for the recovered stale entry.
                     try:
                         from ..utils.source_status import SourceStatusManager
                         project_id = stale_ingestion.get("project_id")
@@ -138,9 +138,9 @@ class Route:
                         if project_id and application_id:
                             graph_dir = f"/data/graphs/{project_id}/{application_id}"
                             status_manager = SourceStatusManager(graph_dir)
-                            status_manager.fail_ingestion(
+                            status_manager.stop_ingestion(
                                 toolkit_id=str(toolkit_id),
-                                error_message="Ingestion stopped by user (recovered from stale state)",
+                                message="Ingestion stopped by user",
                                 documents_processed=0,
                             )
                             log.info(f"[STOP_DELETE] Updated source status for toolkit {toolkit_id}")

@@ -15,7 +15,7 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import PersonOutlineIcon from '@mui/icons-material/PersonOutline';
 import EliteAIcon from './EliteAIcon';
-import { ROLES, ToolActionStatus } from '../hooks/useChatPredict';
+import { ROLES, ToolActionStatus } from '../hooks/useInventoryChat';
 import './ChatMessage.css';
 
 /**
@@ -115,6 +115,8 @@ function ToolAction({ action }) {
 
   // Check if there's expandable content (input, output, or error)
   const hasExpandableContent = action.input || action.output || action.error;
+  const durationMs = Number(action.duration_ms);
+  const hasDuration = Number.isFinite(durationMs);
 
   return (
     <div className={`chat-message-tool-action ${statusClass}`}>
@@ -125,9 +127,9 @@ function ToolAction({ action }) {
       >
         <span className="chat-message-tool-action-icon">{statusIcon}</span>
         <span className="chat-message-tool-action-name">{action.name || 'Tool'}</span>
-        {action.duration_ms > 0 && (
+        {hasDuration && (
           <span className="chat-message-tool-action-message">
-            {action.duration_ms}ms
+            {durationMs}ms
           </span>
         )}
         {hasExpandableContent && (

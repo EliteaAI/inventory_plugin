@@ -14,11 +14,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional
 
+from utils.artifact_bucket import (
+    INVENTORY_ARTIFACT_BUCKET,
+    resolve_inventory_artifact_bucket,
+)
+
 log = logging.getLogger(__name__)
 
 WORKER_APP_LABEL = "inventory-worker"
 JOB_NAME_PREFIX = "inventory-worker-"
-DEFAULT_ARTIFACT_BUCKET = "graphs"
+DEFAULT_ARTIFACT_BUCKET = INVENTORY_ARTIFACT_BUCKET
 JOB_OBJECT_PREFIX = "_inventory_jobs"
 JOB_ARTIFACT_BUCKET_ENV = "INVENTORY_ARTIFACT_BUCKET"
 JOB_PROJECT_ID_ENV = "INVENTORY_PROJECT_ID"
@@ -51,8 +56,10 @@ def job_progress_key(job_id: str) -> str:
 
 def get_job_artifact_bucket(input_data: Optional[Dict[str, Any]] = None) -> str:
     if input_data:
-        return input_data.get("artifact_bucket") or DEFAULT_ARTIFACT_BUCKET
-    return os.environ.get(JOB_ARTIFACT_BUCKET_ENV, DEFAULT_ARTIFACT_BUCKET).strip() or DEFAULT_ARTIFACT_BUCKET
+        return resolve_inventory_artifact_bucket(input_data.get("artifact_bucket"))
+    return resolve_inventory_artifact_bucket(
+        os.environ.get(JOB_ARTIFACT_BUCKET_ENV, DEFAULT_ARTIFACT_BUCKET),
+    )
 
 
 def get_platform_api_url(input_data: Optional[Dict[str, Any]] = None) -> str:
