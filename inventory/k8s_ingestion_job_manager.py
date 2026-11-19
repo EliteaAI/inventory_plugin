@@ -28,6 +28,10 @@ JOB_OBJECT_PREFIX = "_inventory_jobs"
 JOB_ARTIFACT_BUCKET_ENV = "INVENTORY_ARTIFACT_BUCKET"
 JOB_PROJECT_ID_ENV = "INVENTORY_PROJECT_ID"
 PLATFORM_API_URL_ENV = "PLATFORM_API_URL"
+JOB_EMPTY_DIR_SIZE_LIMIT_ENV = "INVENTORY_JOB_EMPTY_DIR_SIZE_LIMIT"
+JOB_SHM_SIZE_LIMIT_ENV = "INVENTORY_JOB_SHM_SIZE_LIMIT"
+JOB_EPHEMERAL_STORAGE_REQUEST_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_REQUEST"
+JOB_EPHEMERAL_STORAGE_LIMIT_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_LIMIT"
 SENSITIVE_INPUT_KEY_PARTS = (
     "token",
     "secret",
@@ -98,6 +102,12 @@ def is_artifact_error(data: Any) -> bool:
     return False
 
 
+def get_optional_env(name: str) -> Optional[str]:
+    """Return a stripped env value, or None when it is unset or blank."""
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
 def is_jobs_enabled() -> bool:
     """Return True when Inventory ingestion should run in K8s Jobs."""
     return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
@@ -126,6 +136,16 @@ class K8sIngestionJobManager:
                 "cpu": os.environ.get("INVENTORY_JOB_CPU_LIMIT", "4"),
             },
         }
+        # Optional ephemeral-storage; omitted when unset so cluster defaults (e.g. LimitRange) still apply.
+        ephemeral_request = get_optional_env(JOB_EPHEMERAL_STORAGE_REQUEST_ENV)
+        ephemeral_limit = get_optional_env(JOB_EPHEMERAL_STORAGE_LIMIT_ENV)
+        if ephemeral_request:
+            self.resources["requests"]["ephemeral-storage"] = ephemeral_request
+        if ephemeral_limit:
+            self.resources["limits"]["ephemeral-storage"] = ephemeral_limit
+        # Optional size limits (K8s quantities, e.g. "10Gi"). Unset keeps the previous behaviour.
+        self.empty_dir_size_limit = get_optional_env(JOB_EMPTY_DIR_SIZE_LIMIT_ENV)
+        self.shm_size_limit = get_optional_env(JOB_SHM_SIZE_LIMIT_ENV)
 
         self._k8s_client = None
 
@@ -297,6 +317,23 @@ class K8sIngestionJobManager:
                 env_vars.append(client.V1EnvVar(name=var_name, value=var_value))
                 already_set.add(var_name)
 
+        volume_mounts = [client.V1VolumeMount(name="data", mount_path="/data")]
+        volumes = [
+            client.V1Volume(
+                name="data",
+                empty_dir=client.V1EmptyDirVolumeSource(size_limit=self.empty_dir_size_limit),
+            )
+        ]
+        if self.shm_size_limit:
+            # Memory-backed emptyDir replaces the default 64Mi /dev/shm.
+            volume_mounts.append(client.V1VolumeMount(name="dshm", mount_path="/dev/shm"))
+            volumes.append(
+                client.V1Volume(
+                    name="dshm",
+                    empty_dir=client.V1EmptyDirVolumeSource(medium="Memory", size_limit=self.shm_size_limit),
+                )
+            )
+
         job_name = f"{JOB_NAME_PREFIX}{job_id}"
         job = client.V1Job(
             api_version="batch/v1",
@@ -328,14 +365,14 @@ class K8sIngestionJobManager:
                                 ],
                                 env=env_vars,
                                 security_context=client.V1SecurityContext(run_as_user=33, run_as_group=33),
-                                volume_mounts=[client.V1VolumeMount(name="data", mount_path="/data")],
+                                volume_mounts=volume_mounts,
                                 resources=client.V1ResourceRequirements(
                                     requests=self.resources["requests"],
                                     limits=self.resources["limits"],
                                 ),
                             )
                         ],
-                        volumes=[client.V1Volume(name="data", empty_dir=client.V1EmptyDirVolumeSource())],
+                        volumes=volumes,
                     ),
                 ),
             ),
