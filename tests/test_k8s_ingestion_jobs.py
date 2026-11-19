@@ -6,6 +6,8 @@ from inventory.k8s_ingestion_job_manager import (
     DEFAULT_ARTIFACT_BUCKET,
     JOB_ARTIFACT_BUCKET_ENV,
     JOB_EMPTY_DIR_SIZE_LIMIT_ENV,
+    JOB_EPHEMERAL_STORAGE_LIMIT_ENV,
+    JOB_EPHEMERAL_STORAGE_REQUEST_ENV,
     JOB_SHM_SIZE_LIMIT_ENV,
     PLATFORM_API_URL_ENV,
     K8sIngestionJobManager,
@@ -153,6 +155,37 @@ def test_create_job_ignores_blank_size_limit_env(monkeypatch, tmp_path):
 
     assert [v.name for v in pod_spec.volumes] == ["data"]
     assert pod_spec.volumes[0].empty_dir.size_limit is None
+
+
+def test_create_job_omits_ephemeral_storage_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv(JOB_EPHEMERAL_STORAGE_REQUEST_ENV, raising=False)
+    monkeypatch.delenv(JOB_EPHEMERAL_STORAGE_LIMIT_ENV, raising=False)
+
+    resources = _create_job_pod_spec(monkeypatch, tmp_path).containers[0].resources
+
+    assert "ephemeral-storage" not in resources.requests
+    assert "ephemeral-storage" not in resources.limits
+
+
+def test_create_job_applies_ephemeral_storage_request_and_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv(JOB_EPHEMERAL_STORAGE_REQUEST_ENV, "2Gi")
+    monkeypatch.setenv(JOB_EPHEMERAL_STORAGE_LIMIT_ENV, "10Gi")
+
+    resources = _create_job_pod_spec(monkeypatch, tmp_path).containers[0].resources
+
+    assert resources.requests["ephemeral-storage"] == "2Gi"
+    assert resources.limits["ephemeral-storage"] == "10Gi"
+    assert resources.limits["memory"] == "8Gi"
+
+
+def test_create_job_ignores_blank_ephemeral_storage_env(monkeypatch, tmp_path):
+    monkeypatch.setenv(JOB_EPHEMERAL_STORAGE_REQUEST_ENV, " ")
+    monkeypatch.setenv(JOB_EPHEMERAL_STORAGE_LIMIT_ENV, "")
+
+    resources = _create_job_pod_spec(monkeypatch, tmp_path).containers[0].resources
+
+    assert "ephemeral-storage" not in resources.requests
+    assert "ephemeral-storage" not in resources.limits
 
 
 def test_worker_logs_wait_until_container_is_running(monkeypatch, tmp_path):

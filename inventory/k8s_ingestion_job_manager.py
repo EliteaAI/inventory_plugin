@@ -30,6 +30,8 @@ JOB_PROJECT_ID_ENV = "INVENTORY_PROJECT_ID"
 PLATFORM_API_URL_ENV = "PLATFORM_API_URL"
 JOB_EMPTY_DIR_SIZE_LIMIT_ENV = "INVENTORY_JOB_EMPTY_DIR_SIZE_LIMIT"
 JOB_SHM_SIZE_LIMIT_ENV = "INVENTORY_JOB_SHM_SIZE_LIMIT"
+JOB_EPHEMERAL_STORAGE_REQUEST_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_REQUEST"
+JOB_EPHEMERAL_STORAGE_LIMIT_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_LIMIT"
 SENSITIVE_INPUT_KEY_PARTS = (
     "token",
     "secret",
@@ -134,6 +136,13 @@ class K8sIngestionJobManager:
                 "cpu": os.environ.get("INVENTORY_JOB_CPU_LIMIT", "4"),
             },
         }
+        # Optional ephemeral-storage; omitted when unset so cluster defaults (e.g. LimitRange) still apply.
+        ephemeral_request = get_optional_env(JOB_EPHEMERAL_STORAGE_REQUEST_ENV)
+        ephemeral_limit = get_optional_env(JOB_EPHEMERAL_STORAGE_LIMIT_ENV)
+        if ephemeral_request:
+            self.resources["requests"]["ephemeral-storage"] = ephemeral_request
+        if ephemeral_limit:
+            self.resources["limits"]["ephemeral-storage"] = ephemeral_limit
         # Optional size limits (K8s quantities, e.g. "10Gi"). Unset keeps the previous behaviour.
         self.empty_dir_size_limit = get_optional_env(JOB_EMPTY_DIR_SIZE_LIMIT_ENV)
         self.shm_size_limit = get_optional_env(JOB_SHM_SIZE_LIMIT_ENV)
