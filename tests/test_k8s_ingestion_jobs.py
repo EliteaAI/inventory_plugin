@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from inventory.k8s_ingestion_job_manager import (
     DEFAULT_ARTIFACT_BUCKET,
     JOB_ARTIFACT_BUCKET_ENV,
+    JOB_EMPTY_DIR_SIZE_LIMIT_ENV,
+    JOB_SHM_SIZE_LIMIT_ENV,
     PLATFORM_API_URL_ENV,
     K8sIngestionJobManager,
     get_job_artifact_bucket,
@@ -98,6 +100,59 @@ def test_create_job_passes_platform_api_url_to_worker_env(monkeypatch, tmp_path)
     assert env[PLATFORM_API_URL_ENV] == "https://elitea.example.com/api"
     assert "/app" in env["PYTHONPATH"].split(":")
     assert "AI_RUN_PLATFORM_URL" not in env
+
+
+def _create_job_pod_spec(monkeypatch, tmp_path):
+    created = {}
+
+    class FakeBatchApi:
+        def create_namespaced_job(self, namespace, body):
+            created["body"] = body
+
+    manager = K8sIngestionJobManager(base_path=str(tmp_path))
+    monkeypatch.setattr(manager, "get_slot_availability", lambda: {"can_start": True})
+    monkeypatch.setattr(manager, "_get_elitea_client", lambda input_data: object())
+    monkeypatch.setattr(manager, "_upload_job_input", lambda job_id, input_data, elitea_client: True)
+    monkeypatch.setattr(manager, "_get_batch_api", lambda: FakeBatchApi())
+
+    result = manager.create_job("job1", {"project_id": "7", "platform_token": "token"})
+    assert result["success"] is True
+    return created["body"].spec.template.spec
+
+
+def test_create_job_defaults_have_no_size_limits_and_no_shm(monkeypatch, tmp_path):
+    monkeypatch.delenv(JOB_EMPTY_DIR_SIZE_LIMIT_ENV, raising=False)
+    monkeypatch.delenv(JOB_SHM_SIZE_LIMIT_ENV, raising=False)
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    assert [v.name for v in pod_spec.volumes] == ["data"]
+    assert pod_spec.volumes[0].empty_dir.size_limit is None
+    assert [m.name for m in pod_spec.containers[0].volume_mounts] == ["data"]
+
+
+def test_create_job_applies_empty_dir_and_shm_size_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv(JOB_EMPTY_DIR_SIZE_LIMIT_ENV, "10Gi")
+    monkeypatch.setenv(JOB_SHM_SIZE_LIMIT_ENV, "2Gi")
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    volumes = {v.name: v for v in pod_spec.volumes}
+    assert volumes["data"].empty_dir.size_limit == "10Gi"
+    assert volumes["dshm"].empty_dir.medium == "Memory"
+    assert volumes["dshm"].empty_dir.size_limit == "2Gi"
+    mounts = {m.name: m.mount_path for m in pod_spec.containers[0].volume_mounts}
+    assert mounts == {"data": "/data", "dshm": "/dev/shm"}
+
+
+def test_create_job_ignores_blank_size_limit_env(monkeypatch, tmp_path):
+    monkeypatch.setenv(JOB_EMPTY_DIR_SIZE_LIMIT_ENV, "  ")
+    monkeypatch.setenv(JOB_SHM_SIZE_LIMIT_ENV, "")
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    assert [v.name for v in pod_spec.volumes] == ["data"]
+    assert pod_spec.volumes[0].empty_dir.size_limit is None
 
 
 def test_worker_logs_wait_until_container_is_running(monkeypatch, tmp_path):
