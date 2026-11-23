@@ -9,6 +9,14 @@ from inventory.k8s_ingestion_job_manager import (
     JOB_EPHEMERAL_STORAGE_LIMIT_ENV,
     JOB_EPHEMERAL_STORAGE_REQUEST_ENV,
     JOB_SHM_SIZE_LIMIT_ENV,
+    JOB_ALLOW_PRIVILEGE_ESCALATION_ENV,
+    JOB_CAPABILITIES_DROP_ENV,
+    JOB_FS_GROUP_ENV,
+    JOB_READ_ONLY_ROOT_FILESYSTEM_ENV,
+    JOB_RUN_AS_GROUP_ENV,
+    JOB_RUN_AS_NON_ROOT_ENV,
+    JOB_RUN_AS_USER_ENV,
+    JOB_SECCOMP_PROFILE_ENV,
     PLATFORM_API_URL_ENV,
     K8sIngestionJobManager,
     get_job_artifact_bucket,
@@ -186,6 +194,79 @@ def test_create_job_ignores_blank_ephemeral_storage_env(monkeypatch, tmp_path):
 
     assert "ephemeral-storage" not in resources.requests
     assert "ephemeral-storage" not in resources.limits
+
+
+SECURITY_ENVS = (
+    JOB_RUN_AS_USER_ENV,
+    JOB_RUN_AS_GROUP_ENV,
+    JOB_FS_GROUP_ENV,
+    JOB_RUN_AS_NON_ROOT_ENV,
+    JOB_ALLOW_PRIVILEGE_ESCALATION_ENV,
+    JOB_READ_ONLY_ROOT_FILESYSTEM_ENV,
+    JOB_CAPABILITIES_DROP_ENV,
+    JOB_SECCOMP_PROFILE_ENV,
+)
+
+
+def test_create_job_security_context_defaults_are_hardened(monkeypatch, tmp_path):
+    for name in SECURITY_ENVS:
+        monkeypatch.delenv(name, raising=False)
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    pod_sc = pod_spec.security_context
+    assert (pod_sc.run_as_user, pod_sc.run_as_group, pod_sc.fs_group) == (33, 33, 33)
+    assert pod_sc.run_as_non_root is True
+    assert pod_sc.seccomp_profile.type == "RuntimeDefault"
+    sc = pod_spec.containers[0].security_context
+    assert (sc.run_as_user, sc.run_as_group) == (33, 33)
+    assert sc.run_as_non_root is True
+    assert sc.allow_privilege_escalation is False
+    assert sc.read_only_root_filesystem is False
+    assert sc.capabilities.drop == ["ALL"]
+
+
+def test_create_job_security_context_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv(JOB_RUN_AS_USER_ENV, "1000")
+    monkeypatch.setenv(JOB_RUN_AS_GROUP_ENV, "1000")
+    monkeypatch.setenv(JOB_FS_GROUP_ENV, "2000")
+    monkeypatch.setenv(JOB_READ_ONLY_ROOT_FILESYSTEM_ENV, "true")
+    monkeypatch.setenv(JOB_CAPABILITIES_DROP_ENV, "ALL, NET_RAW")
+    monkeypatch.setenv(JOB_SECCOMP_PROFILE_ENV, "Localhost")
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    assert pod_spec.security_context.fs_group == 2000
+    assert pod_spec.security_context.seccomp_profile.type == "Localhost"
+    sc = pod_spec.containers[0].security_context
+    assert (sc.run_as_user, sc.run_as_group) == (1000, 1000)
+    assert sc.read_only_root_filesystem is True
+    assert sc.capabilities.drop == ["ALL", "NET_RAW"]
+
+
+def test_create_job_blank_security_env_leaves_field_unset(monkeypatch, tmp_path):
+    for name in SECURITY_ENVS:
+        monkeypatch.setenv(name, "")
+
+    pod_spec = _create_job_pod_spec(monkeypatch, tmp_path)
+
+    pod_sc = pod_spec.security_context
+    assert pod_sc.run_as_user is None and pod_sc.fs_group is None
+    assert pod_sc.run_as_non_root is None and pod_sc.seccomp_profile is None
+    sc = pod_spec.containers[0].security_context
+    assert sc.allow_privilege_escalation is None
+    assert sc.capabilities is None
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [(JOB_RUN_AS_USER_ENV, "www-data"), (JOB_ALLOW_PRIVILEGE_ESCALATION_ENV, "maybe")],
+)
+def test_invalid_security_env_fails_at_controller_start(monkeypatch, tmp_path, name, value):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        K8sIngestionJobManager(base_path=str(tmp_path))
 
 
 def test_worker_logs_wait_until_container_is_running(monkeypatch, tmp_path):
