@@ -32,6 +32,16 @@ JOB_EMPTY_DIR_SIZE_LIMIT_ENV = "INVENTORY_JOB_EMPTY_DIR_SIZE_LIMIT"
 JOB_SHM_SIZE_LIMIT_ENV = "INVENTORY_JOB_SHM_SIZE_LIMIT"
 JOB_EPHEMERAL_STORAGE_REQUEST_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_REQUEST"
 JOB_EPHEMERAL_STORAGE_LIMIT_ENV = "INVENTORY_JOB_EPHEMERAL_STORAGE_LIMIT"
+# Worker pod/container securityContext. Defaults are the hardened values; an
+# empty value leaves that field unset (cluster/runtime default applies).
+JOB_RUN_AS_USER_ENV = "INVENTORY_JOB_RUN_AS_USER"
+JOB_RUN_AS_GROUP_ENV = "INVENTORY_JOB_RUN_AS_GROUP"
+JOB_FS_GROUP_ENV = "INVENTORY_JOB_FS_GROUP"
+JOB_RUN_AS_NON_ROOT_ENV = "INVENTORY_JOB_RUN_AS_NON_ROOT"
+JOB_ALLOW_PRIVILEGE_ESCALATION_ENV = "INVENTORY_JOB_ALLOW_PRIVILEGE_ESCALATION"
+JOB_READ_ONLY_ROOT_FILESYSTEM_ENV = "INVENTORY_JOB_READ_ONLY_ROOT_FILESYSTEM"
+JOB_CAPABILITIES_DROP_ENV = "INVENTORY_JOB_CAPABILITIES_DROP"
+JOB_SECCOMP_PROFILE_ENV = "INVENTORY_JOB_SECCOMP_PROFILE"
 SENSITIVE_INPUT_KEY_PARTS = (
     "token",
     "secret",
@@ -108,6 +118,85 @@ def get_optional_env(name: str) -> Optional[str]:
     return value or None
 
 
+def _env_or_default(name: str, default: str) -> Optional[str]:
+    """Unset -> default; set but blank -> None (leave the field unset); else the value."""
+    if name not in os.environ:
+        return default
+    return get_optional_env(name)
+
+
+def get_int_setting(name: str, default: str) -> Optional[int]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def get_bool_setting(name: str, default: str) -> Optional[bool]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes"):
+        return True
+    if lowered in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{name} must be true or false, got {value!r}")
+
+
+def get_list_setting(name: str, default: str) -> Optional[list[str]]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def get_security_settings() -> Dict[str, Any]:
+    """Worker securityContext settings from the controller's environment.
+
+    Defaults match the worker image (USER 33:33, no setuid binaries) and the
+    restricted Pod Security profile except readOnlyRootFilesystem, which stays
+    off by default because the worker may write temp files inside the image.
+    """
+    return {
+        "run_as_user": get_int_setting(JOB_RUN_AS_USER_ENV, "33"),
+        "run_as_group": get_int_setting(JOB_RUN_AS_GROUP_ENV, "33"),
+        "fs_group": get_int_setting(JOB_FS_GROUP_ENV, "33"),
+        "run_as_non_root": get_bool_setting(JOB_RUN_AS_NON_ROOT_ENV, "true"),
+        "allow_privilege_escalation": get_bool_setting(JOB_ALLOW_PRIVILEGE_ESCALATION_ENV, "false"),
+        "read_only_root_filesystem": get_bool_setting(JOB_READ_ONLY_ROOT_FILESYSTEM_ENV, "false"),
+        "capabilities_drop": get_list_setting(JOB_CAPABILITIES_DROP_ENV, "ALL"),
+        "seccomp_profile": _env_or_default(JOB_SECCOMP_PROFILE_ENV, "RuntimeDefault"),
+    }
+
+
+def build_pod_security_context(client, settings: Dict[str, Any]):
+    seccomp = settings["seccomp_profile"]
+    return client.V1PodSecurityContext(
+        run_as_user=settings["run_as_user"],
+        run_as_group=settings["run_as_group"],
+        fs_group=settings["fs_group"],
+        run_as_non_root=settings["run_as_non_root"],
+        seccomp_profile=client.V1SeccompProfile(type=seccomp) if seccomp else None,
+    )
+
+
+def build_container_security_context(client, settings: Dict[str, Any]):
+    drop = settings["capabilities_drop"]
+    return client.V1SecurityContext(
+        run_as_user=settings["run_as_user"],
+        run_as_group=settings["run_as_group"],
+        run_as_non_root=settings["run_as_non_root"],
+        allow_privilege_escalation=settings["allow_privilege_escalation"],
+        read_only_root_filesystem=settings["read_only_root_filesystem"],
+        capabilities=client.V1Capabilities(drop=drop) if drop else None,
+    )
+
+
 def is_jobs_enabled() -> bool:
     """Return True when Inventory ingestion should run in K8s Jobs."""
     return os.environ.get("INVENTORY_JOBS_ENABLED", "false").lower() == "true"
@@ -146,6 +235,8 @@ class K8sIngestionJobManager:
         # Optional size limits (K8s quantities, e.g. "10Gi"). Unset keeps the previous behaviour.
         self.empty_dir_size_limit = get_optional_env(JOB_EMPTY_DIR_SIZE_LIMIT_ENV)
         self.shm_size_limit = get_optional_env(JOB_SHM_SIZE_LIMIT_ENV)
+        # Read once at start: a bad value fails the controller, not every Job.
+        self.security = get_security_settings()
 
         self._k8s_client = None
 
@@ -351,7 +442,7 @@ class K8sIngestionJobManager:
                     spec=client.V1PodSpec(
                         restart_policy="Never",
                         service_account_name=os.environ.get("INVENTORY_WORKER_SERVICE_ACCOUNT", "default"),
-                        security_context=client.V1PodSecurityContext(run_as_user=33, run_as_group=33, fs_group=33),
+                        security_context=build_pod_security_context(client, self.security),
                         containers=[
                             client.V1Container(
                                 name="worker",
@@ -364,7 +455,7 @@ class K8sIngestionJobManager:
                                     f'exec python "$W" --job-id={job_id}'
                                 ],
                                 env=env_vars,
-                                security_context=client.V1SecurityContext(run_as_user=33, run_as_group=33),
+                                security_context=build_container_security_context(client, self.security),
                                 volume_mounts=volume_mounts,
                                 resources=client.V1ResourceRequirements(
                                     requests=self.resources["requests"],
